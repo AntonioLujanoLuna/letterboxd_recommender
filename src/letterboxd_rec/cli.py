@@ -5,24 +5,26 @@ from .scraper import LetterboxdScraper
 from .recommender import MetadataRecommender, CollaborativeRecommender, Recommendation
 from .profile import build_profile
 from tqdm import tqdm
+import asyncio
 
-def _scrape_film_metadata(scraper, slugs, max_per_batch=100):
+def _scrape_film_metadata(scraper, slugs, max_per_batch=100, use_async=True):
     """Helper to scrape film metadata for a list of slugs."""
     if not slugs:
         return
     
     limited_slugs = slugs[:max_per_batch]
-    metadata_list = []
     
-    for slug in tqdm(limited_slugs, desc="Metadata"):
-        meta = scraper.scrape_film(slug)
-        if meta:
-            metadata_list.append((
-                meta.slug, meta.title, meta.year,
-                json.dumps(meta.directors), json.dumps(meta.genres),
-                json.dumps(meta.cast), json.dumps(meta.themes),
-                meta.runtime, meta.avg_rating, meta.rating_count
-            ))
+    if use_async and len(limited_slugs) > 10:
+        from .scraper import AsyncLetterboxdScraper
+        print(f"  Fetching {len(limited_slugs)} films (async)...")
+        async_scraper = AsyncLetterboxdScraper(delay=0.2, max_concurrent=5)
+        metadata_list = asyncio.run(async_scraper.scrape_films_batch(limited_slugs))
+    else:
+        metadata_list = []
+        for slug in tqdm(limited_slugs, desc="Metadata"):
+            meta = scraper.scrape_film(slug)
+            if meta:
+                metadata_list.append(meta)
     
     # Batch insert all metadata
     if metadata_list:
@@ -31,7 +33,14 @@ def _scrape_film_metadata(scraper, slugs, max_per_batch=100):
                 INSERT OR REPLACE INTO films 
                 (slug, title, year, directors, genres, cast, themes, runtime, avg_rating, rating_count)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, metadata_list)
+            """, [(
+                m.slug, m.title, m.year,
+                json.dumps(m.directors), json.dumps(m.genres),
+                json.dumps(m.cast), json.dumps(m.themes),
+                m.runtime, m.avg_rating, m.rating_count
+            ) for m in metadata_list])
+        
+        print(f"  Saved {len(metadata_list)} films")
 
 def cmd_scrape(args):
     """Scrape a user's Letterboxd data."""
@@ -103,6 +112,45 @@ def cmd_discover(args):
         
         while len(all_discovered) < args.limit and attempts < max_attempts:
             attempts += 1
+            batch_size = fetch_limit * (attempts + 1)
+            
+            # Discover users based on source
+            if args.source == 'following':
+                if not args.username:
+                    print("--username is required for 'following' source")
+                    return
+                usernames = scraper.scrape_following(args.username, limit=batch_size)
+            elif args.source == 'followers':
+                if not args.username:
+                    print("--username is required for 'followers' source")
+                    return
+                usernames = scraper.scrape_followers(args.username, limit=batch_size)
+            elif args.source == 'popular':
+                usernames = scraper.scrape_popular_members(limit=batch_size)
+            elif args.source == 'film':
+                if not args.film_slug:
+                    print("--film-slug is required for 'film' source")
+                    return
+                usernames = scraper.scrape_film_fans(args.film_slug, limit=batch_size)
+            else:
+                print(f"Unknown source: {args.source}")
+                return
+            
+            # Filter to new users
+            new_usernames = [u for u in usernames if u not in existing_users and u not in all_discovered]
+            all_discovered.extend(new_usernames)
+            
+            # Break only if source is exhausted (returned fewer than requested)
+            if len(usernames) < batch_size:
+                if not new_usernames:
+                    print(f"Source exhausted after {attempts} attempts, no new users found")
+                break
+            
+            # Progress feedback
+            if not new_usernames:
+                print(f"  Attempt {attempts}: all {len(usernames)} users already scraped, expanding search...")
+
+            attempts += 1
             batch_size = fetch_limit * (attempts + 1)  # Increase fetch size each attempt
             
             # Discover users based on source
@@ -135,18 +183,12 @@ def cmd_discover(args):
                 print(f"No more new users found after {attempts} attempts")
                 break
         
-        # Trim to limit
         new_usernames = all_discovered[:args.limit]
-        total_found = len(usernames) if usernames else 0
-        skipped = total_found - len(new_usernames)
-        
-        if skipped > 0:
-            print(f"Skipped {skipped} already-scraped users.")
-        
+
         if not new_usernames:
-            print("No new users to scrape!")
+            print(f"No new users to scrape! (checked {len(existing_users)} existing users)")
             return
-        
+
         print(f"\nDiscovered {len(new_usernames)} new users. Scraping their data...")
         
         # Scrape each user

@@ -4,6 +4,7 @@ import time
 from selectolax.parser import HTMLParser
 from dataclasses import dataclass
 from tqdm import tqdm
+import asyncio
 
 @dataclass
 class FilmInteraction:
