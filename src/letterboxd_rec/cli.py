@@ -1,8 +1,8 @@
 import argparse
 import json
-from .database import init_db, get_db
+from .database import init_db, get_db, load_json
 from .scraper import LetterboxdScraper
-from .recommender import MetadataRecommender, CollaborativeRecommender
+from .recommender import MetadataRecommender, CollaborativeRecommender, Recommendation
 from .profile import build_profile
 from tqdm import tqdm
 

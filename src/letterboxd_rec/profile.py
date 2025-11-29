@@ -4,22 +4,17 @@ from .database import load_json
 
 @dataclass
 class UserProfile:
-    """Aggregated preferences extracted from user's film history."""
+    """Aggregated user preferences from their film interactions."""
+    n_films: int = 0
+    n_rated: int = 0
+    n_liked: int = 0
+    avg_liked_rating: float | None = None
     
-    # Attribute -> score (positive = likes, negative = dislikes)
     genres: dict[str, float] = field(default_factory=dict)
     directors: dict[str, float] = field(default_factory=dict)
     actors: dict[str, float] = field(default_factory=dict)
     themes: dict[str, float] = field(default_factory=dict)
-    
-    # Decade preferences
     decades: dict[int, float] = field(default_factory=dict)
-    
-    # Stats
-    avg_liked_rating: float = 0.0  # avg Letterboxd rating of films user liked
-    n_films: int = 0
-    n_rated: int = 0
-    has_explicit_feedback: bool = False
 
 def build_profile(user_films: list[dict], film_metadata: dict[str, dict]) -> UserProfile:
     """
@@ -49,7 +44,7 @@ def build_profile(user_films: list[dict], film_metadata: dict[str, dict]) -> Use
     theme_counts = defaultdict(int)
     decade_counts = defaultdict(int)
     
-    liked_ratings = []
+    rated_films = []
     
     for uf in user_films:
         slug = uf['slug']
@@ -65,7 +60,7 @@ def build_profile(user_films: list[dict], film_metadata: dict[str, dict]) -> Use
         # Extract attributes
         genres = load_json(meta.get('genres'))
         directors = load_json(meta.get('directors'))
-        cast = load_json(meta.get('cast', []))[:5]  # top 5 actors
+        cast = load_json(meta.get('cast', []))[:5]
         themes = load_json(meta.get('themes', []))[:10]
         year = meta.get('year')
         
@@ -79,7 +74,6 @@ def build_profile(user_films: list[dict], film_metadata: dict[str, dict]) -> Use
             director_counts[d] += 1
         
         for a in cast:
-            # Diminishing weight for lower-billed actors
             actor_scores[a] += weight * 0.7
             actor_counts[a] += 1
         
@@ -92,23 +86,22 @@ def build_profile(user_films: list[dict], film_metadata: dict[str, dict]) -> Use
             decade_scores[decade] += weight
             decade_counts[decade] += 1
         
-        # Track Letterboxd ratings of liked films
-        if weight > 0.5 and meta.get('avg_rating'):
-            liked_ratings.append(meta['avg_rating'])
+        # Track rated films for average
+        if uf.get('rating'):
+            rated_films.append(uf['rating'])
     
-    # Normalize by count (so prolific directors don't dominate)
-    # But keep raw score influence—someone with 10 Spielberg films rated 5★ loves Spielberg
+    # Normalize scores
     profile.genres = {k: v / (genre_counts[k] ** 0.5) for k, v in genre_scores.items()}
-    profile.directors = {k: v for k, v in director_scores.items()}  # don't normalize directors
+    profile.directors = {k: v for k, v in director_scores.items()}
     profile.actors = {k: v / (actor_counts[k] ** 0.3) for k, v in actor_scores.items()}
     profile.themes = {k: v / (theme_counts[k] ** 0.5) for k, v in theme_scores.items()}
     profile.decades = {k: v / (decade_counts[k] ** 0.5) for k, v in decade_scores.items()}
     
-    # Stats
+    # Aggregate counts
     profile.n_films = len(user_films)
-    profile.n_rated = sum(1 for f in user_films if f.get('rating'))
-    profile.has_explicit_feedback = profile.n_rated >= 10
-    profile.avg_liked_rating = sum(liked_ratings) / len(liked_ratings) if liked_ratings else 3.5
+    profile.n_rated = len(rated_films)
+    profile.n_liked = sum(1 for f in user_films if f.get('liked'))
+    profile.avg_liked_rating = sum(rated_films) / len(rated_films) if rated_films else None
     
     return profile
 

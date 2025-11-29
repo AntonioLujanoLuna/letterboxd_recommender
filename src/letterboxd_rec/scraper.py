@@ -350,3 +350,88 @@ class LetterboxdScraper:
     
     def close(self):
         self.client.close()
+
+
+class AsyncLetterboxdScraper:
+    """Async scraper for parallel metadata fetching."""
+    
+    BASE = "https://letterboxd.com"
+    
+    def __init__(self, delay: float = 0.2, max_concurrent: int = 5):
+        self.delay = delay
+        self.semaphore = asyncio.Semaphore(max_concurrent)
+    
+    async def scrape_films_batch(self, slugs: list[str]) -> list:
+        """Scrape multiple films concurrently."""
+        async with httpx.AsyncClient(
+            headers={"User-Agent": "Mozilla/5.0 (compatible; letterboxd-rec/1.0)"},
+            follow_redirects=True,
+            timeout=30.0
+        ) as client:
+            tasks = [self._scrape_film_async(client, slug) for slug in slugs]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        return [r for r in results if r is not None and not isinstance(r, Exception)]
+    
+    async def _scrape_film_async(self, client: httpx.AsyncClient, slug: str):
+        """Scrape a single film asynchronously."""
+        async with self.semaphore:
+            await asyncio.sleep(self.delay)
+            try:
+                resp = await client.get(f"{self.BASE}/film/{slug}/")
+                if resp.status_code == 404:
+                    return None
+                resp.raise_for_status()
+                return self._parse_film_page(resp.text, slug)
+            except Exception as e:
+                return None
+    
+    def _parse_film_page(self, html: str, slug: str):
+        """Parse film page HTML."""
+        tree = HTMLParser(html)
+        
+        title_el = tree.css_first("h1.headline-1")
+        title = title_el.text(strip=True) if title_el else slug
+        
+        year = None
+        year_el = tree.css_first("small.number a, div.releaseyear a")
+        if year_el:
+            try:
+                year = int(year_el.text(strip=True))
+            except ValueError:
+                pass
+        
+        directors = [a.text(strip=True) for a in tree.css("a[href*='/director/']") if a.text(strip=True)]
+        genres = [a.text(strip=True) for a in tree.css("a[href*='/films/genre/']") if a.text(strip=True)]
+        cast = [a.text(strip=True) for a in tree.css("a[href*='/actor/']")[:10] if a.text(strip=True)]
+        themes = [a.text(strip=True) for a in tree.css("a[href*='/films/theme/'], a[href*='/films/mini-theme/']") if a.text(strip=True)]
+        
+        runtime = None
+        runtime_el = tree.css_first("p.text-link.text-footer")
+        if runtime_el and "mins" in runtime_el.text():
+            try:
+                runtime = int(runtime_el.text().split()[0])
+            except (ValueError, IndexError):
+                pass
+        
+        avg_rating = None
+        meta = tree.css_first("meta[name='twitter:data2']")
+        if meta:
+            try:
+                avg_rating = float(meta.attributes.get("content", "").split()[0])
+            except (ValueError, IndexError):
+                pass
+        
+        rating_count = None
+        ratings_el = tree.css_first("a[href*='/ratings/']")
+        if ratings_el:
+            try:
+                rating_count = int(float(ratings_el.text(strip=True).replace(",", "").replace("K", "000")))
+            except (ValueError, IndexError):
+                pass
+        
+        return FilmMetadata(
+            slug=slug, title=title, year=year, directors=directors,
+            genres=genres, cast=cast, themes=themes,
+            runtime=runtime, avg_rating=avg_rating, rating_count=rating_count
+        )
