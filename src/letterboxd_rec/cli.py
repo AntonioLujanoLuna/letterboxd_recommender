@@ -102,17 +102,16 @@ def cmd_discover(args):
         with get_db() as conn:
             existing_users = {r['username'] for r in conn.execute("SELECT DISTINCT username FROM user_films")}
         
-        # Discover users, keep fetching until we have enough NEW users
         all_discovered = []
-        fetch_limit = args.limit
-        max_attempts = 5  # Don't fetch endlessly
+        max_attempts = 5
         attempts = 0
         
-        print(f"Target: {args.limit} new users")
+        print(f"Target: {args.limit} new users (have {len(existing_users)} existing)")
         
         while len(all_discovered) < args.limit and attempts < max_attempts:
             attempts += 1
-            batch_size = fetch_limit * (attempts + 1)
+            # Fetch more users each attempt to find new ones
+            batch_size = args.limit * (attempts + 1)
             
             # Discover users based on source
             if args.source == 'following':
@@ -136,67 +135,34 @@ def cmd_discover(args):
                 print(f"Unknown source: {args.source}")
                 return
             
-            # Filter to new users
+            # Filter to new users only
             new_usernames = [u for u in usernames if u not in existing_users and u not in all_discovered]
             all_discovered.extend(new_usernames)
             
-            # Break only if source is exhausted (returned fewer than requested)
+            print(f"  Attempt {attempts}: found {len(usernames)} users, {len(new_usernames)} new")
+            
+            # Source exhausted - can't get more users
             if len(usernames) < batch_size:
-                if not new_usernames:
-                    print(f"Source exhausted after {attempts} attempts, no new users found")
                 break
             
-            # Progress feedback
-            if not new_usernames:
-                print(f"  Attempt {attempts}: all {len(usernames)} users already scraped, expanding search...")
-
-            attempts += 1
-            batch_size = fetch_limit * (attempts + 1)  # Increase fetch size each attempt
-            
-            # Discover users based on source
-            if args.source == 'following':
-                if not args.username:
-                    print("--username is required for 'following' source")
-                    return
-                usernames = scraper.scrape_following(args.username, limit=batch_size)
-            elif args.source == 'followers':
-                if not args.username:
-                    print("--username is required for 'followers' source")
-                    return
-                usernames = scraper.scrape_followers(args.username, limit=batch_size)
-            elif args.source == 'popular':
-                usernames = scraper.scrape_popular_members(limit=batch_size)
-            elif args.source == 'film':
-                if not args.film_slug:
-                    print("--film-slug is required for 'film' source")
-                    return
-                usernames = scraper.scrape_film_fans(args.film_slug, limit=batch_size)
-            else:
-                print(f"Unknown source: {args.source}")
-                return
-            
-            # Filter to new users
-            new_usernames = [u for u in usernames if u not in existing_users and u not in all_discovered]
-            all_discovered.extend(new_usernames)
-            
-            if len(new_usernames) == 0:
-                print(f"No more new users found after {attempts} attempts")
+            # Got enough new users
+            if len(all_discovered) >= args.limit:
                 break
         
+        # Trim to requested limit
         new_usernames = all_discovered[:args.limit]
-
+        
         if not new_usernames:
-            print(f"No new users to scrape! (checked {len(existing_users)} existing users)")
+            print(f"No new users found! All discovered users already in database.")
             return
-
-        print(f"\nDiscovered {len(new_usernames)} new users. Scraping their data...")
+        
+        print(f"\nScraping {len(new_usernames)} new users...")
         
         # Scrape each user
         for username in tqdm(new_usernames, desc="Users"):
             try:
                 interactions = scraper.scrape_user(username)
                 
-                # Batch insert user films
                 with get_db() as conn:
                     conn.executemany("""
                         INSERT OR REPLACE INTO user_films 
@@ -207,10 +173,8 @@ def cmd_discover(args):
                     
                     existing_film_slugs = {r['slug'] for r in conn.execute("SELECT slug FROM films")}
                 
-                # Add to existing users set
                 existing_users.add(username)
                 
-                # Scrape and batch insert film metadata
                 new_slugs = [i.film_slug for i in interactions if i.film_slug not in existing_film_slugs]
                 _scrape_film_metadata(scraper, new_slugs, max_per_batch=100)
                 
