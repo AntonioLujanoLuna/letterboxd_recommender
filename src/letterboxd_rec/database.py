@@ -57,5 +57,6 @@ def load_json(val):
         return val
     try:
         return json.loads(val)
-    except:
+    except (json.JSONDecodeError, TypeError) as e:
+        print(f"Warning: Failed to parse JSON: {e}")
         return []

@@ -5,6 +5,33 @@ from .scraper import LetterboxdScraper
 from .recommender import MetadataRecommender, CollaborativeRecommender
 from tqdm import tqdm
 
+def _scrape_film_metadata(scraper, slugs, max_per_batch=100):
+    """Helper to scrape film metadata for a list of slugs."""
+    if not slugs:
+        return
+    
+    limited_slugs = slugs[:max_per_batch]
+    metadata_list = []
+    
+    for slug in tqdm(limited_slugs, desc="Metadata"):
+        meta = scraper.scrape_film(slug)
+        if meta:
+            metadata_list.append((
+                meta.slug, meta.title, meta.year,
+                json.dumps(meta.directors), json.dumps(meta.genres),
+                json.dumps(meta.cast), json.dumps(meta.themes),
+                meta.runtime, meta.avg_rating, meta.rating_count
+            ))
+    
+    # Batch insert all metadata
+    if metadata_list:
+        with get_db() as conn:
+            conn.executemany("""
+                INSERT OR REPLACE INTO films 
+                (slug, title, year, directors, genres, cast, themes, runtime, avg_rating, rating_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, metadata_list)
+
 def cmd_scrape(args):
     """Scrape a user's Letterboxd data."""
     init_db()
@@ -13,35 +40,22 @@ def cmd_scrape(args):
     try:
         interactions = scraper.scrape_user(args.username)
         
+        # Batch insert user films
         with get_db() as conn:
-            for i in interactions:
-                conn.execute("""
-                    INSERT OR REPLACE INTO user_films 
-                    (username, film_slug, rating, watched, watchlisted, liked, scraped_at)
-                    VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
-                """, (args.username, i.film_slug, i.rating, i.watched, i.watchlisted, i.liked))
-        
-        # Scrape metadata for new films
-        print("\nFetching film metadata...")
-        with get_db() as conn:
+            conn.executemany("""
+                INSERT OR REPLACE INTO user_films 
+                (username, film_slug, rating, watched, watchlisted, liked, scraped_at)
+                VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+            """, [(args.username, i.film_slug, i.rating, i.watched, i.watchlisted, i.liked) 
+                  for i in interactions])
+            
             existing = {r['slug'] for r in conn.execute("SELECT slug FROM films")}
         
         new_slugs = [i.film_slug for i in interactions if i.film_slug not in existing]
         
-        for slug in tqdm(new_slugs, desc="Metadata"):
-            meta = scraper.scrape_film(slug)
-            if meta:
-                with get_db() as conn:
-                    conn.execute("""
-                        INSERT OR REPLACE INTO films 
-                        (slug, title, year, directors, genres, cast, themes, runtime, avg_rating, rating_count)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        meta.slug, meta.title, meta.year,
-                        json.dumps(meta.directors), json.dumps(meta.genres),
-                        json.dumps(meta.cast), json.dumps(meta.themes),
-                        meta.runtime, meta.avg_rating, meta.rating_count
-                    ))
+        # Scrape and batch insert film metadata
+        print("\nFetching film metadata...")
+        _scrape_film_metadata(scraper, new_slugs)
         
         print(f"\nDone! {len(interactions)} films for {args.username}")
         
@@ -114,37 +128,24 @@ def cmd_discover(args):
             try:
                 interactions = scraper.scrape_user(username)
                 
+                # Batch insert user films
                 with get_db() as conn:
-                    for i in interactions:
-                        conn.execute("""
-                            INSERT OR REPLACE INTO user_films 
-                            (username, film_slug, rating, watched, watchlisted, liked, scraped_at)
-                            VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
-                        """, (username, i.film_slug, i.rating, i.watched, i.watchlisted, i.liked))
+                    conn.executemany("""
+                        INSERT OR REPLACE INTO user_films 
+                        (username, film_slug, rating, watched, watchlisted, liked, scraped_at)
+                        VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+                    """, [(username, i.film_slug, i.rating, i.watched, i.watchlisted, i.liked) 
+                          for i in interactions])
+                    
+                    existing_film_slugs = {r['slug'] for r in conn.execute("SELECT slug FROM films")}
                 
                 # Add to existing users set
                 existing_users.add(username)
                 
-                # Scrape metadata for new films
-                with get_db() as conn:
-                    existing = {r['slug'] for r in conn.execute("SELECT slug FROM films")}
+                # Scrape and batch insert film metadata
+                new_slugs = [i.film_slug for i in interactions if i.film_slug not in existing_film_slugs]
+                _scrape_film_metadata(scraper, new_slugs, max_per_batch=100)
                 
-                new_slugs = [i.film_slug for i in interactions if i.film_slug not in existing]
-                
-                for slug in new_slugs[:100]:  # Limit metadata scraping per user
-                    meta = scraper.scrape_film(slug)
-                    if meta:
-                        with get_db() as conn:
-                            conn.execute("""
-                                INSERT OR REPLACE INTO films 
-                                (slug, title, year, directors, genres, cast, themes, runtime, avg_rating, rating_count)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """, (
-                                meta.slug, meta.title, meta.year,
-                                json.dumps(meta.directors), json.dumps(meta.genres),
-                                json.dumps(meta.cast), json.dumps(meta.themes),
-                                meta.runtime, meta.avg_rating, meta.rating_count
-                            ))
             except Exception as e:
                 print(f"Error scraping {username}: {e}")
         
@@ -168,8 +169,9 @@ def cmd_recommend(args):
         strategy = args.strategy if hasattr(args, 'strategy') else 'metadata'
         
         if strategy == 'collaborative':
-            # Load all user data
+            # Load all user data and film metadata
             all_user_films = {}
+            all_films = {}
             with get_db() as conn:
                 all_users = [r['username'] for r in conn.execute("SELECT DISTINCT username FROM user_films")]
                 for user in all_users:
@@ -177,8 +179,11 @@ def cmd_recommend(args):
                         SELECT film_slug as slug, rating, watched, watchlisted, liked
                         FROM user_films WHERE username = ?
                     """, (user,))]
+                
+                # Load film metadata for filtering and display
+                all_films = {r['slug']: dict(r) for r in conn.execute("SELECT * FROM films")}
             
-            recommender = CollaborativeRecommender(all_user_films)
+            recommender = CollaborativeRecommender(all_user_films, all_films)
             recs = recommender.recommend(
                 args.username,
                 n=args.limit,
@@ -200,6 +205,55 @@ def cmd_recommend(args):
             )
     
     print(f"\nTop {len(recs)} recommendations for {args.username} ({strategy}):")
+    for i, r in enumerate(recs, 1):
+        print(f"{i}. {r.title} ({r.year}) - Score: {r.score:.1f}")
+        print(f"   Why: {', '.join(r.reasons)}")
+
+def cmd_stats(args):
+    """Show database statistics."""
+    with get_db() as conn:
+        user_count = conn.execute("SELECT COUNT(DISTINCT username) FROM user_films").fetchone()[0]
+        film_count = conn.execute("SELECT COUNT(*) FROM films").fetchone()[0]
+        interaction_count = conn.execute("SELECT COUNT(*) FROM user_films").fetchone()[0]
+        rated_count = conn.execute("SELECT COUNT(*) FROM user_films WHERE rating IS NOT NULL").fetchone()[0]
+        
+        print(f"\nDatabase Statistics:")
+        print(f"  Users: {user_count}")
+        print(f"  Films: {film_count}")
+        print(f"  Total interactions: {interaction_count}")
+        print(f"  Rated interactions: {rated_count}")
+        
+        if user_count > 0:
+            # Show top users by film count
+            top_users = conn.execute("""
+                SELECT username, COUNT(*) as film_count 
+                FROM user_films 
+                GROUP BY username 
+                ORDER BY film_count DESC 
+                LIMIT 5
+            """).fetchall()
+            
+            print(f"\nTop users by film count:")
+            for user, count in top_users:
+                print(f"  {user}: {count} films")
+
+def cmd_similar(args):
+    """Find films similar to a specific film."""
+    with get_db() as conn:
+        all_films = [dict(r) for r in conn.execute("SELECT * FROM films")]
+    
+    if not all_films:
+        print("No films in database. Run scrape first.")
+        return
+    
+    recommender = MetadataRecommender(all_films)
+    recs = recommender.similar_to(args.slug, n=args.limit)
+    
+    if not recs:
+        print(f"No film found with slug '{args.slug}'")
+        return
+    
+    print(f"\nFilms similar to {args.slug}:")
     for i, r in enumerate(recs, 1):
         print(f"{i}. {r.title} ({r.year}) - Score: {r.score:.1f}")
         print(f"   Why: {', '.join(r.reasons)}")
@@ -234,6 +288,16 @@ def main():
     rec_parser.add_argument("--exclude-genres", nargs="+", help="Exclude genres (metadata only)")
     rec_parser.add_argument("--min-rating", type=float, help="Minimum community rating (metadata only)")
     rec_parser.set_defaults(func=cmd_recommend)
+    
+    # Stats command
+    stats_parser = subparsers.add_parser("stats", help="Show database statistics")
+    stats_parser.set_defaults(func=cmd_stats)
+    
+    # Similar command
+    similar_parser = subparsers.add_parser("similar", help="Find films similar to a specific film")
+    similar_parser.add_argument("slug", help="Film slug (e.g., 'the-matrix')")
+    similar_parser.add_argument("--limit", type=int, default=10, help="Number of similar films")
+    similar_parser.set_defaults(func=cmd_similar)
     
     args = parser.parse_args()
     args.func(args)

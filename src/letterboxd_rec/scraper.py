@@ -37,17 +37,29 @@ class LetterboxdScraper:
         )
         self.delay = delay
     
-    def _get(self, url: str) -> HTMLParser | None:
+    def _get(self, url: str, max_retries: int = 3) -> HTMLParser | None:
         time.sleep(self.delay)
-        try:
-            resp = self.client.get(url)
-            if resp.status_code == 404:
+        
+        for attempt in range(max_retries):
+            try:
+                resp = self.client.get(url)
+                if resp.status_code == 404:
+                    return None
+                resp.raise_for_status()
+                return HTMLParser(resp.text)
+            except httpx.TimeoutException as e:
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt  # Exponential backoff
+                    print(f"Timeout on {url}, retrying in {wait_time}s... (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(wait_time)
+                else:
+                    print(f"Error: {url} - {e} (max retries exceeded)")
+                    return None
+            except httpx.HTTPError as e:
+                print(f"Error: {url} - {e}")
                 return None
-            resp.raise_for_status()
-            return HTMLParser(resp.text)
-        except httpx.HTTPError as e:
-            print(f"Error: {url} - {e}")
-            return None
+        
+        return None
     
     def scrape_user(self, username: str) -> list[FilmInteraction]:
         """Scrape all film interactions for a user."""

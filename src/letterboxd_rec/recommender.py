@@ -235,12 +235,14 @@ class CollaborativeRecommender:
     Finds users with similar taste and recommends films they liked.
     """
     
-    def __init__(self, all_user_films: dict[str, list[dict]]):
+    def __init__(self, all_user_films: dict[str, list[dict]], film_metadata: dict[str, dict] | None = None):
         """
         Args:
             all_user_films: Dict mapping username -> list of user_films dicts
+            film_metadata: Optional dict mapping slug -> film metadata dict for filtering and display
         """
         self.all_user_films = all_user_films
+        self.films = film_metadata or {}
     
     def recommend(
         self,
@@ -278,6 +280,14 @@ class CollaborativeRecommender:
                 if slug in seen:
                     continue
                 
+                # Apply year filters if metadata available
+                if self.films and slug in self.films:
+                    year = self.films[slug].get('year')
+                    if min_year and year and year < min_year:
+                        continue
+                    if max_year and year and year > max_year:
+                        continue
+                
                 rating = film.get('rating')
                 liked = film.get('liked', False)
                 
@@ -302,17 +312,16 @@ class CollaborativeRecommender:
         # Sort by score
         ranked = sorted(film_scores.items(), key=lambda x: -x[1])
         
-        # Build results (we don't have film metadata here, so we'll need to look it up)
+        # Build results with film metadata if available
         results = []
         for slug, score in ranked[:n]:
-            # Try to get title from any user who has it
-            title = slug
-            year = None
-            for user_films in self.all_user_films.values():
-                for film in user_films:
-                    if film['slug'] == slug:
-                        # If we stored metadata with user_films, we could use it here
-                        break
+            if self.films and slug in self.films:
+                film = self.films[slug]
+                title = film.get('title', slug)
+                year = film.get('year')
+            else:
+                title = slug
+                year = None
             
             results.append(Recommendation(
                 slug=slug,
@@ -327,28 +336,39 @@ class CollaborativeRecommender:
     def _find_neighbors(self, username: str, target_films: list[dict], k: int = 10) -> list[tuple[str, float]]:
         """
         Find k most similar users based on rating overlap.
+        Uses mean-centered ratings to account for different rating scales.
         Returns list of (username, similarity_score) tuples.
         """
         similarities = []
         
-        # Build target user's rating dict
+        # Build target user's rating dict and mean
         target_ratings = {}
         for film in target_films:
             rating = film.get('rating')
             if rating:
                 target_ratings[film['slug']] = rating
         
+        if not target_ratings:
+            return []
+        
+        target_mean = sum(target_ratings.values()) / len(target_ratings)
+        
         # Compare with all other users
         for other_user, other_films in self.all_user_films.items():
             if other_user == username:
                 continue
             
-            # Build other user's rating dict
+            # Build other user's rating dict and mean
             other_ratings = {}
             for film in other_films:
                 rating = film.get('rating')
                 if rating:
                     other_ratings[film['slug']] = rating
+            
+            if not other_ratings:
+                continue
+            
+            other_mean = sum(other_ratings.values()) / len(other_ratings)
             
             # Find common films
             common = set(target_ratings.keys()) & set(other_ratings.keys())
@@ -356,16 +376,15 @@ class CollaborativeRecommender:
             if len(common) < 5:  # Need at least 5 common films
                 continue
             
-            # Compute similarity (Pearson correlation or cosine similarity)
-            # Using simple cosine similarity for now
-            dot_product = sum(target_ratings[s] * other_ratings[s] for s in common)
-            target_magnitude = sum(target_ratings[s] ** 2 for s in common) ** 0.5
-            other_magnitude = sum(other_ratings[s] ** 2 for s in common) ** 0.5
+            # Compute similarity with mean-centered ratings (Pearson-like)
+            numerator = sum((target_ratings[s] - target_mean) * (other_ratings[s] - other_mean) for s in common)
+            target_variance = sum((target_ratings[s] - target_mean) ** 2 for s in common) ** 0.5
+            other_variance = sum((other_ratings[s] - other_mean) ** 2 for s in common) ** 0.5
             
-            if target_magnitude == 0 or other_magnitude == 0:
+            if target_variance == 0 or other_variance == 0:
                 continue
             
-            similarity = dot_product / (target_magnitude * other_magnitude)
+            similarity = numerator / (target_variance * other_variance)
             similarities.append((other_user, similarity))
         
         # Sort by similarity and return top k

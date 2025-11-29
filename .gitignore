@@ -3,3 +3,5 @@
 /debug_fans_endpoint.py
 /PRD.md
 /verify_db.py
+*.pyc
+__pycache__
