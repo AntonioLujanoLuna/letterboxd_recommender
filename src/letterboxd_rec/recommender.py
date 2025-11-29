@@ -385,7 +385,12 @@ class CollaborativeRecommender:
                 continue
             
             similarity = numerator / (target_variance * other_variance)
-            similarities.append((other_user, similarity))
+            
+            # Apply significance weighting - more common films = more reliable
+            confidence = min(len(common) / 20, 1.0)  # Full confidence at 20+ common films
+            weighted_similarity = similarity * confidence
+            
+            similarities.append((other_user, weighted_similarity))
         
         # Sort by similarity and return top k
         similarities.sort(key=lambda x: -x[1])

@@ -111,7 +111,7 @@ def cmd_discover(args):
         
         # Trim to limit
         new_usernames = all_discovered[:args.limit]
-        total_found = len(set(usernames) if 'usernames' in locals() else [])
+        total_found = len(usernames) if usernames else 0
         skipped = total_found - len(new_usernames)
         
         if skipped > 0:
@@ -166,22 +166,20 @@ def cmd_recommend(args):
             print(f"No data for '{args.username}'. Run: python main.py scrape {args.username}")
             return
         
+        # Load film metadata (needed by both strategies)
+        all_films = {r['slug']: dict(r) for r in conn.execute("SELECT * FROM films")}
+        
         strategy = args.strategy if hasattr(args, 'strategy') else 'metadata'
         
         if strategy == 'collaborative':
-            # Load all user data and film metadata
+            # Load all user data
             all_user_films = {}
-            all_films = {}
-            with get_db() as conn:
-                all_users = [r['username'] for r in conn.execute("SELECT DISTINCT username FROM user_films")]
-                for user in all_users:
-                    all_user_films[user] = [dict(r) for r in conn.execute("""
-                        SELECT film_slug as slug, rating, watched, watchlisted, liked
-                        FROM user_films WHERE username = ?
-                    """, (user,))]
-                
-                # Load film metadata for filtering and display
-                all_films = {r['slug']: dict(r) for r in conn.execute("SELECT * FROM films")}
+            all_users = [r['username'] for r in conn.execute("SELECT DISTINCT username FROM user_films")]
+            for user in all_users:
+                all_user_films[user] = [dict(r) for r in conn.execute("""
+                    SELECT film_slug as slug, rating, watched, watchlisted, liked
+                    FROM user_films WHERE username = ?
+                """, (user,))]
             
             recommender = CollaborativeRecommender(all_user_films, all_films)
             recs = recommender.recommend(
@@ -192,8 +190,7 @@ def cmd_recommend(args):
             )
         else:
             # Metadata-based (default)
-            all_films = [dict(r) for r in conn.execute("SELECT * FROM films")]
-            recommender = MetadataRecommender(all_films)
+            recommender = MetadataRecommender(list(all_films.values()))
             recs = recommender.recommend(
                 user_films,
                 n=args.limit,

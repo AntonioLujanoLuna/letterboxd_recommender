@@ -193,7 +193,7 @@ class LetterboxdScraper:
             if "mins" in text:
                 try:
                     runtime = int(text.split()[0])
-                except:
+                except (ValueError, IndexError):
                     pass
         
         # Average rating
@@ -203,7 +203,7 @@ class LetterboxdScraper:
             content = meta.attributes.get("content", "")
             try:
                 avg_rating = float(content.split()[0])
-            except:
+            except (ValueError, IndexError):
                 pass
         
         # Rating count
@@ -213,7 +213,7 @@ class LetterboxdScraper:
             text = ratings_el.text(strip=True).replace(",", "").replace("K", "000")
             try:
                 rating_count = int(float(text))
-            except:
+            except (ValueError, IndexError):
                 pass
         
         return FilmMetadata(
