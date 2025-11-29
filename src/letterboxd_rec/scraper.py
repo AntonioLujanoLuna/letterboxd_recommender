@@ -319,5 +319,34 @@ class LetterboxdScraper:
         print(f"  Found {len(usernames)} popular members")
         return usernames
     
+    def scrape_film_fans(self, slug: str, limit: int = 50) -> list[str]:
+        """Scrape users who are fans of a specific film."""
+        usernames = []
+        page = 1
+        
+        print(f"Scraping fans of {slug}...")
+        while len(usernames) < limit:
+            tree = self._get(f"{self.BASE}/film/{slug}/fans/page/{page}/")
+            if not tree:
+                break
+            
+            links = tree.css("a.name")
+            if not links:
+                break
+            
+            for link in links:
+                href = link.attributes.get("href", "")
+                if href.startswith("/") and href.endswith("/"):
+                    user = href.strip("/")
+                    if user and user not in usernames:
+                        usernames.append(user)
+                        if len(usernames) >= limit:
+                            break
+            
+            page += 1
+        
+        print(f"  Found {len(usernames)} fans of {slug}")
+        return usernames
+    
     def close(self):
         self.client.close()

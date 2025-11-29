@@ -29,6 +29,7 @@ class MetadataRecommender:
     
     def __init__(self, all_films: list[dict]):
         self.films = {f['slug']: f for f in all_films}
+        self.films_dict = self.films  # Alias for consistency
     
     def recommend(
         self,
@@ -39,6 +40,8 @@ class MetadataRecommender:
         genres: list[str] | None = None,
         exclude_genres: list[str] | None = None,
         min_rating: float | None = None,
+        diversity: bool = False,
+        max_per_director: int = 2,
     ) -> list[Recommendation]:
         """Generate recommendations."""
         
@@ -81,7 +84,11 @@ class MetadataRecommender:
         # Sort by score
         candidates.sort(key=lambda x: -x[1])
         
-        # Build results
+        # Apply diversity if requested
+        if diversity:
+            return self._diversify(candidates, n, max_per_director)
+        
+        # Build results (standard mode)
         results = []
         for slug, score, reasons in candidates[:n]:
             film = self.films[slug]
@@ -227,6 +234,44 @@ class MetadataRecommender:
             )
             for s, sc, r in candidates[:n]
         ]
+    
+    def _diversify(self, candidates: list[tuple[str, float, list[str]]], n: int, max_per_director: int = 2) -> list[Recommendation]:
+        """Select top n while limiting per-director concentration."""
+        from collections import defaultdict
+        
+        results = []
+        director_counts = defaultdict(int)
+        
+        for slug, score, reasons in candidates:
+            film = self.films_dict.get(slug)
+            if not film:
+                continue
+            
+            directors = load_json(film.get('directors'))
+            
+            # Check if any director has hit the limit
+            if any(director_counts[d] >= max_per_director for d in directors):
+                continue
+            
+            # Add to results
+            title = film.get('title', slug)
+            year = film.get('year')
+            results.append(Recommendation(
+                slug=slug,
+                title=title,
+                year=year,
+                score=score,
+                reasons=reasons[:3]
+            ))
+            
+            # Update director counts
+            for d in directors:
+                director_counts[d] += 1
+            
+            if len(results) >= n:
+                break
+        
+        return results
 
 
 class CollaborativeRecommender:
