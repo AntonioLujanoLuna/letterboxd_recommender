@@ -298,6 +298,11 @@ def cmd_recommend(args):
             "url": f"https://letterboxd.com/film/{r.slug}/"
         } for r in recs]
         print(json_module.dumps(output, indent=2))
+    elif hasattr(args, 'format') and args.format == 'csv':
+        print("Title,Year,URL,Score,Reasons")
+        for r in recs:
+            reasons = "; ".join(r.reasons).replace('"', '""')
+            print(f'"{r.title}",{r.year},https://letterboxd.com/film/{r.slug}/,{r.score:.2f},"{reasons}"')
     elif hasattr(args, 'format') and args.format == 'markdown':
         print(f"\n# Top {len(recs)} recommendations for {args.username} ({strategy})\n")
         for i, r in enumerate(recs, 1):
@@ -340,45 +345,42 @@ def cmd_stats(args):
         
         if hasattr(args, 'verbose') and args.verbose:
             # Films without metadata
-            with conn:
-                missing_metadata = conn.execute("""
-                    SELECT COUNT(DISTINCT uf.film_slug) 
-                    FROM user_films uf 
-                    LEFT JOIN films f ON uf.film_slug = f.slug 
-                    WHERE f.slug IS NULL
-                """).fetchone()[0]
-                
-                print(f"\n  Films without metadata: {missing_metadata}")
+            missing_metadata = conn.execute("""
+                SELECT COUNT(DISTINCT uf.film_slug) 
+                FROM user_films uf 
+                LEFT JOIN films f ON uf.film_slug = f.slug 
+                WHERE f.slug IS NULL
+            """).fetchone()[0]
+            
+            print(f"\n  Films without metadata: {missing_metadata}")
             
             # Staleness - oldest scraped users
-            with conn:
-                oldest = conn.execute("""
-                    SELECT username, MIN(scraped_at) as oldest_scrape
-                    FROM user_films 
-                    GROUP BY username 
-                    ORDER BY oldest_scrape 
-                    LIMIT 5
-                """).fetchall()
-                
-                if oldest:
-                    print(f"\nOldest scraped users:")
-                    for user, scrape_time in oldest:
-                        print(f"  {user}: {scrape_time}")
+            oldest = conn.execute("""
+                SELECT username, MIN(scraped_at) as oldest_scrape
+                FROM user_films 
+                GROUP BY username 
+                ORDER BY oldest_scrape 
+                LIMIT 5
+            """).fetchall()
+            
+            if oldest:
+                print(f"\nOldest scraped users:")
+                for user, scrape_time in oldest:
+                    print(f"  {user}: {scrape_time}")
             
             # Genre distribution
-            with conn:
-                film_genres = conn.execute("SELECT genres FROM films WHERE genres IS NOT NULL").fetchall()
-                from collections import Counter
-                genre_counts = Counter()
-                for (genres_json,) in film_genres:
-                    genres = load_json(genres_json)
-                    for g in genres:
-                        genre_counts[g] += 1
-                
-                if genre_counts:
-                    print(f"\nTop genres in database:")
-                    for genre, count in genre_counts.most_common(10):
-                        print(f"  {genre}: {count} films")
+            film_genres = conn.execute("SELECT genres FROM films WHERE genres IS NOT NULL").fetchall()
+            from collections import Counter
+            genre_counts = Counter()
+            for (genres_json,) in film_genres:
+                genres = load_json(genres_json)
+                for g in genres:
+                    genre_counts[g] += 1
+            
+            if genre_counts:
+                print(f"\nTop genres in database:")
+                for genre, count in genre_counts.most_common(10):
+                    print(f"  {genre}: {count} films")
 
 def cmd_export(args):
     """Export database to JSON file."""
@@ -503,6 +505,70 @@ def cmd_similar(args):
         print(f"{i}. {r.title} ({r.year}) - Score: {r.score:.1f}")
         print(f"   Why: {', '.join(r.reasons)}")
 
+def cmd_triage(args):
+    """Rank user's watchlist by predicted enjoyment."""
+    with get_db() as conn:
+        # Get watched films for profile building
+        user_films = [dict(r) for r in conn.execute("""
+            SELECT film_slug as slug, rating, watched, watchlisted, liked
+            FROM user_films WHERE username = ?
+        """, (args.username,))]
+        
+        # Get watchlist
+        watchlist = [r['film_slug'] for r in conn.execute("""
+            SELECT film_slug FROM user_films 
+            WHERE username = ? AND watchlisted = 1
+        """, (args.username,))]
+        
+        all_films = {r['slug']: dict(r) for r in conn.execute("SELECT * FROM films")}
+    
+    if not user_films:
+        print(f"No data for '{args.username}'. Run: python main.py scrape {args.username}")
+        return
+    
+    if not watchlist:
+        print(f"No watchlist data for '{args.username}'.")
+        return
+    
+    recommender = MetadataRecommender(list(all_films.values()))
+    recs = recommender.recommend_from_candidates(user_films, watchlist, n=args.limit)
+    
+    print(f"\nWatchlist Triage for {args.username} (Top {len(recs)}):")
+    for i, r in enumerate(recs, 1):
+        print(f"{i}. {r.title} ({r.year}) - Score: {r.score:.1f}")
+        print(f"   Why: {', '.join(r.reasons)}")
+
+def cmd_gaps(args):
+    """Find gaps in filmography of favorite directors."""
+    with get_db() as conn:
+        user_films = [dict(r) for r in conn.execute("""
+            SELECT film_slug as slug, rating, watched, watchlisted, liked
+            FROM user_films WHERE username = ?
+        """, (args.username,))]
+        
+        all_films = {r['slug']: dict(r) for r in conn.execute("SELECT * FROM films")}
+    
+    if not user_films:
+        print(f"No data for '{args.username}'. Run: python main.py scrape {args.username}")
+        return
+    
+    recommender = MetadataRecommender(list(all_films.values()))
+    gaps = recommender.find_gaps(
+        user_films, 
+        min_director_score=args.min_score,
+        limit_per_director=args.limit
+    )
+    
+    if not gaps:
+        print(f"No gaps found for {args.username}. Try lowering --min-score.")
+        return
+    
+    print(f"\nFilmography Gaps for {args.username}:")
+    for director, recs in sorted(gaps.items(), key=lambda x: -len(x[1])):
+        print(f"\n{director}:")
+        for r in recs:
+            print(f"  - {r.title} ({r.year}) [{r.score:.1f}]")
+
 def main():
     parser = argparse.ArgumentParser(description="Letterboxd Recommender")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -537,7 +603,7 @@ def main():
     rec_parser.add_argument("--min-rating", type=float, help="Minimum community rating (metadata only)")
     rec_parser.add_argument("--diversity", action="store_true", help="Enable diversity mode (metadata only)")
     rec_parser.add_argument("--max-per-director", type=int, default=2, help="Max films per director (diversity mode)")
-    rec_parser.add_argument("--format", choices=['text', 'json', 'markdown'], default='text',
+    rec_parser.add_argument("--format", choices=['text', 'json', 'markdown', 'csv'], default='text',
                             help="Output format")
     rec_parser.set_defaults(func=cmd_recommend)
     
@@ -567,6 +633,19 @@ def main():
     similar_parser.add_argument("slug", help="Film slug (e.g., 'the-matrix')")
     similar_parser.add_argument("--limit", type=int, default=10, help="Number of similar films")
     similar_parser.set_defaults(func=cmd_similar)
+    
+    # Triage command
+    triage_parser = subparsers.add_parser("triage", help="Rank watchlist by predicted enjoyment")
+    triage_parser.add_argument("username", help="Letterboxd username")
+    triage_parser.add_argument("--limit", type=int, default=20, help="Number of films to show")
+    triage_parser.set_defaults(func=cmd_triage)
+    
+    # Gaps command
+    gaps_parser = subparsers.add_parser("gaps", help="Find essential missing films from favorite directors")
+    gaps_parser.add_argument("username", help="Letterboxd username")
+    gaps_parser.add_argument("--min-score", type=float, default=2.0, help="Minimum director affinity score")
+    gaps_parser.add_argument("--limit", type=int, default=3, help="Max films per director")
+    gaps_parser.set_defaults(func=cmd_gaps)
     
     args = parser.parse_args()
     args.func(args)

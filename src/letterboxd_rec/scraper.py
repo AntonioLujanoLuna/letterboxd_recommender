@@ -56,6 +56,14 @@ class LetterboxdScraper:
                 else:
                     print(f"Error: {url} - {e} (max retries exceeded)")
                     return None
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 429:
+                    retry_after = int(e.response.headers.get("Retry-After", 60))
+                    print(f"Rate limited (429) on {url}, waiting {retry_after}s...")
+                    time.sleep(retry_after)
+                    continue
+                print(f"Error: {url} - {e}")
+                return None
             except httpx.HTTPError as e:
                 print(f"Error: {url} - {e}")
                 return None
@@ -382,6 +390,16 @@ class AsyncLetterboxdScraper:
                 resp = await client.get(f"{self.BASE}/film/{slug}/")
                 if resp.status_code == 404:
                     return None
+                
+                if resp.status_code == 429:
+                    retry_after = int(resp.headers.get("Retry-After", 60))
+                    print(f"Rate limited (429) on {slug}, waiting {retry_after}s...")
+                    await asyncio.sleep(retry_after)
+                    # Retry once
+                    resp = await client.get(f"{self.BASE}/film/{slug}/")
+                    if resp.status_code == 429:
+                        return None
+                
                 resp.raise_for_status()
                 return self._parse_film_page(resp.text, slug)
             except Exception as e:
@@ -402,10 +420,10 @@ class AsyncLetterboxdScraper:
             except ValueError:
                 pass
         
-        directors = [a.text(strip=True) for a in tree.css("a[href*='/director/']") if a.text(strip=True)]
-        genres = [a.text(strip=True) for a in tree.css("a[href*='/films/genre/']") if a.text(strip=True)]
-        cast = [a.text(strip=True) for a in tree.css("a[href*='/actor/']")[:10] if a.text(strip=True)]
-        themes = [a.text(strip=True) for a in tree.css("a[href*='/films/theme/'], a[href*='/films/mini-theme/']") if a.text(strip=True)]
+        directors = list(dict.fromkeys([a.text(strip=True) for a in tree.css("a[href*='/director/']") if a.text(strip=True)]))
+        genres = list(dict.fromkeys([a.text(strip=True) for a in tree.css("a[href*='/films/genre/']") if a.text(strip=True)]))
+        cast = list(dict.fromkeys([a.text(strip=True) for a in tree.css("a[href*='/actor/']")[:10] if a.text(strip=True)]))
+        themes = list(dict.fromkeys([a.text(strip=True) for a in tree.css("a[href*='/films/theme/'], a[href*='/films/mini-theme/']") if a.text(strip=True)]))
         
         runtime = None
         runtime_el = tree.css_first("p.text-link.text-footer")

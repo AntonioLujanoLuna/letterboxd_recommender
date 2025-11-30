@@ -102,6 +102,102 @@ class MetadataRecommender:
         
         return results
     
+    def recommend_from_candidates(
+        self,
+        user_films: list[dict],
+        candidates: list[str],
+        n: int = 20,
+    ) -> list[Recommendation]:
+        """Score and rank a specific list of films (e.g. watchlist)."""
+        # Build user profile
+        profile = build_profile(user_films, self.films)
+        
+        scored_candidates = []
+        for slug in candidates:
+            if slug not in self.films:
+                continue
+            
+            film = self.films[slug]
+            score, reasons = self._score_film(film, profile)
+            
+            if score > 0:
+                scored_candidates.append((slug, score, reasons))
+        
+        # Sort by score
+        scored_candidates.sort(key=lambda x: -x[1])
+        
+        results = []
+        for slug, score, reasons in scored_candidates[:n]:
+            film = self.films[slug]
+            results.append(Recommendation(
+                slug=slug,
+                title=film.get('title', slug),
+                year=film.get('year'),
+                score=score,
+                reasons=reasons[:3]
+            ))
+        
+        return results
+
+    def find_gaps(
+        self,
+        user_films: list[dict],
+        min_director_score: float = 2.0,
+        limit_per_director: int = 3
+    ) -> dict[str, list[Recommendation]]:
+        """Find unseen films from directors the user loves."""
+        profile = build_profile(user_films, self.films)
+        seen = {f['slug'] for f in user_films}
+        
+        gaps = {}
+        
+        # Identify high affinity directors
+        favorite_directors = [d for d, s in profile.directors.items() if s >= min_director_score]
+        
+        for director in favorite_directors:
+            # Find all films by this director
+            director_films = []
+            for slug, film in self.films.items():
+                if slug in seen:
+                    continue
+                
+                film_directors = load_json(film.get('directors'))
+                if director in film_directors:
+                    director_films.append(film)
+            
+            if not director_films:
+                continue
+            
+            # Rank by community rating/popularity (using simple heuristic)
+            # We want "essential" films, so rating count and avg rating matter
+            ranked_films = []
+            for film in director_films:
+                # Score purely on "essentialness"
+                score = 0
+                if film.get('avg_rating'):
+                    score += film['avg_rating']
+                if film.get('rating_count'):
+                    score += min(film['rating_count'] / 10000, 2.0) # Cap popularity bonus
+                
+                ranked_films.append((film, score))
+            
+            ranked_films.sort(key=lambda x: -x[1])
+            
+            recs = []
+            for film, score in ranked_films[:limit_per_director]:
+                recs.append(Recommendation(
+                    slug=film['slug'],
+                    title=film.get('title', film['slug']),
+                    year=film.get('year'),
+                    score=score,
+                    reasons=[f"Essential {director}"]
+                ))
+            
+            if recs:
+                gaps[director] = recs
+        
+        return gaps
+    
     def _score_film(self, film: dict, profile: UserProfile) -> tuple[float, list[str]]:
         """
         Score a film against user profile.
@@ -185,7 +281,7 @@ class MetadataRecommender:
         target_genres = set(load_json(target.get('genres')))
         target_directors = set(load_json(target.get('directors')))
         target_cast = set(load_json(target.get('cast', []))[:5])
-        target_decade = (target.get('year') // 10) * 10 if target.get('year') else None
+        target_decade = (target.get('year') // 10) * 10 if target.get('year') is not None else None
         
         candidates = []
         for other_slug, film in self.films.items():
