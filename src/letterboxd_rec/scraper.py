@@ -26,6 +26,12 @@ class FilmMetadata:
     runtime: int | None
     avg_rating: float | None
     rating_count: int | None
+    # Phase 1 enhancements
+    countries: list[str]
+    languages: list[str]
+    writers: list[str]
+    cinematographers: list[str]
+    composers: list[str]
 
 class LetterboxdScraper:
     BASE = "https://letterboxd.com"
@@ -225,10 +231,47 @@ class LetterboxdScraper:
             except (ValueError, IndexError):
                 pass
         
+        # Phase 1: Countries
+        countries = []
+        for a in tree.css("a[href*='/films/country/']"):
+            country = a.text(strip=True)
+            if country and country not in countries:
+                countries.append(country)
+        
+        # Phase 1: Languages  
+        languages = []
+        for a in tree.css("a[href*='/films/language/']"):
+            lang = a.text(strip=True)
+            if lang and lang not in languages:
+                languages.append(lang)
+        
+        # Phase 1: Writers (look for screenplay, writer, story credits)
+        writers = []
+        for a in tree.css("a[href*='/writer/']"):
+            name = a.text(strip=True)
+            if name and name not in writers:
+                writers.append(name)
+        
+        # Phase 1: Cinematographers
+        cinematographers = []
+        for a in tree.css("a[href*='/cinematography/']"):
+            name = a.text(strip=True)
+            if name and name not in cinematographers:
+                cinematographers.append(name)
+        
+        # Phase 1: Composers
+        composers = []
+        for a in tree.css("a[href*='/composer/']"):
+            name = a.text(strip=True)
+            if name and name not in composers:
+                composers.append(name)
+        
         return FilmMetadata(
             slug=slug, title=title, year=year, directors=directors,
             genres=genres, cast=cast, themes=themes, runtime=runtime,
-            avg_rating=avg_rating, rating_count=rating_count
+            avg_rating=avg_rating, rating_count=rating_count,
+            countries=countries, languages=languages, writers=writers,
+            cinematographers=cinematographers, composers=composers
         )
     
     def _parse_rating(self, span) -> float | None:
@@ -357,8 +400,164 @@ class LetterboxdScraper:
         print(f"  Found {len(usernames)} fans of {slug}")
         return usernames
     
+    def scrape_favorites(self, username: str) -> list[str]:
+        """Scrape user's favorite films (4-film profile showcase)."""
+        tree = self._get(f"{self.BASE}/{username}/")
+        if not tree:
+            return []
+        
+        favorites = []
+        
+        # Favorites are in the profile showcase section
+        # Look for poster containers in the favorites section
+        showcase = tree.css("section.profile-favorites li.poster-container, section#favourites li.poster-container")
+        for item in showcase[:4]:  # Max 4 favorites
+            # Try data attribute first
+            react_comp = item.css_first("div.react-component")
+            if react_comp:
+                slug = react_comp.attributes.get("data-film-slug")
+                if slug:
+                    favorites.append(slug)
+                    continue
+            
+            # Fallback: extract from link
+            link = item.css_first("div[data-film-slug]")
+            if link:
+                slug = link.attributes.get("data-film-slug")
+                if slug:
+                    favorites.append(slug)
+        
+        return favorites
+    
+    def scrape_user_lists(self, username: str, limit: int = 50) -> list[dict]:
+        """
+        Scrape all lists for a user.
+        
+        Returns:
+            List of dicts with keys: list_slug, list_name, is_ranked
+        """
+        lists = []
+        page = 1
+        
+        print(f"Scraping {username}'s lists...")
+        while len(lists) < limit:
+            tree = self._get(f"{self.BASE}/{username}/lists/page/{page}/")
+            if not tree:
+                break
+            
+            # Try different selectors for list items
+            list_items = tree.css("section.list-summary")
+            if not list_items:
+                # Fallback selector
+                list_items = tree.css("section.film-list-summary")
+            
+            if not list_items:
+                break
+            
+            for item in list_items:
+                # Extract list URL and name
+                link = item.css_first("h2 a, h3 a")
+                if not link:
+                    continue
+                
+                href = link.attributes.get("href", "")
+                list_name = link.text(strip=True)
+                
+                # Extract slug from /username/list/list-slug/
+                parts = href.strip("/").split("/")
+                if len(parts) >= 3 and parts[1] == "list":
+                    list_slug = parts[2]
+                else:
+                    continue
+                
+                # Detect if ranked (look for numbered list indicators)
+                is_ranked = (
+                    item.css_first(".icon-numbered") is not None or
+                    "numbered"in item.attributes.get("class", "").lower()
+                )
+                
+                lists.append({
+                    "list_slug": list_slug,
+                    "list_name": list_name,
+                    "is_ranked": is_ranked
+                })
+                
+                if len(lists) >= limit:
+                    break
+            
+            page += 1
+        
+        print(f"  Found {len(lists)} lists")
+        return lists
+    
+    def scrape_list_films(self, username: str, list_slug: str) -> list[dict]:
+        """
+        Scrape films from a specific list.
+        
+        Returns:
+            List of dicts with keys: film_slug, position (if ranked)
+        """
+        films = []
+        page = 1
+        
+        while True:
+            tree = self._get(f"{self.BASE}/{username}/list/{list_slug}/page/{page}/")
+            if not tree:
+                break
+            
+            # Check if this is a ranked list by looking for position indicators
+            has_positions = tree.css_first(".list-number, .position") is not None
+            
+            # Get film items
+            items = tree.css("li.poster-container")
+            if not items:
+                break
+            
+            for idx, item in enumerate(items):
+                # Get film slug
+                react_comp = item.css_first("div.react-component")
+                film_slug = None
+                
+                if react_comp:
+                    film_slug = react_comp.attributes.get("data-film-slug")
+                
+                if not film_slug:
+                    # Fallback
+                    link = item.css_first("div[data-film-slug]")
+                    if link:
+                        film_slug = link.attributes.get("data-film-slug")
+                
+                if not film_slug:
+                    continue
+                
+                # Determine position
+                position = None
+                if has_positions:
+                    # Look for explicit position number
+                    pos_el = item.css_first(".list-number, .position")
+                    if pos_el:
+                        try:
+                            pos_text = pos_el.text(strip=True).rstrip(".")
+                            position = int(pos_text)
+                        except (ValueError, AttributeError):
+                            # Fallback to sequential position
+                            position = (page - 1) * len(items) + idx + 1
+                    else:
+                        # Sequential position as fallback
+                        position = (page - 1) * len(items) + idx + 1
+                
+                films.append({
+                    "film_slug": film_slug,
+                    "position": position
+                })
+            
+            page += 1
+        
+        return films
+    
     def close(self):
         self.client.close()
+
 
 
 class AsyncLetterboxdScraper:
@@ -449,8 +648,17 @@ class AsyncLetterboxdScraper:
             except (ValueError, IndexError):
                 pass
         
+        # Phase 1: New fields
+        countries = list(dict.fromkeys([a.text(strip=True) for a in tree.css("a[href*='/films/country/']") if a.text(strip=True)]))
+        languages = list(dict.fromkeys([a.text(strip=True) for a in tree.css("a[href*='/films/language/']") if a.text(strip=True)]))
+        writers = list(dict.fromkeys([a.text(strip=True) for a in tree.css("a[href*='/writer/']") if a.text(strip=True)]))
+        cinematographers = list(dict.fromkeys([a.text(strip=True) for a in tree.css("a[href*='/cinematography/']") if a.text(strip=True)]))
+        composers = list(dict.fromkeys([a.text(strip=True) for a in tree.css("a[href*='/composer/']") if a.text(strip=True)]))
+        
         return FilmMetadata(
             slug=slug, title=title, year=year, directors=directors,
             genres=genres, cast=cast, themes=themes,
-            runtime=runtime, avg_rating=avg_rating, rating_count=rating_count
+            runtime=runtime, avg_rating=avg_rating, rating_count=rating_count,
+            countries=countries, languages=languages, writers=writers,
+            cinematographers=cinematographers, composers=composers
         )

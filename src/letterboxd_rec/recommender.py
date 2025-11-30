@@ -25,6 +25,12 @@ class MetadataRecommender:
         'decade': 0.3,
         'community_rating': 0.8,
         'popularity': 0.2,
+        # Phase 1 enhancements
+        'country': 1.5,       # strong geographic preference signal
+        'language': 1.0,      # language preference
+        'writer': 2.0,        # nearly as strong as directors
+        'cinematographer': 1.0,  # visual style preference
+        'composer': 0.8,      # musical/score preference
     }
     
     def __init__(self, all_films: list[dict]):
@@ -250,6 +256,53 @@ class MetadataRecommender:
             decade = (year // 10) * 10
             if decade in profile.decades:
                 score += profile.decades[decade] * self.WEIGHTS['decade']
+        
+        # Phase 1: Country match
+        film_countries = load_json(film.get('countries', []))
+        for i, country in enumerate(film_countries):
+            if country in profile.countries:
+                # Primary country gets full weight, secondary reduced
+                country_weight = self.WEIGHTS['country'] if i == 0 else self.WEIGHTS['country'] * 0.3
+                score += profile.countries[country] * country_weight
+                if i == 0 and profile.countries[country] > 0.5:
+                    reasons.append(f"Country: {country}")
+        
+        # Phase 1: Language match
+        film_languages = load_json(film.get('languages', []))
+        matched_languages = []
+        for lang in film_languages:
+            if lang in profile.languages and profile.languages[lang] > 0.5:
+                score += profile.languages[lang] * self.WEIGHTS['language']
+                matched_languages.append(lang)
+        if matched_languages:
+            reasons.append(f"Language: {matched_languages[0]}")
+        
+        # Phase 1: Writer match
+        film_writers = load_json(film.get('writers', []))
+        for w in film_writers:
+            if w in profile.writers:
+                writer_score = profile.writers[w]
+                score += writer_score * self.WEIGHTS['writer']
+                if writer_score > 1.0:
+                    reasons.append(f"Writer: {w}")
+        
+        # Phase 1: Cinematographer match
+        film_cinematographers = load_json(film.get('cinematographers', []))
+        for c in film_cinematographers:
+            if c in profile.cinematographers:
+                cine_score = profile.cinematographers[c]
+                score += cine_score * self.WEIGHTS['cinematographer']
+                if cine_score > 0.8:
+                    reasons.append(f"Cinematography: {c}")
+        
+        # Phase 1: Composer match
+        film_composers = load_json(film.get('composers', []))
+        for comp in film_composers:
+            if comp in profile.composers:
+                comp_score = profile.composers[comp]
+                score += comp_score * self.WEIGHTS['composer']
+                if comp_score > 0.8:
+                    reasons.append(f"Composer: {comp}")
         
         # Community rating bonus
         # Favor films rated similarly to user's liked films

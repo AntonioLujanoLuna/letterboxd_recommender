@@ -1,6 +1,6 @@
 import argparse
 import json
-from .database import init_db, get_db, load_json
+from .database import init_db, get_db, load_json, load_user_lists
 from .scraper import LetterboxdScraper
 from .recommender import MetadataRecommender, CollaborativeRecommender, Recommendation
 from .profile import build_profile
@@ -26,18 +26,22 @@ def _scrape_film_metadata(scraper, slugs, max_per_batch=100, use_async=True):
             if meta:
                 metadata_list.append(meta)
     
-    # Batch insert all metadata
+    # Batch insert all metadata (with Phase 1 fields)
     if metadata_list:
         with get_db() as conn:
             conn.executemany("""
                 INSERT OR REPLACE INTO films 
-                (slug, title, year, directors, genres, cast, themes, runtime, avg_rating, rating_count)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (slug, title, year, directors, genres, cast, themes, runtime, avg_rating, rating_count,
+                 countries, languages, writers, cinematographers, composers)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, [(
                 m.slug, m.title, m.year,
                 json.dumps(m.directors), json.dumps(m.genres),
                 json.dumps(m.cast), json.dumps(m.themes),
-                m.runtime, m.avg_rating, m.rating_count
+                m.runtime, m.avg_rating, m.rating_count,
+                json.dumps(m.countries), json.dumps(m.languages),
+                json.dumps(m.writers), json.dumps(m.cinematographers),
+                json.dumps(m.composers)
             ) for m in metadata_list])
         
         print(f"  Saved {len(metadata_list)} films")
@@ -86,6 +90,63 @@ def cmd_scrape(args):
         # Scrape and batch insert film metadata
         print("\nFetching film metadata...")
         _scrape_film_metadata(scraper, new_slugs)
+        
+        # Phase 2.1: Scrape user lists if enabled
+        include_lists = getattr(args, 'include_lists', True)
+        if include_lists:
+            from datetime import datetime
+            
+            print(f"\nScraping {args.username}'s lists...")
+            
+            # Get profile favorites (4-film showcase)
+            favorites = scraper.scrape_favorites(args.username)
+            if favorites:
+                print(f"  Found {len(favorites)} profile favorites")
+                with get_db() as conn:
+                    for slug in favorites:
+                        conn.execute("""
+                            INSERT OR REPLACE INTO user_lists
+                            (username, list_slug, list_name, is_ranked, is_favorites, position, film_slug, scraped_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            args.username, "profile-favorites", "Profile Favorites",
+                            0, 1, None, slug, datetime.now().isoformat()
+                        ))
+            
+            # Get all user lists
+            max_lists = getattr(args, 'max_lists', 50)
+            lists = scraper.scrape_user_lists(args.username, limit=max_lists)
+            
+            # Scrape films from each list
+            for list_info in lists:
+                list_slug = list_info['list_slug']
+                list_name = list_info['list_name']
+                is_ranked = list_info['is_ranked']
+                
+                # Detect favorites
+                is_favorites = "favorite" in list_name.lower() or list_slug == "favorites"
+                
+                print(f"  Scraping list: {list_name}...")
+                films = scraper.scrape_list_films(args.username, list_slug)
+                
+                if not films:
+                    print(f"    (empty list)")
+                    continue
+                
+                # Save to database
+                with get_db() as conn:
+                    for film in films:
+                        conn.execute("""
+                            INSERT OR REPLACE INTO user_lists
+                            (username, list_slug, list_name, is_ranked, is_favorites, position, film_slug, scraped_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            args.username, list_slug, list_name, 
+                            is_ranked, is_favorites, film.get('position'),
+                            film['film_slug'], datetime.now().isoformat()
+                        ))
+                
+                print(f"    {len(films)} films")
         
         print(f"\nDone! {len(interactions)} films for {args.username}")
         

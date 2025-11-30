@@ -21,7 +21,12 @@ def init_db():
                 themes TEXT,        -- JSON list (from Letterboxd tags)
                 runtime INTEGER,
                 avg_rating REAL,
-                rating_count INTEGER
+                rating_count INTEGER,
+                countries TEXT,     -- JSON list (Phase 1)
+                languages TEXT,     -- JSON list (Phase 1)
+                writers TEXT,       -- JSON list (Phase 1)
+                cinematographers TEXT,  -- JSON list (Phase 1)
+                composers TEXT      -- JSON list (Phase 1)
             );
             
             CREATE TABLE IF NOT EXISTS user_films (
@@ -35,9 +40,45 @@ def init_db():
                 PRIMARY KEY (username, film_slug)
             );
             
+            CREATE TABLE IF NOT EXISTS user_lists (
+                username TEXT,
+                list_slug TEXT,
+                list_name TEXT,
+                is_ranked INTEGER DEFAULT 0,
+                is_favorites INTEGER DEFAULT 0,
+                position INTEGER,
+                film_slug TEXT,
+                scraped_at TEXT,
+                PRIMARY KEY (username, list_slug, film_slug)
+            );
+            
             CREATE INDEX IF NOT EXISTS idx_user ON user_films(username);
             CREATE INDEX IF NOT EXISTS idx_film_year ON films(year);
+            CREATE INDEX IF NOT EXISTS idx_lists_user ON user_lists(username);
+            CREATE INDEX IF NOT EXISTS idx_lists_film ON user_lists(film_slug);
+            CREATE INDEX IF NOT EXISTS idx_lists_favorites ON user_lists(is_favorites);
         """)
+        
+        # Migration: Add new columns to existing films table if they don't exist
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(films)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+        
+        new_columns = {
+            'countries': 'TEXT',
+            'languages': 'TEXT',
+            'writers': 'TEXT',
+            'cinematographers': 'TEXT',
+            'composers': 'TEXT'
+        }
+        
+        for col_name, col_type in new_columns.items():
+            if col_name not in existing_columns:
+                try:
+                    conn.execute(f"ALTER TABLE films ADD COLUMN {col_name} {col_type}")
+                    print(f"Added column '{col_name}' to films table")
+                except sqlite3.Error as e:
+                    print(f"Warning: Could not add column '{col_name}': {e}")
 
 @contextmanager
 def get_db():
@@ -60,3 +101,15 @@ def load_json(val):
     except (json.JSONDecodeError, TypeError) as e:
         print(f"Warning: Failed to parse JSON: {e}")
         return []
+
+def load_user_lists(username: str) -> list[dict]:
+    """Load all list entries for a user from database."""
+    with get_db() as conn:
+        cursor = conn.execute("""
+            SELECT username, list_slug, list_name, is_ranked, is_favorites, position, film_slug
+            FROM user_lists
+            WHERE username = ?
+        """, (username,))
+        
+        rows = cursor.fetchall()
+        return [dict(row) for row in rows]
