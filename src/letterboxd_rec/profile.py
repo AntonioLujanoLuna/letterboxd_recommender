@@ -1,6 +1,36 @@
+import logging
 from collections import defaultdict
 from dataclasses import dataclass, field
 from .database import load_json
+
+logger = logging.getLogger(__name__)
+
+# Configuration constants
+MAX_CAST_CONSIDERED = 5
+MAX_THEMES_CONSIDERED = 10
+SECONDARY_COUNTRY_WEIGHT = 0.3
+
+# Weight constants for interaction types
+WEIGHT_LOVED = 2.0        # Rating 4.5-5.0
+WEIGHT_LIKED = 1.0        # Rating 3.5-4.0
+WEIGHT_NEUTRAL = 0.3      # Rating 3.0
+WEIGHT_DISLIKED = -0.5    # Rating 2.0-2.5
+WEIGHT_HATED = -1.5       # Rating 0.5-1.5
+WEIGHT_LIKED_NO_RATING = 1.5
+WEIGHT_WATCHED_ONLY = 0.4
+WEIGHT_WATCHLISTED = 0.2
+
+# List multipliers
+LIST_MULTIPLIER_FAVORITES = 3.0
+LIST_MULTIPLIER_TOP_10 = 2.0
+LIST_MULTIPLIER_TOP_30 = 1.5
+LIST_MULTIPLIER_RANKED_OTHER = 1.2
+LIST_MULTIPLIER_CURATED = 1.3
+
+# Normalization exponents (0 = no normalization, 0.5 = sqrt, 1.0 = full count normalization)
+NORM_EXPONENT_DEFAULT = 0.5
+NORM_EXPONENT_ACTORS = 0.3
+
 
 @dataclass
 class UserProfile:
@@ -15,12 +45,24 @@ class UserProfile:
     actors: dict[str, float] = field(default_factory=dict)
     themes: dict[str, float] = field(default_factory=dict)
     decades: dict[int, float] = field(default_factory=dict)
-    # Phase 1 enhancements
     countries: dict[str, float] = field(default_factory=dict)
     languages: dict[str, float] = field(default_factory=dict)
     writers: dict[str, float] = field(default_factory=dict)
     cinematographers: dict[str, float] = field(default_factory=dict)
     composers: dict[str, float] = field(default_factory=dict)
+
+
+def _normalize_scores(scores: dict, counts: dict, exponent: float = NORM_EXPONENT_DEFAULT) -> dict:
+    """
+    Normalize accumulated scores by count with configurable exponent.
+    
+    exponent=0.0: no normalization (raw scores)
+    exponent=0.5: sqrt normalization (balance frequency and magnitude)
+    exponent=1.0: full mean normalization
+    """
+    if exponent == 0:
+        return dict(scores)
+    return {k: v / (counts[k] ** exponent) for k, v in scores.items() if counts[k] > 0}
 
 
 def build_profile(
@@ -41,7 +83,7 @@ def build_profile(
     - Watched only:   +0.4 (mild positive)
     - Watchlisted:    +0.2 (interest signal)
     
-    List multipliers (Phase 2.1):
+    List multipliers:
     - Favorites:      3.0x (strongest signal)
     - Ranked top 10:  2.0x
     - Ranked 11-30:   1.5x
@@ -50,53 +92,24 @@ def build_profile(
     """
     profile = UserProfile()
     
-    # Phase 2.1: Build list weight lookup
-    list_weights = {}
-    if user_lists:
-        for entry in user_lists:
-            slug = entry['film_slug']
-            
-            # Determine weight multiplier based on list type
-            if entry.get('is_favorites'):
-                multiplier = 3.0  # Triple weight for favorites
-            elif entry.get('is_ranked') and entry.get('position'):
-                # Position-based weight for ranked lists
-                position = entry['position']
-                if position <= 10:
-                    multiplier = 2.0  # Top 10
-                elif position <= 30:
-                    multiplier = 1.5  # Top 30
-                else:
-                    multiplier = 1.2  # Lower ranked
-            else:
-                multiplier = 1.3  # Curated list presence
-            
-            # Keep highest multiplier if film is in multiple lists
-            if slug not in list_weights or multiplier > list_weights[slug]:
-                list_weights[slug] = multiplier
+    # Build list weight lookup
+    list_weights = _build_list_weights(user_lists)
     
-    genre_scores = defaultdict(float)
-    director_scores = defaultdict(float)
-    actor_scores = defaultdict(float)
-    theme_scores = defaultdict(float)
-    decade_scores = defaultdict(float)
-    country_scores = defaultdict(float)
-    language_scores = defaultdict(float)
-    writer_scores = defaultdict(float)
-    cinematographer_scores = defaultdict(float)
-    composer_scores = defaultdict(float)
+    # Score accumulators
+    scores = {
+        'genre': defaultdict(float),
+        'director': defaultdict(float),
+        'actor': defaultdict(float),
+        'theme': defaultdict(float),
+        'decade': defaultdict(float),
+        'country': defaultdict(float),
+        'language': defaultdict(float),
+        'writer': defaultdict(float),
+        'cinematographer': defaultdict(float),
+        'composer': defaultdict(float),
+    }
     
-    genre_counts = defaultdict(int)
-    director_counts = defaultdict(int)
-    actor_counts = defaultdict(int)
-    theme_counts = defaultdict(int)
-    decade_counts = defaultdict(int)
-    country_counts = defaultdict(int)
-    language_counts = defaultdict(int)
-    writer_counts = defaultdict(int)
-    cinematographer_counts = defaultdict(int)
-    composer_counts = defaultdict(int)
-    
+    counts = {k: defaultdict(int) for k in scores}
     rated_films = []
     
     for uf in user_films:
@@ -108,85 +121,76 @@ def build_profile(
         # Determine weight for this film
         weight = _compute_weight(uf)
         
-        # Phase 2.1: Apply list multiplier if film is in any lists
+        # Apply list multiplier if film is in any lists
         if slug in list_weights:
             weight *= list_weights[slug]
         
         if weight == 0:
             continue
         
-        # Extract attributes
-        genres = load_json(meta.get('genres'))
-        directors = load_json(meta.get('directors'))
-        cast = load_json(meta.get('cast', []))[:5]
-        themes = load_json(meta.get('themes', []))[:10]
-        year = meta.get('year')
+        # Extract and accumulate scores for each attribute type
+        _accumulate_list_scores(
+            load_json(meta.get('genres')), 
+            weight, scores['genre'], counts['genre']
+        )
+        _accumulate_list_scores(
+            load_json(meta.get('directors')), 
+            weight, scores['director'], counts['director']
+        )
+        _accumulate_list_scores(
+            load_json(meta.get('cast', []))[:MAX_CAST_CONSIDERED], 
+            weight * 0.7, scores['actor'], counts['actor']
+        )
+        _accumulate_list_scores(
+            load_json(meta.get('themes', []))[:MAX_THEMES_CONSIDERED], 
+            weight * 0.5, scores['theme'], counts['theme']
+        )
+        _accumulate_list_scores(
+            load_json(meta.get('languages', [])), 
+            weight, scores['language'], counts['language']
+        )
+        _accumulate_list_scores(
+            load_json(meta.get('writers', [])), 
+            weight, scores['writer'], counts['writer']
+        )
+        _accumulate_list_scores(
+            load_json(meta.get('cinematographers', [])), 
+            weight, scores['cinematographer'], counts['cinematographer']
+        )
+        _accumulate_list_scores(
+            load_json(meta.get('composers', [])), 
+            weight, scores['composer'], counts['composer']
+        )
+        
+        # Countries: primary gets full weight, secondary reduced
         countries = load_json(meta.get('countries', []))
-        languages = load_json(meta.get('languages', []))
-        writers = load_json(meta.get('writers', []))
-        cinematographers = load_json(meta.get('cinematographers', []))
-        composers = load_json(meta.get('composers', []))
+        for i, country in enumerate(countries):
+            country_weight = weight if i == 0 else weight * SECONDARY_COUNTRY_WEIGHT
+            scores['country'][country] += country_weight
+            counts['country'][country] += 1
         
-        # Accumulate scores
-        for g in genres:
-            genre_scores[g] += weight
-            genre_counts[g] += 1
-        
-        for d in directors:
-            director_scores[d] += weight
-            director_counts[d] += 1
-        
-        for a in cast:
-            actor_scores[a] += weight * 0.7
-            actor_counts[a] += 1
-        
-        for t in themes:
-            theme_scores[t] += weight * 0.5
-            theme_counts[t] += 1
-        
+        # Decades
+        year = meta.get('year')
         if year:
             decade = (year // 10) * 10
-            decade_scores[decade] += weight
-            decade_counts[decade] += 1
-        
-        # Phase 1: New fields
-        for i, country in enumerate(countries):
-            # Primary country gets full weight, secondary get reduced
-            country_weight = weight if i == 0 else weight * 0.3
-            country_scores[country] += country_weight
-            country_counts[country] += 1
-        
-        for lang in languages:
-            language_scores[lang] += weight
-            language_counts[lang] += 1
-        
-        for w in writers:
-            writer_scores[w] += weight
-            writer_counts[w] += 1
-        
-        for c in cinematographers:
-            cinematographer_scores[c] += weight
-            cinematographer_counts[c] += 1
-        
-        for comp in composers:
-            composer_scores[comp] += weight
-            composer_counts[comp] += 1
+            scores['decade'][decade] += weight
+            counts['decade'][decade] += 1
         
         # Track rated films for average
         if uf.get('rating'):
             rated_films.append(uf['rating'])
     
-    # Normalize scores
-    profile.genres = {k: v / (genre_counts[k] ** 0.5) for k, v in genre_scores.items()}
-    profile.directors = {k: v for k, v in director_scores.items()}
-    profile.actors = {k: v / (actor_counts[k] ** 0.3) for k, v in actor_scores.items()}
-    profile.themes = {k: v / (theme_counts[k] ** 0.5) for k, v in theme_scores.items()}
-    profile.decades = {k: v / (decade_counts[k] ** 0.5) for k, v in decade_scores.items()}
-    profile.countries = {k: v / (country_counts[k] ** 0.5) for k, v in country_scores.items()}
-    profile.languages = {k: v / (language_counts[k] ** 0.5) for k, v in language_scores.items()}
-    profile.writers = {k: v for k, v in writer_scores.items()}
-    profile.cinematographers = {k: v for k, v in cinematographer_scores.items()}
-    profile.composers = {k: v for k, v in composer_scores.items()}
+    # Normalize all scores consistently
+    profile.genres = _normalize_scores(scores['genre'], counts['genre'])
+    profile.directors = _normalize_scores(scores['director'], counts['director'])
+    profile.actors = _normalize_scores(scores['actor'], counts['actor'], NORM_EXPONENT_ACTORS)
+    profile.themes = _normalize_scores(scores['theme'], counts['theme'])
+    profile.decades = _normalize_scores(scores['decade'], counts['decade'])
+    profile.countries = _normalize_scores(scores['country'], counts['country'])
+    profile.languages = _normalize_scores(scores['language'], counts['language'])
+    profile.writers = _normalize_scores(scores['writer'], counts['writer'])
+    profile.cinematographers = _normalize_scores(scores['cinematographer'], counts['cinematographer'])
+    profile.composers = _normalize_scores(scores['composer'], counts['composer'])
     
     # Aggregate counts
     profile.n_films = len(user_films)
@@ -195,6 +199,48 @@ def build_profile(
     profile.avg_liked_rating = sum(rated_films) / len(rated_films) if rated_films else None
     
     return profile
+
+
+def _build_list_weights(user_lists: list[dict] | None) -> dict[str, float]:
+    """Build lookup of film slug -> list weight multiplier."""
+    if not user_lists:
+        return {}
+    
+    list_weights = {}
+    for entry in user_lists:
+        slug = entry['film_slug']
+        
+        if entry.get('is_favorites'):
+            multiplier = LIST_MULTIPLIER_FAVORITES
+        elif entry.get('is_ranked') and entry.get('position'):
+            position = entry['position']
+            if position <= 10:
+                multiplier = LIST_MULTIPLIER_TOP_10
+            elif position <= 30:
+                multiplier = LIST_MULTIPLIER_TOP_30
+            else:
+                multiplier = LIST_MULTIPLIER_RANKED_OTHER
+        else:
+            multiplier = LIST_MULTIPLIER_CURATED
+        
+        # Keep highest multiplier if film is in multiple lists
+        if slug not in list_weights or multiplier > list_weights[slug]:
+            list_weights[slug] = multiplier
+    
+    return list_weights
+
+
+def _accumulate_list_scores(
+    items: list, 
+    weight: float, 
+    scores: dict, 
+    counts: dict
+) -> None:
+    """Accumulate scores for a list of items."""
+    for item in items:
+        scores[item] += weight
+        counts[item] += 1
+
 
 def _compute_weight(uf: dict) -> float:
     """Compute preference weight for a single film interaction."""
@@ -206,29 +252,26 @@ def _compute_weight(uf: dict) -> float:
     # Explicit rating takes precedence
     if rating is not None:
         if rating >= 4.5:
-            base_weight = 2.0
+            return WEIGHT_LOVED
         elif rating >= 3.5:
-            base_weight = 1.0
+            return WEIGHT_LIKED
         elif rating >= 3.0:
-            base_weight = 0.3
+            return WEIGHT_NEUTRAL
         elif rating >= 2.0:
-            base_weight = -0.5
+            return WEIGHT_DISLIKED
         else:
-            base_weight = -1.5
+            return WEIGHT_HATED
+    
     # Liked without rating
-    elif liked:
-        base_weight = 1.5
+    if liked:
+        return WEIGHT_LIKED_NO_RATING
+    
     # Just watched
-    elif watched:
-        base_weight = 0.4
+    if watched:
+        return WEIGHT_WATCHED_ONLY
+    
     # Just watchlisted
-    elif watchlisted:
-        base_weight = 0.2
-    else:
-        base_weight = 0.0
-
-    # Note: Temporal decay removed - scraped_at reflects when we scraped the data,
-    # not when the user watched the film. To implement proper temporal decay, we would
-    # need actual watch dates from Letterboxd (not currently available in the schema).
-
-    return base_weight
+    if watchlisted:
+        return WEIGHT_WATCHLISTED
+    
+    return 0.0

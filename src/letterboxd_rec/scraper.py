@@ -1,10 +1,13 @@
 import httpx
 import json
 import time
+import logging
 from selectolax.parser import HTMLParser
 from dataclasses import dataclass
 from tqdm import tqdm
 import asyncio
+
+logger = logging.getLogger(__name__)
 
 @dataclass
 class FilmInteraction:
@@ -26,7 +29,6 @@ class FilmMetadata:
     runtime: int | None
     avg_rating: float | None
     rating_count: int | None
-    # Phase 1 enhancements
     countries: list[str]
     languages: list[str]
     writers: list[str]
@@ -91,19 +93,19 @@ def parse_film_page(tree: HTMLParser, slug: str) -> FilmMetadata:
         except (ValueError, IndexError):
             pass
 
-    # Phase 1: Countries
+    # Countries
     countries = list(dict.fromkeys([a.text(strip=True) for a in tree.css("a[href*='/films/country/']") if a.text(strip=True)]))
 
-    # Phase 1: Languages
+    # Languages
     languages = list(dict.fromkeys([a.text(strip=True) for a in tree.css("a[href*='/films/language/']") if a.text(strip=True)]))
 
-    # Phase 1: Writers
+    # Writers
     writers = list(dict.fromkeys([a.text(strip=True) for a in tree.css("a[href*='/writer/']") if a.text(strip=True)]))
 
-    # Phase 1: Cinematographers
+    # Cinematographers
     cinematographers = list(dict.fromkeys([a.text(strip=True) for a in tree.css("a[href*='/cinematography/']") if a.text(strip=True)]))
 
-    # Phase 1: Composers
+    # Composers
     composers = list(dict.fromkeys([a.text(strip=True) for a in tree.css("a[href*='/composer/']") if a.text(strip=True)]))
 
     return FilmMetadata(
@@ -113,6 +115,7 @@ def parse_film_page(tree: HTMLParser, slug: str) -> FilmMetadata:
         countries=countries, languages=languages, writers=writers,
         cinematographers=cinematographers, composers=composers
     )
+
 
 class LetterboxdScraper:
     BASE = "https://letterboxd.com"
@@ -137,22 +140,22 @@ class LetterboxdScraper:
                 return HTMLParser(resp.text)
             except httpx.TimeoutException as e:
                 if attempt < max_retries - 1:
-                    wait_time = 2 ** attempt  # Exponential backoff
-                    print(f"Timeout on {url}, retrying in {wait_time}s... (attempt {attempt + 1}/{max_retries})")
+                    wait_time = 2 ** attempt
+                    logger.warning(f"Timeout on {url}, retrying in {wait_time}s... (attempt {attempt + 1}/{max_retries})")
                     time.sleep(wait_time)
                 else:
-                    print(f"Error: {url} - {e} (max retries exceeded)")
+                    logger.error(f"Max retries exceeded for {url}: {e}")
                     return None
             except httpx.HTTPStatusError as e:
                 if e.response.status_code == 429:
                     retry_after = int(e.response.headers.get("Retry-After", 60))
-                    print(f"Rate limited (429) on {url}, waiting {retry_after}s...")
+                    logger.warning(f"Rate limited (429) on {url}, waiting {retry_after}s...")
                     time.sleep(retry_after)
                     continue
-                print(f"Error: {url} - {e}")
+                logger.error(f"HTTP error on {url}: {e}")
                 return None
             except httpx.HTTPError as e:
-                print(f"Error: {url} - {e}")
+                logger.error(f"Request error on {url}: {e}")
                 return None
         
         return None
@@ -162,20 +165,18 @@ class LetterboxdScraper:
         films = {}
         
         # Get watched films with ratings
-        print(f"Scraping {username}'s films...")
+        logger.info(f"Scraping {username}'s films...")
         page = 1
         while True:
             tree = self._get(f"{self.BASE}/{username}/films/page/{page}/")
             if not tree:
                 break
             
-            # Updated selector for grid items
             items = tree.css("li.griditem")
             if not items:
                 break
             
             for item in items:
-                # Slug is now in the react component
                 react_comp = item.css_first("div.react-component")
                 if not react_comp:
                     continue
@@ -187,7 +188,6 @@ class LetterboxdScraper:
                 rating = None
                 liked = False
                 
-                # Rating and like are in the viewingdata paragraph
                 viewing_data = item.css_first("p.poster-viewingdata")
                 if viewing_data:
                     rating_span = viewing_data.css_first("span.rating")
@@ -199,10 +199,10 @@ class LetterboxdScraper:
                 films[slug] = FilmInteraction(slug, rating, True, False, liked)
             
             page += 1
-            print(f"  Watched page {page-1}: {len(items)} films")
+            logger.debug(f"  Watched page {page-1}: {len(items)} films")
         
         # Get watchlist
-        print(f"Scraping {username}'s watchlist...")
+        logger.info(f"Scraping {username}'s watchlist...")
         page = 1
         while True:
             tree = self._get(f"{self.BASE}/{username}/watchlist/page/{page}/")
@@ -231,7 +231,7 @@ class LetterboxdScraper:
         
         n_rated = sum(1 for f in films.values() if f.rating)
         n_liked = sum(1 for f in films.values() if f.liked)
-        print(f"Total: {len(films)} films ({n_rated} rated, {n_liked} liked)")
+        logger.info(f"Total: {len(films)} films ({n_rated} rated, {n_liked} liked)")
         return list(films.values())
     
     def scrape_film(self, slug: str) -> FilmMetadata | None:
@@ -256,7 +256,7 @@ class LetterboxdScraper:
         usernames = []
         page = 1
         
-        print(f"Scraping {username}'s following...")
+        logger.info(f"Scraping {username}'s following...")
         while len(usernames) < limit:
             tree = self._get(f"{self.BASE}/{username}/following/page/{page}/")
             if not tree:
@@ -277,7 +277,7 @@ class LetterboxdScraper:
             
             page += 1
         
-        print(f"  Found {len(usernames)} following")
+        logger.info(f"  Found {len(usernames)} following")
         return usernames
     
     def scrape_followers(self, username: str, limit: int = 100) -> list[str]:
@@ -285,7 +285,7 @@ class LetterboxdScraper:
         usernames = []
         page = 1
         
-        print(f"Scraping {username}'s followers...")
+        logger.info(f"Scraping {username}'s followers...")
         while len(usernames) < limit:
             tree = self._get(f"{self.BASE}/{username}/followers/page/{page}/")
             if not tree:
@@ -306,7 +306,7 @@ class LetterboxdScraper:
             
             page += 1
         
-        print(f"  Found {len(usernames)} followers")
+        logger.info(f"  Found {len(usernames)} followers")
         return usernames
     
     def scrape_popular_members(self, limit: int = 50) -> list[str]:
@@ -314,7 +314,7 @@ class LetterboxdScraper:
         usernames = []
         page = 1
         
-        print("Scraping popular members...")
+        logger.info("Scraping popular members...")
         while len(usernames) < limit:
             tree = self._get(f"{self.BASE}/members/popular/this/week/page/{page}/")
             if not tree:
@@ -335,7 +335,7 @@ class LetterboxdScraper:
             
             page += 1
         
-        print(f"  Found {len(usernames)} popular members")
+        logger.info(f"  Found {len(usernames)} popular members")
         return usernames
     
     def scrape_film_fans(self, slug: str, limit: int = 50) -> list[str]:
@@ -343,7 +343,7 @@ class LetterboxdScraper:
         usernames = []
         page = 1
         
-        print(f"Scraping fans of {slug}...")
+        logger.info(f"Scraping fans of {slug}...")
         while len(usernames) < limit:
             tree = self._get(f"{self.BASE}/film/{slug}/fans/page/{page}/")
             if not tree:
@@ -364,7 +364,7 @@ class LetterboxdScraper:
             
             page += 1
         
-        print(f"  Found {len(usernames)} fans of {slug}")
+        logger.info(f"  Found {len(usernames)} fans of {slug}")
         return usernames
     
     def scrape_favorites(self, username: str) -> list[str]:
@@ -375,11 +375,8 @@ class LetterboxdScraper:
         
         favorites = []
         
-        # Favorites are in the profile showcase section
-        # Look for poster containers in the favorites section
         showcase = tree.css("section.profile-favorites li.poster-container, section#favourites li.poster-container")
-        for item in showcase[:4]:  # Max 4 favorites
-            # Try data attribute first
+        for item in showcase[:4]:
             react_comp = item.css_first("div.react-component")
             if react_comp:
                 slug = react_comp.attributes.get("data-film-slug")
@@ -387,7 +384,6 @@ class LetterboxdScraper:
                     favorites.append(slug)
                     continue
             
-            # Fallback: extract from link
             link = item.css_first("div[data-film-slug]")
             if link:
                 slug = link.attributes.get("data-film-slug")
@@ -397,32 +393,24 @@ class LetterboxdScraper:
         return favorites
     
     def scrape_user_lists(self, username: str, limit: int = 50) -> list[dict]:
-        """
-        Scrape all lists for a user.
-        
-        Returns:
-            List of dicts with keys: list_slug, list_name, is_ranked
-        """
+        """Scrape all lists for a user."""
         lists = []
         page = 1
         
-        print(f"Scraping {username}'s lists...")
+        logger.info(f"Scraping {username}'s lists...")
         while len(lists) < limit:
             tree = self._get(f"{self.BASE}/{username}/lists/page/{page}/")
             if not tree:
                 break
             
-            # Try different selectors for list items
             list_items = tree.css("section.list-summary")
             if not list_items:
-                # Fallback selector
                 list_items = tree.css("section.film-list-summary")
             
             if not list_items:
                 break
             
             for item in list_items:
-                # Extract list URL and name
                 link = item.css_first("h2 a, h3 a")
                 if not link:
                     continue
@@ -430,17 +418,15 @@ class LetterboxdScraper:
                 href = link.attributes.get("href", "")
                 list_name = link.text(strip=True)
                 
-                # Extract slug from /username/list/list-slug/
                 parts = href.strip("/").split("/")
                 if len(parts) >= 3 and parts[1] == "list":
                     list_slug = parts[2]
                 else:
                     continue
                 
-                # Detect if ranked (look for numbered list indicators)
                 is_ranked = (
                     item.css_first(".icon-numbered") is not None or
-                    "numbered"in item.attributes.get("class", "").lower()
+                    "numbered" in item.attributes.get("class", "").lower()
                 )
                 
                 lists.append({
@@ -454,16 +440,11 @@ class LetterboxdScraper:
             
             page += 1
         
-        print(f"  Found {len(lists)} lists")
+        logger.info(f"  Found {len(lists)} lists")
         return lists
     
     def scrape_list_films(self, username: str, list_slug: str) -> list[dict]:
-        """
-        Scrape films from a specific list.
-        
-        Returns:
-            List of dicts with keys: film_slug, position (if ranked)
-        """
+        """Scrape films from a specific list."""
         films = []
         page = 1
         
@@ -472,16 +453,13 @@ class LetterboxdScraper:
             if not tree:
                 break
             
-            # Check if this is a ranked list by looking for position indicators
             has_positions = tree.css_first(".list-number, .position") is not None
             
-            # Get film items
             items = tree.css("li.poster-container")
             if not items:
                 break
             
             for idx, item in enumerate(items):
-                # Get film slug
                 react_comp = item.css_first("div.react-component")
                 film_slug = None
                 
@@ -489,7 +467,6 @@ class LetterboxdScraper:
                     film_slug = react_comp.attributes.get("data-film-slug")
                 
                 if not film_slug:
-                    # Fallback
                     link = item.css_first("div[data-film-slug]")
                     if link:
                         film_slug = link.attributes.get("data-film-slug")
@@ -497,20 +474,16 @@ class LetterboxdScraper:
                 if not film_slug:
                     continue
                 
-                # Determine position
                 position = None
                 if has_positions:
-                    # Look for explicit position number
                     pos_el = item.css_first(".list-number, .position")
                     if pos_el:
                         try:
                             pos_text = pos_el.text(strip=True).rstrip(".")
                             position = int(pos_text)
                         except (ValueError, AttributeError):
-                            # Fallback to sequential position
                             position = (page - 1) * len(items) + idx + 1
                     else:
-                        # Sequential position as fallback
                         position = (page - 1) * len(items) + idx + 1
                 
                 films.append({
@@ -526,17 +499,18 @@ class LetterboxdScraper:
         self.client.close()
 
 
-
 class AsyncLetterboxdScraper:
     """Async scraper for parallel metadata fetching."""
     
     BASE = "https://letterboxd.com"
+    DEFAULT_RETRY_AFTER = 60
+    MAX_RETRIES = 3
     
     def __init__(self, delay: float = 0.2, max_concurrent: int = 5):
         self.delay = delay
         self.semaphore = asyncio.Semaphore(max_concurrent)
     
-    async def scrape_films_batch(self, slugs: list[str]) -> list:
+    async def scrape_films_batch(self, slugs: list[str]) -> list[FilmMetadata]:
         """Scrape multiple films concurrently."""
         async with httpx.AsyncClient(
             headers={"User-Agent": "Mozilla/5.0 (compatible; letterboxd-rec/1.0)"},
@@ -546,32 +520,55 @@ class AsyncLetterboxdScraper:
             tasks = [self._scrape_film_async(client, slug) for slug in slugs]
             results = await asyncio.gather(*tasks, return_exceptions=True)
         
-        return [r for r in results if r is not None and not isinstance(r, Exception)]
+        # Filter out failures and log them
+        successful = []
+        for slug, result in zip(slugs, results):
+            if isinstance(result, Exception):
+                logger.error(f"Failed to scrape {slug}: {type(result).__name__}: {result}")
+            elif result is not None:
+                successful.append(result)
+        
+        return successful
     
-    async def _scrape_film_async(self, client: httpx.AsyncClient, slug: str):
-        """Scrape a single film asynchronously."""
+    async def _scrape_film_async(self, client: httpx.AsyncClient, slug: str) -> FilmMetadata | None:
+        """Scrape a single film asynchronously with proper retry logic."""
         async with self.semaphore:
             await asyncio.sleep(self.delay)
-            try:
-                resp = await client.get(f"{self.BASE}/film/{slug}/")
-                if resp.status_code == 404:
-                    return None
-                
-                if resp.status_code == 429:
-                    retry_after = int(resp.headers.get("Retry-After", 60))
-                    print(f"Rate limited (429) on {slug}, waiting {retry_after}s...")
-                    await asyncio.sleep(retry_after)
-                    # Retry once
+            
+            for attempt in range(self.MAX_RETRIES):
+                try:
                     resp = await client.get(f"{self.BASE}/film/{slug}/")
-                    if resp.status_code == 429:
+                    
+                    if resp.status_code == 404:
+                        logger.debug(f"Film not found: {slug}")
                         return None
-                
-                resp.raise_for_status()
-                return self._parse_film_page(resp.text, slug)
-            except Exception as e:
-                return None
+                    
+                    if resp.status_code == 429:
+                        retry_after = int(resp.headers.get("Retry-After", self.DEFAULT_RETRY_AFTER))
+                        logger.warning(f"Rate limited on {slug}, waiting {retry_after}s (attempt {attempt + 1}/{self.MAX_RETRIES})")
+                        await asyncio.sleep(retry_after)
+                        continue
+                    
+                    resp.raise_for_status()
+                    return self._parse_film_page(resp.text, slug)
+                    
+                except httpx.TimeoutException:
+                    wait_time = 2 ** attempt
+                    logger.warning(f"Timeout on {slug}, retrying in {wait_time}s (attempt {attempt + 1}/{self.MAX_RETRIES})")
+                    await asyncio.sleep(wait_time)
+                    
+                except httpx.HTTPStatusError as e:
+                    logger.error(f"HTTP {e.response.status_code} on {slug}: {e}")
+                    return None
+                    
+                except httpx.HTTPError as e:
+                    logger.error(f"Request error on {slug}: {type(e).__name__}: {e}")
+                    return None
+            
+            logger.error(f"Max retries exceeded for {slug}")
+            return None
     
-    def _parse_film_page(self, html: str, slug: str):
+    def _parse_film_page(self, html: str, slug: str) -> FilmMetadata:
         """Parse film page HTML."""
         tree = HTMLParser(html)
         return parse_film_page(tree, slug)

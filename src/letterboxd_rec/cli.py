@@ -1,11 +1,37 @@
 import argparse
 import json
+import logging
+from collections import defaultdict
+from datetime import datetime, timedelta
+
 from .database import init_db, get_db, load_json, load_user_lists
 from .scraper import LetterboxdScraper
 from .recommender import MetadataRecommender, CollaborativeRecommender, Recommendation
 from .profile import build_profile
 from tqdm import tqdm
 import asyncio
+
+logger = logging.getLogger(__name__)
+
+
+def _load_all_user_films(conn) -> dict[str, list[dict]]:
+    """
+    Load all user films in a single query.
+    Returns dict mapping username -> list of film interaction dicts.
+    """
+    all_user_films = defaultdict(list)
+    rows = conn.execute("""
+        SELECT username, film_slug as slug, rating, watched, watchlisted, liked
+        FROM user_films
+    """).fetchall()
+    
+    for row in rows:
+        row_dict = dict(row)
+        username = row_dict.pop('username')
+        all_user_films[username].append(row_dict)
+    
+    return dict(all_user_films)
+
 
 def _scrape_film_metadata(scraper, slugs, max_per_batch=100, use_async=True):
     """Helper to scrape film metadata for a list of slugs."""
@@ -16,7 +42,7 @@ def _scrape_film_metadata(scraper, slugs, max_per_batch=100, use_async=True):
     
     if use_async and len(limited_slugs) > 10:
         from .scraper import AsyncLetterboxdScraper
-        print(f"  Fetching {len(limited_slugs)} films (async)...")
+        logger.info(f"Fetching {len(limited_slugs)} films (async)...")
         async_scraper = AsyncLetterboxdScraper(delay=0.2, max_concurrent=5)
         metadata_list = asyncio.run(async_scraper.scrape_films_batch(limited_slugs))
     else:
@@ -26,7 +52,7 @@ def _scrape_film_metadata(scraper, slugs, max_per_batch=100, use_async=True):
             if meta:
                 metadata_list.append(meta)
     
-    # Batch insert all metadata (with Phase 1 fields)
+    # Batch insert all metadata
     if metadata_list:
         with get_db() as conn:
             conn.executemany("""
@@ -44,7 +70,8 @@ def _scrape_film_metadata(scraper, slugs, max_per_batch=100, use_async=True):
                 json.dumps(m.composers)
             ) for m in metadata_list])
         
-        print(f"  Saved {len(metadata_list)} films")
+        logger.info(f"Saved {len(metadata_list)} films")
+
 
 def cmd_scrape(args):
     """Scrape a user's Letterboxd data."""
@@ -62,7 +89,6 @@ def cmd_scrape(args):
                 """, (args.username,)).fetchone()
                 
                 if result and result['last_scrape']:
-                    from datetime import datetime, timedelta
                     last_scrape = datetime.fromisoformat(result['last_scrape'])
                     age_days = (datetime.now() - last_scrape).days
                     
@@ -91,10 +117,8 @@ def cmd_scrape(args):
         print("\nFetching film metadata...")
         _scrape_film_metadata(scraper, new_slugs)
         
-        # Phase 2.1: Scrape user lists if enabled
+        # Scrape user lists if enabled
         if args.include_lists:
-            from datetime import datetime
-            
             print(f"\nScraping {args.username}'s lists...")
             
             # Get profile favorites (4-film showcase)
@@ -151,6 +175,7 @@ def cmd_scrape(args):
     finally:
         scraper.close()
 
+
 def cmd_discover(args):
     """Discover and scrape other users."""
     init_db()
@@ -169,7 +194,6 @@ def cmd_discover(args):
         
         while len(all_discovered) < args.limit and attempts < max_attempts:
             attempts += 1
-            # Fetch more users each attempt to find new ones
             batch_size = args.limit * (attempts + 1)
             
             # Discover users based on source
@@ -200,15 +224,12 @@ def cmd_discover(args):
             
             print(f"  Attempt {attempts}: found {len(usernames)} users, {len(new_usernames)} new")
             
-            # Source exhausted - can't get more users
             if len(usernames) < batch_size:
                 break
             
-            # Got enough new users
             if len(all_discovered) >= args.limit:
                 break
         
-        # Trim to requested limit
         new_usernames = all_discovered[:args.limit]
         
         if not new_usernames:
@@ -238,12 +259,13 @@ def cmd_discover(args):
                 _scrape_film_metadata(scraper, new_slugs, max_per_batch=100)
                 
             except Exception as e:
-                print(f"Error scraping {username}: {e}")
+                logger.error(f"Error scraping {username}: {e}")
         
         print(f"\nDone! Scraped {len(new_usernames)} new users.")
         
     finally:
         scraper.close()
+
 
 def cmd_recommend(args):
     """Generate recommendations."""
@@ -263,14 +285,8 @@ def cmd_recommend(args):
         strategy = args.strategy if hasattr(args, 'strategy') else 'metadata'
         
         if strategy == 'hybrid':
-            # Hybrid: combine metadata and collaborative
-            all_user_films = {}
-            all_users = [r['username'] for r in conn.execute("SELECT DISTINCT username FROM user_films")]
-            for user in all_users:
-                all_user_films[user] = [dict(r) for r in conn.execute("""
-                    SELECT film_slug as slug, rating, watched, watchlisted, liked
-                    FROM user_films WHERE username = ?
-                """, (user,))]
+            # Hybrid: combine metadata and collaborative (single query)
+            all_user_films = _load_all_user_films(conn)
             
             # Get recommendations from both strategies
             meta_rec = MetadataRecommender(list(all_films.values()))
@@ -312,15 +328,10 @@ def cmd_recommend(args):
                         score=score,
                         reasons=["Hybrid: metadata + collaborative"]
                     ))
+                    
         elif strategy == 'collaborative':
-            # Load all user data
-            all_user_films = {}
-            all_users = [r['username'] for r in conn.execute("SELECT DISTINCT username FROM user_films")]
-            for user in all_users:
-                all_user_films[user] = [dict(r) for r in conn.execute("""
-                    SELECT film_slug as slug, rating, watched, watchlisted, liked
-                    FROM user_films WHERE username = ?
-                """, (user,))]
+            # Load all user data (single query)
+            all_user_films = _load_all_user_films(conn)
             
             recommender = CollaborativeRecommender(all_user_films, all_films)
             recs = recommender.recommend(
@@ -347,7 +358,6 @@ def cmd_recommend(args):
     
     # Format and print results
     if hasattr(args, 'format') and args.format == 'json':
-        import json as json_module
         output = [{
             "title": r.title,
             "year": r.year,
@@ -356,7 +366,7 @@ def cmd_recommend(args):
             "reasons": r.reasons,
             "url": f"https://letterboxd.com/film/{r.slug}/"
         } for r in recs]
-        print(json_module.dumps(output, indent=2))
+        print(json.dumps(output, indent=2))
     elif hasattr(args, 'format') and args.format == 'csv':
         print("Title,Year,URL,Score,Reasons")
         for r in recs:
@@ -374,6 +384,7 @@ def cmd_recommend(args):
             print(f"{i}. {r.title} ({r.year}) - Score: {r.score:.1f}")
             print(f"   Why: {', '.join(r.reasons)}")
 
+
 def cmd_stats(args):
     """Show database statistics."""
     with get_db() as conn:
@@ -389,7 +400,6 @@ def cmd_stats(args):
         print(f"  Rated interactions: {rated_count}")
         
         if user_count > 0:
-            # Show top users by film count
             top_users = conn.execute("""
                 SELECT username, COUNT(*) as film_count 
                 FROM user_films 
@@ -403,7 +413,6 @@ def cmd_stats(args):
                 print(f"  {user}: {count} films")
         
         if hasattr(args, 'verbose') and args.verbose:
-            # Films without metadata
             missing_metadata = conn.execute("""
                 SELECT COUNT(DISTINCT uf.film_slug) 
                 FROM user_films uf 
@@ -413,7 +422,6 @@ def cmd_stats(args):
             
             print(f"\n  Films without metadata: {missing_metadata}")
             
-            # Staleness - oldest scraped users
             oldest = conn.execute("""
                 SELECT username, MIN(scraped_at) as oldest_scrape
                 FROM user_films 
@@ -427,7 +435,6 @@ def cmd_stats(args):
                 for user, scrape_time in oldest:
                     print(f"  {user}: {scrape_time}")
             
-            # Genre distribution
             film_genres = conn.execute("SELECT genres FROM films WHERE genres IS NOT NULL").fetchall()
             from collections import Counter
             genre_counts = Counter()
@@ -441,35 +448,33 @@ def cmd_stats(args):
                 for genre, count in genre_counts.most_common(10):
                     print(f"  {genre}: {count} films")
 
+
 def cmd_export(args):
     """Export database to JSON file."""
     with get_db() as conn:
-        # Export user_films
         user_films = [dict(r) for r in conn.execute("SELECT * FROM user_films")]
-        
-        # Export films
         films = [dict(r) for r in conn.execute("SELECT * FROM films")]
     
     data = {
         "user_films": user_films,
         "films": films,
-        "exported_at": __import__('datetime').datetime.now().isoformat()
+        "exported_at": datetime.now().isoformat()
     }
     
     with open(args.file, 'w') as f:
-        __import__('json').dump(data, f, indent=2)
+        json.dump(data, f, indent=2)
     
     print(f"Exported {len(user_films)} user interactions and {len(films)} films to {args.file}")
+
 
 def cmd_import(args):
     """Import database from JSON file."""
     with open(args.file, 'r') as f:
-        data = __import__('json').load(f)
+        data = json.load(f)
     
     init_db()
     
     with get_db() as conn:
-        # Import films first
         if 'films' in data:
             for film in data['films']:
                 conn.execute("""
@@ -487,7 +492,6 @@ def cmd_import(args):
                 ))
             print(f"Imported {len(data['films'])} films")
         
-        # Then import user_films
         if 'user_films' in data:
             for uf in data['user_films']:
                 conn.execute("""
@@ -502,6 +506,7 @@ def cmd_import(args):
             print(f"Imported {len(data['user_films'])} user interactions")
     
     print(f"Import completed from {args.file}")
+
 
 def cmd_profile(args):
     """Show user's preference profile."""
@@ -542,9 +547,10 @@ def cmd_profile(args):
         print("\nDecade preferences:")
         for dec in sorted(profile.decades.keys()):
             score = profile.decades[dec]
-            bar_length = int(max(0, score * 2))  # Scale for visibility
+            bar_length = int(max(0, score * 2))
             bar = "█" * bar_length
             print(f"  {dec}s: {bar} ({score:+.1f})")
+
 
 def cmd_similar(args):
     """Find films similar to a specific film."""
@@ -567,16 +573,15 @@ def cmd_similar(args):
         print(f"{i}. {r.title} ({r.year}) - Score: {r.score:.1f}")
         print(f"   Why: {', '.join(r.reasons)}")
 
+
 def cmd_triage(args):
     """Rank user's watchlist by predicted enjoyment."""
     with get_db() as conn:
-        # Get watched films for profile building
         user_films = [dict(r) for r in conn.execute("""
             SELECT film_slug as slug, rating, watched, watchlisted, liked
             FROM user_films WHERE username = ?
         """, (args.username,))]
         
-        # Get watchlist
         watchlist = [r['film_slug'] for r in conn.execute("""
             SELECT film_slug FROM user_films 
             WHERE username = ? AND watchlisted = 1
@@ -599,6 +604,7 @@ def cmd_triage(args):
     for i, r in enumerate(recs, 1):
         print(f"{i}. {r.title} ({r.year}) - Score: {r.score:.1f}")
         print(f"   Why: {', '.join(r.reasons)}")
+
 
 def cmd_gaps(args):
     """Find gaps in filmography of favorite directors."""
@@ -631,8 +637,10 @@ def cmd_gaps(args):
         for r in recs:
             print(f"  - {r.title} ({r.year}) [{r.score:.1f}]")
 
+
 def main():
     parser = argparse.ArgumentParser(description="Letterboxd Recommender")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
     subparsers = parser.add_subparsers(dest="command", required=True)
     
     # Scrape command
@@ -716,4 +724,12 @@ def main():
     gaps_parser.set_defaults(func=cmd_gaps)
     
     args = parser.parse_args()
+    
+    # Configure logging based on verbosity
+    log_level = logging.DEBUG if args.verbose else logging.INFO
+    logging.basicConfig(
+        level=log_level,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
     args.func(args)
