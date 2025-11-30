@@ -92,8 +92,7 @@ def cmd_scrape(args):
         _scrape_film_metadata(scraper, new_slugs)
         
         # Phase 2.1: Scrape user lists if enabled
-        include_lists = getattr(args, 'include_lists', True)
-        if include_lists:
+        if args.include_lists:
             from datetime import datetime
             
             print(f"\nScraping {args.username}'s lists...")
@@ -114,8 +113,7 @@ def cmd_scrape(args):
                         ))
             
             # Get all user lists
-            max_lists = getattr(args, 'max_lists', 50)
-            lists = scraper.scrape_user_lists(args.username, limit=max_lists)
+            lists = scraper.scrape_user_lists(args.username, limit=args.max_lists)
             
             # Scrape films from each list
             for list_info in lists:
@@ -475,14 +473,17 @@ def cmd_import(args):
         if 'films' in data:
             for film in data['films']:
                 conn.execute("""
-                    INSERT OR REPLACE INTO films 
-                    (slug, title, year, directors, genres, cast, themes, runtime, avg_rating, rating_count)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT OR REPLACE INTO films
+                    (slug, title, year, directors, genres, cast, themes, runtime, avg_rating, rating_count,
+                     countries, languages, writers, cinematographers, composers)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     film['slug'], film.get('title'), film.get('year'),
                     film.get('directors'), film.get('genres'),
                     film.get('cast'), film.get('themes'),
-                    film.get('runtime'), film.get('avg_rating'), film.get('rating_count')
+                    film.get('runtime'), film.get('avg_rating'), film.get('rating_count'),
+                    film.get('countries'), film.get('languages'),
+                    film.get('writers'), film.get('cinematographers'), film.get('composers')
                 ))
             print(f"Imported {len(data['films'])} films")
         
@@ -639,6 +640,12 @@ def main():
     scrape_parser.add_argument("username", help="Letterboxd username")
     scrape_parser.add_argument("--refresh", type=int, metavar="DAYS",
                                 help="Only scrape if last scraped more than N days ago")
+    scrape_parser.add_argument("--include-lists", action="store_true", default=True,
+                                help="Include user lists (favorites, ranked lists)")
+    scrape_parser.add_argument("--no-include-lists", dest="include_lists", action="store_false",
+                                help="Skip scraping user lists")
+    scrape_parser.add_argument("--max-lists", type=int, default=50,
+                                help="Maximum number of lists to scrape per user (default: 50)")
     scrape_parser.set_defaults(func=cmd_scrape)
     
     # Discover command

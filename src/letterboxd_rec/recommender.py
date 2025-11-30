@@ -364,8 +364,8 @@ class MetadataRecommender:
                 reasons.append(f"Shared cast: {list(cast_overlap)[0]}")
             
             # Same decade
-            film_decade = (film.get('year') // 10) * 10 if film.get('year') else None
-            if target_decade and film_decade == target_decade:
+            film_decade = (film.get('year') // 10) * 10 if film.get('year') is not None else None
+            if target_decade is not None and film_decade == target_decade:
                 score += 0.5
             
             if score > 0:
