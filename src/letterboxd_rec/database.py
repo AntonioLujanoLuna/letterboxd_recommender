@@ -53,6 +53,7 @@ def init_db():
             );
             
             CREATE INDEX IF NOT EXISTS idx_user ON user_films(username);
+            CREATE INDEX IF NOT EXISTS idx_user_film_slug ON user_films(film_slug);
             CREATE INDEX IF NOT EXISTS idx_film_year ON films(year);
             CREATE INDEX IF NOT EXISTS idx_lists_user ON user_lists(username);
             CREATE INDEX IF NOT EXISTS idx_lists_film ON user_lists(film_slug);

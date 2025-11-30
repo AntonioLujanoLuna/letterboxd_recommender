@@ -202,7 +202,7 @@ def _compute_weight(uf: dict) -> float:
     liked = uf.get('liked', False)
     watched = uf.get('watched', False)
     watchlisted = uf.get('watchlisted', False)
-    
+
     # Explicit rating takes precedence
     if rating is not None:
         if rating >= 4.5:
@@ -226,16 +226,9 @@ def _compute_weight(uf: dict) -> float:
         base_weight = 0.2
     else:
         base_weight = 0.0
-    
-    # Phase 1: Apply temporal decay
-    if 'scraped_at' in uf and uf['scraped_at']:
-        try:
-            from datetime import datetime
-            scraped = datetime.fromisoformat(uf['scraped_at'])
-            days_ago = (datetime.now() - scraped).days
-            decay = 0.95 ** (days_ago / 365)  # 5% decay per year
-            base_weight *= max(decay, 0.5)  # floor at 50%
-        except (ValueError, TypeError):
-            pass  # If parsing fails, use base weight
-    
+
+    # Note: Temporal decay removed - scraped_at reflects when we scraped the data,
+    # not when the user watched the film. To implement proper temporal decay, we would
+    # need actual watch dates from Letterboxd (not currently available in the schema).
+
     return base_weight

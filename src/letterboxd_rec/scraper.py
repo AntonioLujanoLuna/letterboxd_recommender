@@ -33,6 +33,87 @@ class FilmMetadata:
     cinematographers: list[str]
     composers: list[str]
 
+
+def parse_film_page(tree: HTMLParser, slug: str) -> FilmMetadata:
+    """
+    Shared parsing logic for film pages.
+    Used by both sync and async scrapers to avoid code duplication.
+    """
+    # Title
+    title_el = tree.css_first("h1.headline-1")
+    title = title_el.text(strip=True) if title_el else slug
+
+    # Year
+    year = None
+    year_el = tree.css_first("small.number a, div.releaseyear a")
+    if year_el:
+        try:
+            year = int(year_el.text(strip=True))
+        except ValueError:
+            pass
+
+    # Directors
+    directors = list(dict.fromkeys([a.text(strip=True) for a in tree.css("a[href*='/director/']") if a.text(strip=True)]))
+
+    # Genres
+    genres = list(dict.fromkeys([a.text(strip=True) for a in tree.css("a[href*='/films/genre/']") if a.text(strip=True)]))
+
+    # Cast (top billed)
+    cast = list(dict.fromkeys([a.text(strip=True) for a in tree.css("a[href*='/actor/']")[:10] if a.text(strip=True)]))
+
+    # Themes/tags
+    themes = list(dict.fromkeys([a.text(strip=True) for a in tree.css("a[href*='/films/theme/'], a[href*='/films/mini-theme/']") if a.text(strip=True)]))
+
+    # Runtime
+    runtime = None
+    runtime_el = tree.css_first("p.text-link.text-footer")
+    if runtime_el and "mins" in runtime_el.text():
+        try:
+            runtime = int(runtime_el.text().split()[0])
+        except (ValueError, IndexError):
+            pass
+
+    # Average rating
+    avg_rating = None
+    meta = tree.css_first("meta[name='twitter:data2']")
+    if meta:
+        try:
+            avg_rating = float(meta.attributes.get("content", "").split()[0])
+        except (ValueError, IndexError):
+            pass
+
+    # Rating count
+    rating_count = None
+    ratings_el = tree.css_first("a[href*='/ratings/']")
+    if ratings_el:
+        try:
+            rating_count = int(float(ratings_el.text(strip=True).replace(",", "").replace("K", "000")))
+        except (ValueError, IndexError):
+            pass
+
+    # Phase 1: Countries
+    countries = list(dict.fromkeys([a.text(strip=True) for a in tree.css("a[href*='/films/country/']") if a.text(strip=True)]))
+
+    # Phase 1: Languages
+    languages = list(dict.fromkeys([a.text(strip=True) for a in tree.css("a[href*='/films/language/']") if a.text(strip=True)]))
+
+    # Phase 1: Writers
+    writers = list(dict.fromkeys([a.text(strip=True) for a in tree.css("a[href*='/writer/']") if a.text(strip=True)]))
+
+    # Phase 1: Cinematographers
+    cinematographers = list(dict.fromkeys([a.text(strip=True) for a in tree.css("a[href*='/cinematography/']") if a.text(strip=True)]))
+
+    # Phase 1: Composers
+    composers = list(dict.fromkeys([a.text(strip=True) for a in tree.css("a[href*='/composer/']") if a.text(strip=True)]))
+
+    return FilmMetadata(
+        slug=slug, title=title, year=year, directors=directors,
+        genres=genres, cast=cast, themes=themes,
+        runtime=runtime, avg_rating=avg_rating, rating_count=rating_count,
+        countries=countries, languages=languages, writers=writers,
+        cinematographers=cinematographers, composers=composers
+    )
+
 class LetterboxdScraper:
     BASE = "https://letterboxd.com"
     
@@ -158,121 +239,7 @@ class LetterboxdScraper:
         tree = self._get(f"{self.BASE}/film/{slug}/")
         if not tree:
             return None
-        
-        # Title
-        title_el = tree.css_first("h1.headline-1")
-        title = title_el.text(strip=True) if title_el else slug
-        
-        # Year
-        year = None
-        year_el = tree.css_first("small.number a, div.releaseyear a")
-        if year_el:
-            try:
-                year = int(year_el.text(strip=True))
-            except ValueError:
-                pass
-        
-        # Directors
-        directors = []
-        for a in tree.css("a[href*='/director/']"):
-            name = a.text(strip=True)
-            if name and name not in directors:
-                directors.append(name)
-        
-        # Genres
-        genres = []
-        for a in tree.css("a[href*='/films/genre/']"):
-            g = a.text(strip=True)
-            if g and g not in genres:
-                genres.append(g)
-        
-        # Cast (top billed)
-        cast = []
-        for a in tree.css("a[href*='/actor/']")[:10]:
-            name = a.text(strip=True)
-            if name and name not in cast:
-                cast.append(name)
-        
-        # Themes/tags
-        themes = []
-        for a in tree.css("a[href*='/films/theme/'], a[href*='/films/mini-theme/']"):
-            t = a.text(strip=True)
-            if t and t not in themes:
-                themes.append(t)
-        
-        # Runtime
-        runtime = None
-        runtime_el = tree.css_first("p.text-link.text-footer")
-        if runtime_el:
-            text = runtime_el.text()
-            if "mins" in text:
-                try:
-                    runtime = int(text.split()[0])
-                except (ValueError, IndexError):
-                    pass
-        
-        # Average rating
-        avg_rating = None
-        meta = tree.css_first("meta[name='twitter:data2']")
-        if meta:
-            content = meta.attributes.get("content", "")
-            try:
-                avg_rating = float(content.split()[0])
-            except (ValueError, IndexError):
-                pass
-        
-        # Rating count
-        rating_count = None
-        ratings_el = tree.css_first("a[href*='/ratings/']")
-        if ratings_el:
-            text = ratings_el.text(strip=True).replace(",", "").replace("K", "000")
-            try:
-                rating_count = int(float(text))
-            except (ValueError, IndexError):
-                pass
-        
-        # Phase 1: Countries
-        countries = []
-        for a in tree.css("a[href*='/films/country/']"):
-            country = a.text(strip=True)
-            if country and country not in countries:
-                countries.append(country)
-        
-        # Phase 1: Languages  
-        languages = []
-        for a in tree.css("a[href*='/films/language/']"):
-            lang = a.text(strip=True)
-            if lang and lang not in languages:
-                languages.append(lang)
-        
-        # Phase 1: Writers (look for screenplay, writer, story credits)
-        writers = []
-        for a in tree.css("a[href*='/writer/']"):
-            name = a.text(strip=True)
-            if name and name not in writers:
-                writers.append(name)
-        
-        # Phase 1: Cinematographers
-        cinematographers = []
-        for a in tree.css("a[href*='/cinematography/']"):
-            name = a.text(strip=True)
-            if name and name not in cinematographers:
-                cinematographers.append(name)
-        
-        # Phase 1: Composers
-        composers = []
-        for a in tree.css("a[href*='/composer/']"):
-            name = a.text(strip=True)
-            if name and name not in composers:
-                composers.append(name)
-        
-        return FilmMetadata(
-            slug=slug, title=title, year=year, directors=directors,
-            genres=genres, cast=cast, themes=themes, runtime=runtime,
-            avg_rating=avg_rating, rating_count=rating_count,
-            countries=countries, languages=languages, writers=writers,
-            cinematographers=cinematographers, composers=composers
-        )
+        return parse_film_page(tree, slug)
     
     def _parse_rating(self, span) -> float | None:
         classes = span.attributes.get("class", "")
@@ -607,58 +574,4 @@ class AsyncLetterboxdScraper:
     def _parse_film_page(self, html: str, slug: str):
         """Parse film page HTML."""
         tree = HTMLParser(html)
-        
-        title_el = tree.css_first("h1.headline-1")
-        title = title_el.text(strip=True) if title_el else slug
-        
-        year = None
-        year_el = tree.css_first("small.number a, div.releaseyear a")
-        if year_el:
-            try:
-                year = int(year_el.text(strip=True))
-            except ValueError:
-                pass
-        
-        directors = list(dict.fromkeys([a.text(strip=True) for a in tree.css("a[href*='/director/']") if a.text(strip=True)]))
-        genres = list(dict.fromkeys([a.text(strip=True) for a in tree.css("a[href*='/films/genre/']") if a.text(strip=True)]))
-        cast = list(dict.fromkeys([a.text(strip=True) for a in tree.css("a[href*='/actor/']")[:10] if a.text(strip=True)]))
-        themes = list(dict.fromkeys([a.text(strip=True) for a in tree.css("a[href*='/films/theme/'], a[href*='/films/mini-theme/']") if a.text(strip=True)]))
-        
-        runtime = None
-        runtime_el = tree.css_first("p.text-link.text-footer")
-        if runtime_el and "mins" in runtime_el.text():
-            try:
-                runtime = int(runtime_el.text().split()[0])
-            except (ValueError, IndexError):
-                pass
-        
-        avg_rating = None
-        meta = tree.css_first("meta[name='twitter:data2']")
-        if meta:
-            try:
-                avg_rating = float(meta.attributes.get("content", "").split()[0])
-            except (ValueError, IndexError):
-                pass
-        
-        rating_count = None
-        ratings_el = tree.css_first("a[href*='/ratings/']")
-        if ratings_el:
-            try:
-                rating_count = int(float(ratings_el.text(strip=True).replace(",", "").replace("K", "000")))
-            except (ValueError, IndexError):
-                pass
-        
-        # Phase 1: New fields
-        countries = list(dict.fromkeys([a.text(strip=True) for a in tree.css("a[href*='/films/country/']") if a.text(strip=True)]))
-        languages = list(dict.fromkeys([a.text(strip=True) for a in tree.css("a[href*='/films/language/']") if a.text(strip=True)]))
-        writers = list(dict.fromkeys([a.text(strip=True) for a in tree.css("a[href*='/writer/']") if a.text(strip=True)]))
-        cinematographers = list(dict.fromkeys([a.text(strip=True) for a in tree.css("a[href*='/cinematography/']") if a.text(strip=True)]))
-        composers = list(dict.fromkeys([a.text(strip=True) for a in tree.css("a[href*='/composer/']") if a.text(strip=True)]))
-        
-        return FilmMetadata(
-            slug=slug, title=title, year=year, directors=directors,
-            genres=genres, cast=cast, themes=themes,
-            runtime=runtime, avg_rating=avg_rating, rating_count=rating_count,
-            countries=countries, languages=languages, writers=writers,
-            cinematographers=cinematographers, composers=composers
-        )
+        return parse_film_page(tree, slug)
