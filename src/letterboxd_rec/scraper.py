@@ -6,6 +6,7 @@ from selectolax.parser import HTMLParser
 from dataclasses import dataclass
 from tqdm import tqdm
 import asyncio
+from .utils import retry_with_backoff, async_retry_with_backoff
 
 logger = logging.getLogger(__name__)
 
@@ -194,46 +195,77 @@ class LetterboxdScraper:
         
         return None
     
-    def scrape_user(self, username: str) -> list[FilmInteraction]:
-        """Scrape all film interactions for a user."""
+    def scrape_user(self, username: str, existing_slugs: set[str] | None = None, stop_on_existing: bool = False) -> list[FilmInteraction]:
+        """
+        Scrape all film interactions for a user.
+
+        Args:
+            username: Letterboxd username to scrape
+            existing_slugs: Optional set of film slugs already in database for this user
+            stop_on_existing: If True, stop pagination when hitting films already scraped (incremental mode)
+
+        Returns:
+            List of FilmInteraction objects
+        """
         films = {}
-        
+
         # Get watched films with ratings
         logger.info(f"Scraping {username}'s films...")
         page = 1
+        consecutive_existing = 0  # Track consecutive existing films for early termination
+        MAX_CONSECUTIVE_EXISTING = 20  # Stop if we see 20 consecutive existing films
+
         while True:
             tree = self._get(f"{self.BASE}/{username}/films/page/{page}/")
             if not tree:
                 break
-            
+
             items = tree.css("li.griditem")
             if not items:
                 break
-            
+
+            page_had_new_films = False
+
             for item in items:
                 react_comp = item.css_first("div.react-component")
                 if not react_comp:
                     continue
-                    
+
                 slug = react_comp.attributes.get("data-item-slug")
                 if not slug:
                     continue
-                
+
+                # Incremental scraping: check if we've already scraped this film
+                if stop_on_existing and existing_slugs and slug in existing_slugs:
+                    consecutive_existing += 1
+                    if consecutive_existing >= MAX_CONSECUTIVE_EXISTING:
+                        logger.info(f"  Found {consecutive_existing} consecutive existing films, stopping early (incremental mode)")
+                        return list(films.values())
+                    continue
+                else:
+                    consecutive_existing = 0
+                    page_had_new_films = True
+
                 rating = None
                 liked = False
-                
+
                 viewing_data = item.css_first("p.poster-viewingdata")
                 if viewing_data:
                     rating_span = viewing_data.css_first("span.rating")
                     if rating_span:
                         rating = self._parse_rating(rating_span)
-                    
+
                     liked = viewing_data.css_first("span.like") is not None
-                
+
                 films[slug] = FilmInteraction(slug, rating, True, False, liked)
-            
+
             page += 1
             logger.debug(f"  Watched page {page-1}: {len(items)} films")
+
+            # If incremental mode and no new films on this page, we can stop
+            if stop_on_existing and not page_had_new_films and existing_slugs:
+                logger.info(f"  No new films found on page {page-1}, stopping early (incremental mode)")
+                break
         
         # Get watchlist
         logger.info(f"Scraping {username}'s watchlist...")
