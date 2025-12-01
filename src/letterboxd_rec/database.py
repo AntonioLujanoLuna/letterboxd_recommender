@@ -1,27 +1,28 @@
 import sqlite3
 import json
 import logging
+import os
 from pathlib import Path
 from contextlib import contextmanager
 
 logger = logging.getLogger(__name__)
 
 # Adjust DB_PATH to be relative to the project root or a specific location
-DB_PATH = Path("data/letterboxd.db")
+DB_PATH = Path(os.environ.get("LETTERBOXD_DB", "data/letterboxd.db"))
 
 
 def init_db():
-    DB_PATH.parent.mkdir(exist_ok=True)
+    DB_PATH.parent.mkdir(exist_ok=True, parents=True)
     with get_db() as conn:
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS films (
                 slug TEXT PRIMARY KEY,
                 title TEXT,
                 year INTEGER,
-                directors TEXT,     -- JSON list
+                directors TEXT,     -- JSON list (kept for backward compat)
                 genres TEXT,        -- JSON list
                 cast TEXT,          -- JSON list
-                themes TEXT,        -- JSON list (from Letterboxd tags)
+                themes TEXT,        -- JSON list
                 runtime INTEGER,
                 avg_rating REAL,
                 rating_count INTEGER,
@@ -55,12 +56,30 @@ def init_db():
                 PRIMARY KEY (username, list_slug, film_slug)
             );
             
+            -- New table for caching user profiles
+            CREATE TABLE IF NOT EXISTS user_profiles (
+                username TEXT PRIMARY KEY,
+                profile_data TEXT,  -- JSON blob of profile stats
+                updated_at TEXT
+            );
+            
+            -- Normalized tables for better querying
+            CREATE TABLE IF NOT EXISTS film_directors (film_slug TEXT, director TEXT, PRIMARY KEY (film_slug, director));
+            CREATE TABLE IF NOT EXISTS film_genres (film_slug TEXT, genre TEXT, PRIMARY KEY (film_slug, genre));
+            CREATE TABLE IF NOT EXISTS film_cast (film_slug TEXT, actor TEXT, PRIMARY KEY (film_slug, actor));
+            CREATE TABLE IF NOT EXISTS film_themes (film_slug TEXT, theme TEXT, PRIMARY KEY (film_slug, theme));
+            
             CREATE INDEX IF NOT EXISTS idx_user ON user_films(username);
             CREATE INDEX IF NOT EXISTS idx_user_film_slug ON user_films(film_slug);
             CREATE INDEX IF NOT EXISTS idx_film_year ON films(year);
             CREATE INDEX IF NOT EXISTS idx_lists_user ON user_lists(username);
             CREATE INDEX IF NOT EXISTS idx_lists_film ON user_lists(film_slug);
             CREATE INDEX IF NOT EXISTS idx_lists_favorites ON user_lists(is_favorites);
+            
+            CREATE INDEX IF NOT EXISTS idx_fd_director ON film_directors(director);
+            CREATE INDEX IF NOT EXISTS idx_fg_genre ON film_genres(genre);
+            CREATE INDEX IF NOT EXISTS idx_fc_actor ON film_cast(actor);
+            CREATE INDEX IF NOT EXISTS idx_ft_theme ON film_themes(theme);
         """)
         
         # Migration: Add new columns to existing films table if they don't exist

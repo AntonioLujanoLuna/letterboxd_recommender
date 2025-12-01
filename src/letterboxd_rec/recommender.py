@@ -17,6 +17,7 @@ class MetadataRecommender:
     """
     
     # Weights for different signal types
+    # Weights for different signal types
     WEIGHTS = {
         'genre': 1.0,
         'director': 3.0,      # strong signal
@@ -25,17 +26,36 @@ class MetadataRecommender:
         'decade': 0.3,
         'community_rating': 0.8,
         'popularity': 0.2,
-        # Phase 1 enhancements
         'country': 1.5,       # strong geographic preference signal
         'language': 1.0,      # language preference
         'writer': 2.0,        # nearly as strong as directors
         'cinematographer': 1.0,  # visual style preference
         'composer': 0.8,      # musical/score preference
     }
+
+    # Thresholds and Constants
+    MATCH_THRESHOLD_GENRE = 0.5
+    MATCH_THRESHOLD_ACTOR = 0.5
+    MATCH_THRESHOLD_LANGUAGE = 0.5
+    MATCH_THRESHOLD_DIRECTOR = 1.0
+    MATCH_THRESHOLD_WRITER = 1.0
+    MATCH_THRESHOLD_CINE = 0.8
+    MATCH_THRESHOLD_COMPOSER = 0.8
+    
+    COUNTRY_SECONDARY_WEIGHT = 0.3
+    
+    RATING_DIFF_HIGH = 0.3
+    RATING_DIFF_MED = 0.5
+    
+    POPULARITY_HIGH = 10000
+    POPULARITY_MED = 1000
+    
+    SIMILAR_DIRECTOR_BONUS = 5.0
+    SIMILAR_CAST_SCORE = 0.5
+    SIMILAR_DECADE_SCORE = 0.5
     
     def __init__(self, all_films: list[dict]):
         self.films = {f['slug']: f for f in all_films}
-        self.films_dict = self.films  # Alias for consistency
     
     def recommend(
         self,
@@ -219,7 +239,7 @@ class MetadataRecommender:
         for g in film_genres:
             if g in profile.genres:
                 genre_score += profile.genres[g]
-                if profile.genres[g] > 0.5:
+                if profile.genres[g] > self.MATCH_THRESHOLD_GENRE:
                     matched_genres.append(g)
         score += genre_score * self.WEIGHTS['genre']
         if matched_genres:
@@ -231,14 +251,14 @@ class MetadataRecommender:
             if d in profile.directors:
                 dir_score = profile.directors[d]
                 score += dir_score * self.WEIGHTS['director']
-                if dir_score > 1.0:
+                if dir_score > self.MATCH_THRESHOLD_DIRECTOR:
                     reasons.append(f"Director: {d}")
         
         # Actor match
         film_cast = load_json(film.get('cast', []))[:5]
         matched_actors = []
         for a in film_cast:
-            if a in profile.actors and profile.actors[a] > 0.5:
+            if a in profile.actors and profile.actors[a] > self.MATCH_THRESHOLD_ACTOR:
                 score += profile.actors[a] * self.WEIGHTS['actor']
                 matched_actors.append(a)
         if matched_actors:
@@ -262,7 +282,7 @@ class MetadataRecommender:
         for i, country in enumerate(film_countries):
             if country in profile.countries:
                 # Primary country gets full weight, secondary reduced
-                country_weight = self.WEIGHTS['country'] if i == 0 else self.WEIGHTS['country'] * 0.3
+                country_weight = self.WEIGHTS['country'] if i == 0 else self.WEIGHTS['country'] * self.COUNTRY_SECONDARY_WEIGHT
                 score += profile.countries[country] * country_weight
                 if i == 0 and profile.countries[country] > 0.5:
                     reasons.append(f"Country: {country}")
@@ -271,7 +291,7 @@ class MetadataRecommender:
         film_languages = load_json(film.get('languages', []))
         matched_languages = []
         for lang in film_languages:
-            if lang in profile.languages and profile.languages[lang] > 0.5:
+            if lang in profile.languages and profile.languages[lang] > self.MATCH_THRESHOLD_LANGUAGE:
                 score += profile.languages[lang] * self.WEIGHTS['language']
                 matched_languages.append(lang)
         if matched_languages:
@@ -283,7 +303,7 @@ class MetadataRecommender:
             if w in profile.writers:
                 writer_score = profile.writers[w]
                 score += writer_score * self.WEIGHTS['writer']
-                if writer_score > 1.0:
+                if writer_score > self.MATCH_THRESHOLD_WRITER:
                     reasons.append(f"Writer: {w}")
         
         # Phase 1: Cinematographer match
@@ -292,7 +312,7 @@ class MetadataRecommender:
             if c in profile.cinematographers:
                 cine_score = profile.cinematographers[c]
                 score += cine_score * self.WEIGHTS['cinematographer']
-                if cine_score > 0.8:
+                if cine_score > self.MATCH_THRESHOLD_CINE:
                     reasons.append(f"Cinematography: {c}")
         
         # Phase 1: Composer match
@@ -301,7 +321,7 @@ class MetadataRecommender:
             if comp in profile.composers:
                 comp_score = profile.composers[comp]
                 score += comp_score * self.WEIGHTS['composer']
-                if comp_score > 0.8:
+                if comp_score > self.MATCH_THRESHOLD_COMPOSER:
                     reasons.append(f"Composer: {comp}")
         
         # Community rating bonus
@@ -310,17 +330,17 @@ class MetadataRecommender:
         if avg and profile.avg_liked_rating:
             # Bonus for films near user's sweet spot
             rating_diff = abs(avg - profile.avg_liked_rating)
-            if rating_diff < 0.3:
+            if rating_diff < self.RATING_DIFF_HIGH:
                 score += 1.0 * self.WEIGHTS['community_rating']
                 reasons.append(f"Highly rated ({avg:.1f}★)")
-            elif rating_diff < 0.5:
+            elif rating_diff < self.RATING_DIFF_MED:
                 score += 0.5 * self.WEIGHTS['community_rating']
         
         # Slight popularity boost (avoid total obscurity)
         count = film.get('rating_count') or 0
-        if count > 10000:
+        if count > self.POPULARITY_HIGH:
             score += 0.3 * self.WEIGHTS['popularity']
-        elif count > 1000:
+        elif count > self.POPULARITY_MED:
             score += 0.1 * self.WEIGHTS['popularity']
         
         return score, reasons
@@ -334,7 +354,7 @@ class MetadataRecommender:
         target_genres = set(load_json(target.get('genres')))
         target_directors = set(load_json(target.get('directors')))
         target_cast = set(load_json(target.get('cast', []))[:5])
-        target_decade = (target.get('year') // 10) * 10 if target.get('year') is not None else None
+        target_decade = (target.get('year') // 10) * 10 if target.get('year') else None
         
         candidates = []
         for other_slug, film in self.films.items():
@@ -353,20 +373,20 @@ class MetadataRecommender:
             film_directors = set(load_json(film.get('directors')))
             dir_overlap = target_directors & film_directors
             if dir_overlap:
-                score += 5.0
+                score += self.SIMILAR_DIRECTOR_BONUS
                 reasons.append(f"Same director: {list(dir_overlap)[0]}")
             
             # Cast overlap
             film_cast = set(load_json(film.get('cast', []))[:5])
             cast_overlap = target_cast & film_cast
-            score += len(cast_overlap) * 0.5
+            score += len(cast_overlap) * self.SIMILAR_CAST_SCORE
             if cast_overlap:
                 reasons.append(f"Shared cast: {list(cast_overlap)[0]}")
             
             # Same decade
             film_decade = (film.get('year') // 10) * 10 if film.get('year') is not None else None
             if target_decade is not None and film_decade == target_decade:
-                score += 0.5
+                score += self.SIMILAR_DECADE_SCORE
             
             if score > 0:
                 candidates.append((other_slug, score, reasons))
@@ -392,7 +412,7 @@ class MetadataRecommender:
         director_counts = defaultdict(int)
         
         for slug, score, reasons in candidates:
-            film = self.films_dict.get(slug)
+            film = self.films.get(slug)
             if not film:
                 continue
             

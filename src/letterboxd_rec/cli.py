@@ -310,10 +310,19 @@ def cmd_recommend(args):
             
             # Merge by rank (Borda count style)
             scores = {}
+            reasons_map = {}
+            
             for rank, r in enumerate(meta_recs):
                 scores[r.slug] = scores.get(r.slug, 0) + (len(meta_recs) - rank)
+                if r.slug not in reasons_map:
+                    reasons_map[r.slug] = []
+                reasons_map[r.slug].extend(r.reasons)
+
             for rank, r in enumerate(collab_recs):
                 scores[r.slug] = scores.get(r.slug, 0) + (len(collab_recs) - rank)
+                if r.slug not in reasons_map:
+                    reasons_map[r.slug] = []
+                reasons_map[r.slug].extend(r.reasons)
             
             # Build final recommendations
             merged = sorted(scores.items(), key=lambda x: -x[1])[:args.limit]
@@ -321,12 +330,14 @@ def cmd_recommend(args):
             for slug, score in merged:
                 if slug in all_films:
                     film = all_films[slug]
+                    # Deduplicate reasons while preserving order
+                    unique_reasons = list(dict.fromkeys(reasons_map.get(slug, [])))
                     recs.append(Recommendation(
                         slug=slug,
                         title=film.get('title', slug),
                         year=film.get('year'),
                         score=score,
-                        reasons=["Hybrid: metadata + collaborative"]
+                        reasons=unique_reasons[:3] # Top 3 combined reasons
                     ))
                     
         elif strategy == 'collaborative':

@@ -131,27 +131,35 @@ class LetterboxdScraper:
     def _get(self, url: str, max_retries: int = 3) -> HTMLParser | None:
         time.sleep(self.delay)
         
-        for attempt in range(max_retries):
+        retries = 0
+        while retries < max_retries:
             try:
                 resp = self.client.get(url)
                 if resp.status_code == 404:
                     return None
+                
+                if resp.status_code == 429:
+                    retry_after = int(resp.headers.get("Retry-After", 60))
+                    logger.warning(f"Rate limited (429) on {url}, waiting {retry_after}s...")
+                    time.sleep(retry_after)
+                    # Do not increment retries for 429
+                    continue
+                
                 resp.raise_for_status()
                 return HTMLParser(resp.text)
             except httpx.TimeoutException as e:
-                if attempt < max_retries - 1:
-                    wait_time = 2 ** attempt
-                    logger.warning(f"Timeout on {url}, retrying in {wait_time}s... (attempt {attempt + 1}/{max_retries})")
+                if retries < max_retries - 1:
+                    wait_time = 2 ** retries
+                    logger.warning(f"Timeout on {url}, retrying in {wait_time}s... (attempt {retries + 1}/{max_retries})")
                     time.sleep(wait_time)
+                    retries += 1
                 else:
                     logger.error(f"Max retries exceeded for {url}: {e}")
                     return None
             except httpx.HTTPStatusError as e:
-                if e.response.status_code == 429:
-                    retry_after = int(e.response.headers.get("Retry-After", 60))
-                    logger.warning(f"Rate limited (429) on {url}, waiting {retry_after}s...")
-                    time.sleep(retry_after)
-                    continue
+                # 429 is handled above if it comes as a status code without raising (depending on client config)
+                # But raise_for_status might raise it.
+                # Actually, I checked status_code before raise_for_status, so 429 is caught.
                 logger.error(f"HTTP error on {url}: {e}")
                 return None
             except httpx.HTTPError as e:
