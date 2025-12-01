@@ -354,7 +354,9 @@ class MetadataRecommender:
         target_genres = set(load_json(target.get('genres')))
         target_directors = set(load_json(target.get('directors')))
         target_cast = set(load_json(target.get('cast', []))[:5])
-        target_decade = (target.get('year') // 10) * 10 if target.get('year') is not None else None
+        
+        target_year = target.get('year')
+        target_decade = (target_year // 10) * 10 if isinstance(target_year, int) else None
         
         candidates = []
         for other_slug, film in self.films.items():
@@ -384,7 +386,9 @@ class MetadataRecommender:
                 reasons.append(f"Shared cast: {list(cast_overlap)[0]}")
             
             # Same decade
-            film_decade = (film.get('year') // 10) * 10 if film.get('year') is not None else None
+            film_year = film.get('year')
+            film_decade = (film_year // 10) * 10 if isinstance(film_year, int) else None
+            
             if target_decade is not None and film_decade == target_decade:
                 score += self.SIMILAR_DECADE_SCORE
             

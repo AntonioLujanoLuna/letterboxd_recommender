@@ -261,7 +261,9 @@ class LetterboxdScraper:
         for cls in classes.split():
             if cls.startswith("rated-"):
                 try:
-                    return int(cls.replace("rated-", "")) / 2
+                    val = int(cls.replace("rated-", "")) / 2
+                    if 0.5 <= val <= 5.0:
+                        return val
                 except ValueError:
                     pass
         return None
