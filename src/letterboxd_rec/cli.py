@@ -73,7 +73,7 @@ def _load_all_user_films(conn, username_filter: str | None = None) -> dict[str, 
     return dict(all_user_films)
 
 
-def _scrape_film_metadata(scraper, slugs, max_per_batch=100, use_async=True):
+def _scrape_film_metadata(scraper: 'LetterboxdScraper', slugs: list[str], max_per_batch: int = 100, use_async: bool = True) -> None:
     """Helper to scrape film metadata for a list of slugs."""
     if not slugs:
         return
@@ -122,7 +122,7 @@ def _scrape_film_metadata(scraper, slugs, max_per_batch=100, use_async=True):
         logger.info(f"Saved {len(metadata_list)} films")
 
 
-def cmd_scrape(args):
+def cmd_scrape(args: argparse.Namespace) -> None:
     """Scrape a user's Letterboxd data."""
     init_db()
     
@@ -152,19 +152,39 @@ def cmd_scrape(args):
                     else:
                         print(f"  Refreshing {username} (last scraped {age_days} days ago)")
 
-        interactions = scraper.scrape_user(username)
-        
-        # Batch insert user films
+        # Check for incremental mode
+        incremental = getattr(args, 'incremental', False)
+        existing_slugs = set()
+
+        if incremental:
+            with get_db() as conn:
+                existing_slugs = {
+                    r['film_slug'] for r in conn.execute("""
+                        SELECT film_slug FROM user_films WHERE username = ?
+                    """, (username,))
+                }
+                logger.info(f"Incremental mode: found {len(existing_slugs)} existing films for {username}")
+
+        interactions = scraper.scrape_user(username, existing_slugs=existing_slugs, stop_on_existing=incremental)
+
+        # Batch insert user films within a transaction
         with get_db() as conn:
-            conn.executemany("""
-                INSERT OR REPLACE INTO user_films
-                (username, film_slug, rating, watched, watchlisted, liked, scraped_at)
-                VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
-            """, [(username, i.film_slug, i.rating, i.watched, i.watchlisted, i.liked)
-                  for i in interactions])
-            
-            existing = {r['slug'] for r in conn.execute("SELECT slug FROM films")}
-        
+            # Start explicit transaction for atomicity
+            conn.execute("BEGIN")
+            try:
+                conn.executemany("""
+                    INSERT OR REPLACE INTO user_films
+                    (username, film_slug, rating, watched, watchlisted, liked, scraped_at)
+                    VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+                """, [(username, i.film_slug, i.rating, i.watched, i.watchlisted, i.liked)
+                      for i in interactions])
+
+                existing = {r['slug'] for r in conn.execute("SELECT slug FROM films")}
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
         new_slugs = [i.film_slug for i in interactions if i.film_slug not in existing]
         
         # Scrape and batch insert film metadata
@@ -180,15 +200,21 @@ def cmd_scrape(args):
             if favorites:
                 print(f"  Found {len(favorites)} profile favorites")
                 with get_db() as conn:
-                    for slug in favorites:
-                        conn.execute("""
-                            INSERT OR REPLACE INTO user_lists
-                            (username, list_slug, list_name, is_ranked, is_favorites, position, film_slug, scraped_at)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        """, (
-                            username, "profile-favorites", "Profile Favorites",
-                            0, 1, None, slug, datetime.now().isoformat()
-                        ))
+                    conn.execute("BEGIN")
+                    try:
+                        for slug in favorites:
+                            conn.execute("""
+                                INSERT OR REPLACE INTO user_lists
+                                (username, list_slug, list_name, is_ranked, is_favorites, position, film_slug, scraped_at)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            """, (
+                                username, "profile-favorites", "Profile Favorites",
+                                0, 1, None, slug, datetime.now().isoformat()
+                            ))
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
+                        raise
             
             # Get all user lists
             lists = scraper.scrape_user_lists(username, limit=args.max_lists)
@@ -211,16 +237,22 @@ def cmd_scrape(args):
                 
                 # Save to database
                 with get_db() as conn:
-                    for film in films:
-                        conn.execute("""
-                            INSERT OR REPLACE INTO user_lists
-                            (username, list_slug, list_name, is_ranked, is_favorites, position, film_slug, scraped_at)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        """, (
-                            username, list_slug, list_name,
-                            is_ranked, is_favorites, film.get('position'),
-                            film['film_slug'], datetime.now().isoformat()
-                        ))
+                    conn.execute("BEGIN")
+                    try:
+                        for film in films:
+                            conn.execute("""
+                                INSERT OR REPLACE INTO user_lists
+                                (username, list_slug, list_name, is_ranked, is_favorites, position, film_slug, scraped_at)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            """, (
+                                username, list_slug, list_name,
+                                is_ranked, is_favorites, film.get('position'),
+                                film['film_slug'], datetime.now().isoformat()
+                            ))
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
+                        raise
                 
                 print(f"    {len(films)} films")
 
@@ -230,7 +262,7 @@ def cmd_scrape(args):
         scraper.close()
 
 
-def cmd_discover(args):
+def cmd_discover(args: argparse.Namespace) -> None:
     """Discover and scrape other users."""
     init_db()
     scraper = LetterboxdScraper(delay=1.0)
@@ -289,24 +321,40 @@ def cmd_discover(args):
         if not new_usernames:
             print(f"No new users found! All discovered users already in database.")
             return
-        
+
+        # Check for dry-run mode
+        dry_run = getattr(args, 'dry_run', False)
+
+        if dry_run:
+            print(f"\n[DRY RUN] Would scrape {len(new_usernames)} new users:")
+            for i, username in enumerate(new_usernames, 1):
+                print(f"  {i}. {username}")
+            print(f"\nTo actually scrape these users, run without --dry-run flag")
+            return
+
         print(f"\nScraping {len(new_usernames)} new users...")
-        
+
         # Scrape each user
         for username in tqdm(new_usernames, desc="Users"):
             try:
                 interactions = scraper.scrape_user(username)
-                
+
                 with get_db() as conn:
-                    conn.executemany("""
-                        INSERT OR REPLACE INTO user_films 
-                        (username, film_slug, rating, watched, watchlisted, liked, scraped_at)
-                        VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
-                    """, [(username, i.film_slug, i.rating, i.watched, i.watchlisted, i.liked) 
-                          for i in interactions])
-                    
-                    existing_film_slugs = {r['slug'] for r in conn.execute("SELECT slug FROM films")}
-                
+                    conn.execute("BEGIN")
+                    try:
+                        conn.executemany("""
+                            INSERT OR REPLACE INTO user_films
+                            (username, film_slug, rating, watched, watchlisted, liked, scraped_at)
+                            VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+                        """, [(username, i.film_slug, i.rating, i.watched, i.watchlisted, i.liked)
+                              for i in interactions])
+
+                        existing_film_slugs = {r['slug'] for r in conn.execute("SELECT slug FROM films")}
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
+                        raise
+
                 existing_users.add(username)
                 
                 new_slugs = [i.film_slug for i in interactions if i.film_slug not in existing_film_slugs]
@@ -321,7 +369,7 @@ def cmd_discover(args):
         scraper.close()
 
 
-def cmd_recommend(args):
+def cmd_recommend(args: argparse.Namespace) -> None:
     """Generate recommendations."""
     # Validate username
     username = _validate_username(args.username)
@@ -366,7 +414,7 @@ def cmd_recommend(args):
                 username=username
             )
             collab_recs = collab_rec.recommend(
-                args.username,
+                username,
                 n=args.limit * 2,
                 min_year=args.min_year,
                 max_year=args.max_year
@@ -410,7 +458,7 @@ def cmd_recommend(args):
             
             recommender = CollaborativeRecommender(all_user_films, all_films)
             recs = recommender.recommend(
-                args.username,
+                username,
                 n=args.limit,
                 min_year=args.min_year,
                 max_year=args.max_year
@@ -464,19 +512,19 @@ def cmd_recommend(args):
             reasons = "; ".join(r.reasons).replace('"', '""')
             print(f'"{r.title}",{r.year},https://letterboxd.com/film/{r.slug}/,{r.score:.2f},"{reasons}"')
     elif output_format == 'markdown':
-        print(f"\n# Top {len(recs)} recommendations for {args.username} ({strategy})\n")
+        print(f"\n# Top {len(recs)} recommendations for {username} ({strategy})\n")
         for i, r in enumerate(recs, 1):
             print(f"## {i}. [{r.title} ({r.year})](https://letterboxd.com/film/{r.slug}/)")
             print(f"**Score**: {r.score:.1f}  ")
             print(f"**Why**: {', '.join(r.reasons)}\n")
     else:
-        print(f"\nTop {len(recs)} recommendations for {args.username} ({strategy}):")
+        print(f"\nTop {len(recs)} recommendations for {username} ({strategy}):")
         for i, r in enumerate(recs, 1):
             print(f"{i}. {r.title} ({r.year}) - Score: {r.score:.1f}")
             print(f"   Why: {', '.join(r.reasons)}")
 
 
-def cmd_stats(args):
+def cmd_stats(args: argparse.Namespace) -> None:
     """Show database statistics."""
     with get_db() as conn:
         user_count = conn.execute("SELECT COUNT(DISTINCT username) FROM user_films").fetchone()[0]
@@ -541,7 +589,7 @@ def cmd_stats(args):
                     print(f"  {genre}: {count} films")
 
 
-def cmd_export(args):
+def cmd_export(args: argparse.Namespace) -> None:
     """Export database to JSON file."""
     with get_db() as conn:
         user_films = [dict(r) for r in conn.execute("SELECT * FROM user_films")]
@@ -559,7 +607,7 @@ def cmd_export(args):
     print(f"Exported {len(user_films)} user interactions and {len(films)} films to {args.file}")
 
 
-def cmd_import(args):
+def cmd_import(args: argparse.Namespace) -> None:
     """Import database from JSON file."""
     with open(args.file, 'r') as f:
         data = json.load(f)
@@ -600,7 +648,7 @@ def cmd_import(args):
     print(f"Import completed from {args.file}")
 
 
-def cmd_profile(args):
+def cmd_profile(args: argparse.Namespace) -> None:
     """Show user's preference profile."""
     with get_db() as conn:
         user_films = [dict(r) for r in conn.execute("""
@@ -644,7 +692,7 @@ def cmd_profile(args):
             print(f"  {dec}s: {bar} ({score:+.1f})")
 
 
-def cmd_similar(args):
+def cmd_similar(args: argparse.Namespace) -> None:
     """Find films similar to a specific film."""
     # Validate slug
     slug = _validate_slug(args.slug)
@@ -669,7 +717,7 @@ def cmd_similar(args):
         print(f"   Why: {', '.join(r.reasons)}")
 
 
-def cmd_triage(args):
+def cmd_triage(args: argparse.Namespace) -> None:
     """Rank user's watchlist by predicted enjoyment."""
     with get_db() as conn:
         user_films = [dict(r) for r in conn.execute("""
@@ -701,7 +749,7 @@ def cmd_triage(args):
         print(f"   Why: {', '.join(r.reasons)}")
 
 
-def cmd_gaps(args):
+def cmd_gaps(args: argparse.Namespace) -> None:
     """Find gaps in filmography of favorite directors."""
     with get_db() as conn:
         user_films = [dict(r) for r in conn.execute("""
@@ -751,6 +799,8 @@ def main():
                                 help="Skip scraping user lists")
     scrape_parser.add_argument("--max-lists", type=int, default=50,
                                 help="Maximum number of lists to scrape per user (default: 50)")
+    scrape_parser.add_argument("--incremental", action="store_true",
+                                help="Stop pagination when hitting already-scraped films (faster for updates)")
     scrape_parser.set_defaults(func=cmd_scrape)
     
     # Discover command
@@ -761,6 +811,8 @@ def main():
     discover_parser.add_argument("--username", help="Username (for following/followers)")
     discover_parser.add_argument("--film-slug", help="Film slug (for film source, e.g., 'perfect-blue')")
     discover_parser.add_argument("--limit", type=int, default=50, help="Number of NEW users to scrape")
+    discover_parser.add_argument("--dry-run", action="store_true",
+                                  help="Show which users would be scraped without actually scraping")
     discover_parser.set_defaults(func=cmd_discover)
     
     # Recommend command

@@ -159,16 +159,20 @@ class MetadataRecommender:
         min_year: int | None = None,
         max_year: int | None = None
     ) -> dict[str, list[Recommendation]]:
-        """Find unseen films from directors the user loves."""
+        """Find unseen films from directors the user loves (parallelized)."""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         profile = build_profile(user_films, self.films)
         seen = {f['slug'] for f in user_films}
-
-        gaps = {}
 
         # Identify high affinity directors
         favorite_directors = [d for d, s in profile.directors.items() if s >= min_director_score]
 
-        for director in favorite_directors:
+        if not favorite_directors:
+            return {}
+
+        def process_director(director: str) -> tuple[str, list[Recommendation] | None]:
+            """Process a single director and return recommendations."""
             # Find all films by this director
             director_films = []
             for slug, film in self.films.items():
@@ -185,10 +189,10 @@ class MetadataRecommender:
                 film_directors = load_json(film.get('directors'))
                 if director in film_directors:
                     director_films.append(film)
-            
+
             if not director_films:
-                continue
-            
+                return (director, None)
+
             # Rank by community rating/popularity (using simple heuristic)
             # We want "essential" films, so rating count and avg rating matter
             ranked_films = []
@@ -198,12 +202,12 @@ class MetadataRecommender:
                 if film.get('avg_rating'):
                     score += film['avg_rating']
                 if film.get('rating_count'):
-                    score += min(film['rating_count'] / 10000, 2.0) # Cap popularity bonus
-                
+                    score += min(film['rating_count'] / 10000, 2.0)  # Cap popularity bonus
+
                 ranked_films.append((film, score))
-            
+
             ranked_films.sort(key=lambda x: -x[1])
-            
+
             recs = []
             for film, score in ranked_films[:limit_per_director]:
                 recs.append(Recommendation(
@@ -213,10 +217,21 @@ class MetadataRecommender:
                     score=score,
                     reasons=[f"Essential {director}"]
                 ))
-            
-            if recs:
-                gaps[director] = recs
-        
+
+            return (director, recs if recs else None)
+
+        # Parallelize director queries
+        gaps = {}
+        with ThreadPoolExecutor(max_workers=min(len(favorite_directors), 10)) as executor:
+            # Submit all director processing tasks
+            futures = {executor.submit(process_director, director): director for director in favorite_directors}
+
+            # Collect results as they complete
+            for future in as_completed(futures):
+                director, recs = future.result()
+                if recs:
+                    gaps[director] = recs
+
         return gaps
     
     def _score_film(self, film: dict, profile: UserProfile) -> tuple[float, list[str]]:
@@ -354,7 +369,7 @@ class MetadataRecommender:
         target_writers = set(load_json(target.get('writers', [])))
 
         target_year = target.get('year')
-        target_decade = (target_year // 10) * 10 if isinstance(target_year, int) else None
+        target_decade = (target_year // 10) * 10 if isinstance(target_year, int) and target_year > 0 else None
         
         candidates = []
         for other_slug, film in self.films.items():
@@ -402,7 +417,7 @@ class MetadataRecommender:
 
             # Same decade
             film_year = film.get('year')
-            film_decade = (film_year // 10) * 10 if isinstance(film_year, int) else None
+            film_decade = (film_year // 10) * 10 if isinstance(film_year, int) and film_year > 0 else None
 
             if target_decade is not None and film_decade == target_decade:
                 score += SIMILAR_DECADE_SCORE
@@ -466,8 +481,10 @@ class CollaborativeRecommender:
     """
     Collaborative filtering recommender.
     Finds users with similar taste and recommends films they liked.
+
+    Uses sparse matrices for efficient similarity computation on large datasets.
     """
-    
+
     def __init__(self, all_user_films: dict[str, list[dict]], film_metadata: dict[str, dict] | None = None):
         """
         Args:
@@ -476,7 +493,69 @@ class CollaborativeRecommender:
         """
         self.all_user_films = all_user_films
         self.films = film_metadata or {}
-    
+
+        # Precompute user-item matrix for efficient similarity computation
+        self._user_matrix = None
+        self._user_index = None
+        self._film_index = None
+        self._build_sparse_matrix()
+
+    def _build_sparse_matrix(self):
+        """
+        Build sparse user-item rating matrix for efficient similarity computation.
+
+        Creates a CSR matrix where rows are users and columns are films.
+        Also builds index mappings for fast lookups.
+        """
+        from scipy.sparse import csr_matrix
+        import numpy as np
+
+        # Build user and film indexes
+        usernames = list(self.all_user_films.keys())
+        self._user_index = {username: idx for idx, username in enumerate(usernames)}
+
+        # Collect all unique films
+        all_films_set = set()
+        for films in self.all_user_films.values():
+            for film in films:
+                all_films_set.add(film['slug'])
+
+        all_films_list = list(all_films_set)
+        self._film_index = {slug: idx for idx, slug in enumerate(all_films_list)}
+
+        # Build sparse matrix (users × films)
+        n_users = len(usernames)
+        n_films = len(all_films_list)
+
+        # Use COO format for building, then convert to CSR
+        row_indices = []
+        col_indices = []
+        ratings = []
+
+        for username, user_films in self.all_user_films.items():
+            user_idx = self._user_index[username]
+            for film in user_films:
+                rating = film.get('rating')
+                if rating:  # Only include rated films
+                    film_idx = self._film_index.get(film['slug'])
+                    if film_idx is not None:
+                        row_indices.append(user_idx)
+                        col_indices.append(film_idx)
+                        ratings.append(rating)
+
+        # Create sparse matrix
+        if row_indices:
+            self._user_matrix = csr_matrix(
+                (ratings, (row_indices, col_indices)),
+                shape=(n_users, n_films),
+                dtype=np.float32
+            )
+        else:
+            # Empty matrix if no ratings
+            self._user_matrix = csr_matrix((n_users, n_films), dtype=np.float32)
+
+        logger.debug(f"Built sparse user-item matrix: {n_users} users × {n_films} films, {len(ratings)} ratings")
+
     def recommend(
         self,
         username: str,
@@ -568,66 +647,67 @@ class CollaborativeRecommender:
     
     def _find_neighbors(self, username: str, target_films: list[dict], k: int = 10, max_users_to_compare: int = 10000) -> list[tuple[str, float]]:
         """
-        Find k most similar users based on rating overlap.
-        Uses mean-centered ratings to account for different rating scales.
+        Find k most similar users based on rating overlap using sparse matrix operations.
+        Uses mean-centered ratings to account for different rating scales (Pearson correlation).
         Returns list of (username, similarity_score) tuples.
 
         Args:
             username: Target username
             target_films: Target user's film interactions
             k: Number of neighbors to return
-            max_users_to_compare: Maximum number of users to compare (for large datasets)
+            max_users_to_compare: Maximum number of users to compare (for large datasets) - ignored when using sparse matrix
         """
-        similarities = []
+        import numpy as np
 
-        # Build target user's rating dict and mean
-        target_ratings = {}
-        for film in target_films:
-            rating = film.get('rating')
-            if rating:
-                target_ratings[film['slug']] = rating
-
-        if not target_ratings:
+        if username not in self._user_index or self._user_matrix is None:
             return []
 
-        target_mean = sum(target_ratings.values()) / len(target_ratings)
+        target_idx = self._user_index[username]
 
-        # Limit the number of users to compare for performance
-        users_compared = 0
+        # Get target user's ratings as sparse row
+        target_row = self._user_matrix[target_idx]
 
-        # Compare with other users (with early termination)
-        for other_user, other_films in self.all_user_films.items():
-            if other_user == username:
+        # Filter out users with too few common ratings
+        # Compute number of common rated films for each user
+        target_nonzero = target_row.nonzero()[1]
+        if len(target_nonzero) == 0:
+            return []
+
+        # Mean-center the target user's ratings
+        target_ratings = target_row.toarray().flatten()
+        target_mask = target_ratings > 0
+        target_mean = target_ratings[target_mask].mean()
+        target_centered = target_ratings.copy()
+        target_centered[target_mask] -= target_mean
+
+        # Compute similarities with all other users
+        similarities = []
+
+        # Vectorized computation for all users at once
+        for other_idx, other_username in enumerate(self._user_index.keys()):
+            if other_username == username:
                 continue
 
-            # Early termination for large datasets
-            users_compared += 1
-            if users_compared > max_users_to_compare:
-                logger.warning(f"Hit max_users_to_compare limit ({max_users_to_compare}), stopping neighbor search early")
-                break
-
-            # Build other user's rating dict and mean
-            other_ratings = {}
-            for film in other_films:
-                rating = film.get('rating')
-                if rating:
-                    other_ratings[film['slug']] = rating
-
-            if not other_ratings:
-                continue
-
-            other_mean = sum(other_ratings.values()) / len(other_ratings)
+            other_row = self._user_matrix[other_idx]
+            other_ratings = other_row.toarray().flatten()
+            other_mask = other_ratings > 0
 
             # Find common films
-            common = set(target_ratings.keys()) & set(other_ratings.keys())
+            common_mask = target_mask & other_mask
+            n_common = common_mask.sum()
 
-            if len(common) < 5:  # Need at least 5 common films
+            if n_common < 5:  # Need at least 5 common films
                 continue
 
-            # Compute similarity with mean-centered ratings (Pearson-like)
-            numerator = sum((target_ratings[s] - target_mean) * (other_ratings[s] - other_mean) for s in common)
-            target_variance = sum((target_ratings[s] - target_mean) ** 2 for s in common) ** 0.5
-            other_variance = sum((other_ratings[s] - other_mean) ** 2 for s in common) ** 0.5
+            # Mean-center other user's ratings
+            other_mean = other_ratings[other_mask].mean()
+            other_centered = other_ratings.copy()
+            other_centered[other_mask] -= other_mean
+
+            # Compute Pearson correlation on common films
+            numerator = (target_centered[common_mask] * other_centered[common_mask]).sum()
+            target_variance = np.sqrt((target_centered[common_mask] ** 2).sum())
+            other_variance = np.sqrt((other_centered[common_mask] ** 2).sum())
 
             if target_variance == 0 or other_variance == 0:
                 continue
@@ -635,12 +715,12 @@ class CollaborativeRecommender:
             similarity = numerator / (target_variance * other_variance)
 
             # Apply significance weighting - more common films = more reliable
-            confidence = min(len(common) / 20, 1.0)  # Full confidence at 20+ common films
+            confidence = min(n_common / 20.0, 1.0)  # Full confidence at 20+ common films
             weighted_similarity = similarity * confidence
 
-            similarities.append((other_user, weighted_similarity))
+            similarities.append((other_username, weighted_similarity))
 
         # Sort by similarity and return top k
-        similarities.sort(key=lambda x: -x[1])
+        similarities.sort(key=lambda x: -x[1], reverse=False)
         return similarities[:k]
 

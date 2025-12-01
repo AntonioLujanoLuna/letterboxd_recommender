@@ -16,7 +16,7 @@ _connection_pool_lock = threading.Lock()
 _connection_pool = {}
 
 
-def init_db():
+def init_db() -> None:
     DB_PATH.parent.mkdir(exist_ok=True, parents=True)
     with get_db() as conn:
         conn.executescript("""
@@ -80,7 +80,17 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_lists_user ON user_lists(username);
             CREATE INDEX IF NOT EXISTS idx_lists_film ON user_lists(film_slug);
             CREATE INDEX IF NOT EXISTS idx_lists_favorites ON user_lists(is_favorites);
-            
+
+            -- Additional indexes for filter queries in triage and profile building
+            CREATE INDEX IF NOT EXISTS idx_user_films_watched ON user_films(watched);
+            CREATE INDEX IF NOT EXISTS idx_user_films_liked ON user_films(liked);
+            CREATE INDEX IF NOT EXISTS idx_user_films_watchlisted ON user_films(watchlisted);
+            CREATE INDEX IF NOT EXISTS idx_user_films_rating ON user_films(rating);
+
+            -- Composite indexes for common query patterns
+            CREATE INDEX IF NOT EXISTS idx_user_watchlisted ON user_films(username, watchlisted);
+            CREATE INDEX IF NOT EXISTS idx_user_rating ON user_films(username, rating);
+
             CREATE INDEX IF NOT EXISTS idx_fd_director ON film_directors(director);
             CREATE INDEX IF NOT EXISTS idx_fg_genre ON film_genres(genre);
             CREATE INDEX IF NOT EXISTS idx_fc_actor ON film_cast(actor);
@@ -150,6 +160,24 @@ def populate_normalized_tables(conn, film_metadata):
         conn.execute("INSERT OR IGNORE INTO film_themes (film_slug, theme) VALUES (?, ?)", (slug, theme))
 
 
+def cleanup_connection_pool() -> None:
+    """
+    Remove connections for dead threads from the pool.
+    Should be called periodically in long-running processes.
+    """
+    with _connection_pool_lock:
+        alive_thread_ids = {t.ident for t in threading.enumerate()}
+        dead_thread_ids = set(_connection_pool.keys()) - alive_thread_ids
+
+        for thread_id in dead_thread_ids:
+            conn = _connection_pool.pop(thread_id)
+            try:
+                conn.close()
+                logger.debug(f"Cleaned up DB connection for dead thread {thread_id}")
+            except Exception as e:
+                logger.warning(f"Error closing connection for thread {thread_id}: {e}")
+
+
 def _get_thread_connection():
     """
     Get a connection for the current thread from the pool.
@@ -163,6 +191,16 @@ def _get_thread_connection():
             conn.row_factory = sqlite3.Row
             _connection_pool[thread_id] = conn
             logger.debug(f"Created new DB connection for thread {thread_id}")
+
+        # Periodically cleanup dead thread connections (every 100th connection request)
+        # This is a lightweight heuristic to avoid accumulating stale connections
+        import random
+        if random.random() < 0.01:  # 1% chance to trigger cleanup
+            # Don't block the current request - just cleanup in background
+            try:
+                cleanup_connection_pool()
+            except Exception as e:
+                logger.debug(f"Background connection cleanup failed: {e}")
 
         return _connection_pool[thread_id]
 
@@ -235,10 +273,12 @@ def load_cached_profile(username: str, max_age_days: int = 7) -> dict | None:
             return None
 
         from datetime import datetime
-        profile_updated_at = datetime.fromisoformat(row['updated_at'])
+        # Ensure naive datetime by replacing tzinfo if present
+        profile_updated_at = datetime.fromisoformat(row['updated_at']).replace(tzinfo=None)
+        now = datetime.now()
 
         # Check age
-        if (datetime.now() - profile_updated_at).days > max_age_days:
+        if (now - profile_updated_at).days > max_age_days:
             return None
 
         # Check if user_lists have been updated more recently
@@ -250,7 +290,7 @@ def load_cached_profile(username: str, max_age_days: int = 7) -> dict | None:
         lists_row = lists_cursor.fetchone()
 
         if lists_row and lists_row['last_list_update']:
-            last_list_update = datetime.fromisoformat(lists_row['last_list_update'])
+            last_list_update = datetime.fromisoformat(lists_row['last_list_update']).replace(tzinfo=None)
             if last_list_update > profile_updated_at:
                 logger.debug(f"Profile cache invalidated for {username} - lists updated more recently")
                 return None
@@ -264,7 +304,7 @@ def load_cached_profile(username: str, max_age_days: int = 7) -> dict | None:
         films_row = films_cursor.fetchone()
 
         if films_row and films_row['last_film_update']:
-            last_film_update = datetime.fromisoformat(films_row['last_film_update'])
+            last_film_update = datetime.fromisoformat(films_row['last_film_update']).replace(tzinfo=None)
             if last_film_update > profile_updated_at:
                 logger.debug(f"Profile cache invalidated for {username} - films updated more recently")
                 return None
