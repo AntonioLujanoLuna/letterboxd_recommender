@@ -16,15 +16,14 @@ logger = logging.getLogger(__name__)
 
 def _validate_slug(slug: str) -> str:
     """
-    Sanitize a film slug to prevent injection or invalid characters.
-    Returns lowercased alphanumeric + hyphens only.
+    Validate a film slug to prevent injection or invalid characters.
+    Raises ValueError if slug contains invalid characters.
+    Returns lowercased valid slug.
     """
     import re
-    # Remove invalid characters, keep only alphanumeric and hyphens
-    sanitized = re.sub(r'[^a-z0-9-]', '', slug.lower())
-    if sanitized != slug.lower().replace(' ', '-'):
-        logger.warning(f"Slug '{slug}' sanitized to '{sanitized}'")
-    return sanitized
+    if not re.match(r'^[a-z0-9-]+$', slug.lower()):
+        raise ValueError(f"Invalid slug: {slug}")
+    return slug.lower()
 
 
 def _validate_username(username: str) -> str:
@@ -118,10 +117,10 @@ def cmd_scrape(args):
         if refresh:
             with get_db() as conn:
                 result = conn.execute("""
-                    SELECT MAX(scraped_at) as last_scrape 
-                    FROM user_films 
+                    SELECT MAX(scraped_at) as last_scrape
+                    FROM user_films
                     WHERE username = ?
-                """, (args.username,)).fetchone()
+                """, (username,)).fetchone()
                 
                 if result and result['last_scrape']:
                     last_scrape = datetime.fromisoformat(result['last_scrape'])
@@ -343,7 +342,8 @@ def cmd_recommend(args):
                 max_year=args.max_year,
                 genres=args.genres,
                 exclude_genres=args.exclude_genres,
-                min_rating=args.min_rating
+                min_rating=args.min_rating,
+                username=username
             )
             collab_recs = collab_rec.recommend(
                 args.username,
@@ -409,20 +409,31 @@ def cmd_recommend(args):
                 exclude_genres=args.exclude_genres,
                 min_rating=args.min_rating,
                 diversity=diversity,
-                max_per_director=max_per_director
+                max_per_director=max_per_director,
+                username=username
             )
     
     # Format and print results
     output_format = getattr(args, 'format', 'text')
     if output_format == 'json':
-        output = [{
-            "title": r.title,
-            "year": r.year,
-            "slug": r.slug,
-            "score": round(r.score, 2),
-            "reasons": r.reasons,
-            "url": f"https://letterboxd.com/film/{r.slug}/"
-        } for r in recs]
+        output = []
+        for r in recs:
+            film = all_films.get(r.slug, {})
+            output.append({
+                "title": r.title,
+                "year": r.year,
+                "slug": r.slug,
+                "score": round(r.score, 2),
+                "reasons": r.reasons,
+                "url": f"https://letterboxd.com/film/{r.slug}/",
+                "directors": load_json(film.get('directors', [])),
+                "genres": load_json(film.get('genres', [])),
+                "cast": load_json(film.get('cast', []))[:5],
+                "themes": load_json(film.get('themes', [])),
+                "countries": load_json(film.get('countries', [])),
+                "avg_rating": film.get('avg_rating'),
+                "rating_count": film.get('rating_count')
+            })
         print(json.dumps(output, indent=2))
     elif output_format == 'csv':
         print("Title,Year,URL,Score,Reasons")
@@ -683,9 +694,11 @@ def cmd_gaps(args):
     
     recommender = MetadataRecommender(list(all_films.values()))
     gaps = recommender.find_gaps(
-        user_films, 
+        user_films,
         min_director_score=args.min_score,
-        limit_per_director=args.limit
+        limit_per_director=args.limit,
+        min_year=args.min_year,
+        max_year=args.max_year
     )
     
     if not gaps:
@@ -780,6 +793,8 @@ def main():
     gaps_parser.add_argument("username", help="Letterboxd username")
     gaps_parser.add_argument("--min-score", type=float, default=2.0, help="Minimum director affinity score")
     gaps_parser.add_argument("--limit", type=int, default=3, help="Max films per director")
+    gaps_parser.add_argument("--min-year", type=int, help="Minimum release year")
+    gaps_parser.add_argument("--max-year", type=int, help="Maximum release year")
     gaps_parser.set_defaults(func=cmd_gaps)
     
     args = parser.parse_args()

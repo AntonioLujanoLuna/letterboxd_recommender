@@ -9,6 +9,28 @@ import asyncio
 
 logger = logging.getLogger(__name__)
 
+
+def _parse_rating_count(text: str) -> int | None:
+    """
+    Parse rating count from text like '1.5M', '500K', '1.2B', or '12,345'.
+    Returns integer count or None if parsing fails.
+    """
+    text = text.strip().replace(",", "")
+    multipliers = {'K': 1_000, 'M': 1_000_000, 'B': 1_000_000_000}
+
+    for suffix, mult in multipliers.items():
+        if text.endswith(suffix):
+            try:
+                return int(float(text[:-1]) * mult)
+            except ValueError:
+                return None
+
+    try:
+        return int(text) if text.isdigit() else None
+    except ValueError:
+        return None
+
+
 @dataclass
 class FilmInteraction:
     film_slug: str
@@ -88,10 +110,7 @@ def parse_film_page(tree: HTMLParser, slug: str) -> FilmMetadata:
     rating_count = None
     ratings_el = tree.css_first("a[href*='/ratings/']")
     if ratings_el:
-        try:
-            rating_count = int(float(ratings_el.text(strip=True).replace(",", "").replace("K", "000")))
-        except (ValueError, IndexError):
-            pass
+        rating_count = _parse_rating_count(ratings_el.text(strip=True))
 
     # Countries
     countries = list(dict.fromkeys([a.text(strip=True) for a in tree.css("a[href*='/films/country/']") if a.text(strip=True)]))
