@@ -1,3 +1,4 @@
+import logging
 from dataclasses import dataclass
 from .profile import UserProfile, build_profile
 from .database import load_json
@@ -18,6 +19,8 @@ from .config import (
     SIMILAR_CAST_SCORE,
     SIMILAR_DECADE_SCORE,
 )
+
+logger = logging.getLogger(__name__)
 
 @dataclass
 class Recommendation:
@@ -50,11 +53,12 @@ class MetadataRecommender:
         diversity: bool = False,
         max_per_director: int = 2,
         username: str | None = None,
+        user_lists: list[dict] | None = None,
     ) -> list[Recommendation]:
         """Generate recommendations."""
 
         # Build user profile
-        profile = build_profile(user_films, self.films, username=username)
+        profile = build_profile(user_films, self.films, user_lists=user_lists, username=username)
         
         # Get seen films
         seen = {f['slug'] for f in user_films}
@@ -562,65 +566,80 @@ class CollaborativeRecommender:
         
         return results
     
-    def _find_neighbors(self, username: str, target_films: list[dict], k: int = 10) -> list[tuple[str, float]]:
+    def _find_neighbors(self, username: str, target_films: list[dict], k: int = 10, max_users_to_compare: int = 10000) -> list[tuple[str, float]]:
         """
         Find k most similar users based on rating overlap.
         Uses mean-centered ratings to account for different rating scales.
         Returns list of (username, similarity_score) tuples.
+
+        Args:
+            username: Target username
+            target_films: Target user's film interactions
+            k: Number of neighbors to return
+            max_users_to_compare: Maximum number of users to compare (for large datasets)
         """
         similarities = []
-        
+
         # Build target user's rating dict and mean
         target_ratings = {}
         for film in target_films:
             rating = film.get('rating')
             if rating:
                 target_ratings[film['slug']] = rating
-        
+
         if not target_ratings:
             return []
-        
+
         target_mean = sum(target_ratings.values()) / len(target_ratings)
-        
-        # Compare with all other users
+
+        # Limit the number of users to compare for performance
+        users_compared = 0
+
+        # Compare with other users (with early termination)
         for other_user, other_films in self.all_user_films.items():
             if other_user == username:
                 continue
-            
+
+            # Early termination for large datasets
+            users_compared += 1
+            if users_compared > max_users_to_compare:
+                logger.warning(f"Hit max_users_to_compare limit ({max_users_to_compare}), stopping neighbor search early")
+                break
+
             # Build other user's rating dict and mean
             other_ratings = {}
             for film in other_films:
                 rating = film.get('rating')
                 if rating:
                     other_ratings[film['slug']] = rating
-            
+
             if not other_ratings:
                 continue
-            
+
             other_mean = sum(other_ratings.values()) / len(other_ratings)
-            
+
             # Find common films
             common = set(target_ratings.keys()) & set(other_ratings.keys())
-            
+
             if len(common) < 5:  # Need at least 5 common films
                 continue
-            
+
             # Compute similarity with mean-centered ratings (Pearson-like)
             numerator = sum((target_ratings[s] - target_mean) * (other_ratings[s] - other_mean) for s in common)
             target_variance = sum((target_ratings[s] - target_mean) ** 2 for s in common) ** 0.5
             other_variance = sum((other_ratings[s] - other_mean) ** 2 for s in common) ** 0.5
-            
+
             if target_variance == 0 or other_variance == 0:
                 continue
-            
+
             similarity = numerator / (target_variance * other_variance)
-            
+
             # Apply significance weighting - more common films = more reliable
             confidence = min(len(common) / 20, 1.0)  # Full confidence at 20+ common films
             weighted_similarity = similarity * confidence
-            
+
             similarities.append((other_user, weighted_similarity))
-        
+
         # Sort by similarity and return top k
         similarities.sort(key=lambda x: -x[1])
         return similarities[:k]

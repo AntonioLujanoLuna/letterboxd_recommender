@@ -38,22 +38,38 @@ def _validate_username(username: str) -> str:
     return sanitized
 
 
-def _load_all_user_films(conn) -> dict[str, list[dict]]:
+def _load_all_user_films(conn, username_filter: str | None = None) -> dict[str, list[dict]]:
     """
-    Load all user films in a single query.
-    Returns dict mapping username -> list of film interaction dicts.
+    Load all user films in a single query with optional username filter.
+
+    Args:
+        conn: Database connection
+        username_filter: If provided, only load films for this user (useful for single-user operations)
+
+    Returns:
+        Dict mapping username -> list of film interaction dicts.
     """
     all_user_films = defaultdict(list)
-    rows = conn.execute("""
-        SELECT username, film_slug as slug, rating, watched, watchlisted, liked
-        FROM user_films
-    """).fetchall()
-    
+
+    if username_filter:
+        # Optimized single-user query
+        rows = conn.execute("""
+            SELECT username, film_slug as slug, rating, watched, watchlisted, liked
+            FROM user_films
+            WHERE username = ?
+        """, (username_filter,)).fetchall()
+    else:
+        # Load all users (for collaborative filtering)
+        rows = conn.execute("""
+            SELECT username, film_slug as slug, rating, watched, watchlisted, liked
+            FROM user_films
+        """).fetchall()
+
     for row in rows:
         row_dict = dict(row)
         username = row_dict.pop('username')
         all_user_films[username].append(row_dict)
-    
+
     return dict(all_user_films)
 
 
@@ -61,14 +77,18 @@ def _scrape_film_metadata(scraper, slugs, max_per_batch=100, use_async=True):
     """Helper to scrape film metadata for a list of slugs."""
     if not slugs:
         return
-    
+
     limited_slugs = slugs[:max_per_batch]
-    
+
     if use_async and len(limited_slugs) > 10:
         from .scraper import AsyncLetterboxdScraper
         logger.info(f"Fetching {len(limited_slugs)} films (async)...")
-        async_scraper = AsyncLetterboxdScraper(delay=0.2, max_concurrent=5)
-        metadata_list = asyncio.run(async_scraper.scrape_films_batch(limited_slugs))
+
+        async def scrape_batch():
+            async with AsyncLetterboxdScraper(delay=0.2, max_concurrent=5) as async_scraper:
+                return await async_scraper.scrape_films_batch(limited_slugs)
+
+        metadata_list = asyncio.run(scrape_batch())
     else:
         metadata_list = []
         for slug in tqdm(limited_slugs, desc="Metadata"):
@@ -125,22 +145,22 @@ def cmd_scrape(args):
                 if result and result['last_scrape']:
                     last_scrape = datetime.fromisoformat(result['last_scrape'])
                     age_days = (datetime.now() - last_scrape).days
-                    
+
                     if age_days < args.refresh:
-                        print(f"  Skipping {args.username} (last scraped {age_days} days ago, refresh threshold: {args.refresh} days)")
+                        print(f"  Skipping {username} (last scraped {age_days} days ago, refresh threshold: {args.refresh} days)")
                         return
                     else:
-                        print(f"  Refreshing {args.username} (last scraped {age_days} days ago)")
-        
-        interactions = scraper.scrape_user(args.username)
+                        print(f"  Refreshing {username} (last scraped {age_days} days ago)")
+
+        interactions = scraper.scrape_user(username)
         
         # Batch insert user films
         with get_db() as conn:
             conn.executemany("""
-                INSERT OR REPLACE INTO user_films 
+                INSERT OR REPLACE INTO user_films
                 (username, film_slug, rating, watched, watchlisted, liked, scraped_at)
                 VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
-            """, [(args.username, i.film_slug, i.rating, i.watched, i.watchlisted, i.liked) 
+            """, [(username, i.film_slug, i.rating, i.watched, i.watchlisted, i.liked)
                   for i in interactions])
             
             existing = {r['slug'] for r in conn.execute("SELECT slug FROM films")}
@@ -153,10 +173,10 @@ def cmd_scrape(args):
         
         # Scrape user lists if enabled
         if args.include_lists:
-            print(f"\nScraping {args.username}'s lists...")
-            
+            print(f"\nScraping {username}'s lists...")
+
             # Get profile favorites (4-film showcase)
-            favorites = scraper.scrape_favorites(args.username)
+            favorites = scraper.scrape_favorites(username)
             if favorites:
                 print(f"  Found {len(favorites)} profile favorites")
                 with get_db() as conn:
@@ -166,24 +186,24 @@ def cmd_scrape(args):
                             (username, list_slug, list_name, is_ranked, is_favorites, position, film_slug, scraped_at)
                             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                         """, (
-                            args.username, "profile-favorites", "Profile Favorites",
+                            username, "profile-favorites", "Profile Favorites",
                             0, 1, None, slug, datetime.now().isoformat()
                         ))
             
             # Get all user lists
-            lists = scraper.scrape_user_lists(args.username, limit=args.max_lists)
-            
+            lists = scraper.scrape_user_lists(username, limit=args.max_lists)
+
             # Scrape films from each list
             for list_info in lists:
                 list_slug = list_info['list_slug']
                 list_name = list_info['list_name']
                 is_ranked = list_info['is_ranked']
-                
+
                 # Detect favorites
                 is_favorites = "favorite" in list_name.lower() or list_slug == "favorites"
-                
+
                 print(f"  Scraping list: {list_name}...")
-                films = scraper.scrape_list_films(args.username, list_slug)
+                films = scraper.scrape_list_films(username, list_slug)
                 
                 if not films:
                     print(f"    (empty list)")
@@ -197,14 +217,14 @@ def cmd_scrape(args):
                             (username, list_slug, list_name, is_ranked, is_favorites, position, film_slug, scraped_at)
                             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                         """, (
-                            args.username, list_slug, list_name, 
+                            username, list_slug, list_name,
                             is_ranked, is_favorites, film.get('position'),
                             film['film_slug'], datetime.now().isoformat()
                         ))
                 
                 print(f"    {len(films)} films")
-        
-        print(f"\nDone! {len(interactions)} films for {args.username}")
+
+        print(f"\nDone! {len(interactions)} films for {username}")
         
     finally:
         scraper.close()
@@ -399,6 +419,8 @@ def cmd_recommend(args):
             # Metadata-based (default)
             diversity = getattr(args, 'diversity', False)
             max_per_director = getattr(args, 'max_per_director', 2)
+            # Load user lists for profile building
+            user_lists = load_user_lists(username)
             recommender = MetadataRecommender(list(all_films.values()))
             recs = recommender.recommend(
                 user_films,
@@ -410,7 +432,8 @@ def cmd_recommend(args):
                 min_rating=args.min_rating,
                 diversity=diversity,
                 max_per_director=max_per_director,
-                username=username
+                username=username,
+                user_lists=user_lists
             )
     
     # Format and print results
