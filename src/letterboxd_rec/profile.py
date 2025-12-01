@@ -68,10 +68,15 @@ def _normalize_scores(scores: dict, counts: dict, exponent: float = NORM_EXPONEN
 def build_profile(
     user_films: list[dict], 
     film_metadata: dict[str, dict],
-    user_lists: list[dict] | None = None
+    user_lists: list[dict] | None = None,
+    username: str | None = None,
+    use_cache: bool = True
 ) -> UserProfile:
     """
     Build preference profile from user's film interactions and lists.
+    
+    If username provided and use_cache=True, checks for cached profile first.
+    Cache is invalidated after 7 days or when new films are scraped.
     
     Weighting strategy:
     - Rating 4.5-5.0: +2.0 (loved it)
@@ -90,6 +95,16 @@ def build_profile(
     - Ranked 31+:     1.2x
     - Curated list:   1.3x
     """
+    # Try to load from cache if username provided
+    if username and use_cache:
+        from .database import load_cached_profile
+        cached = load_cached_profile(username, max_age_days=7)
+        if cached:
+            logger.debug(f"Using cached profile for {username}")
+            # Reconstruct UserProfile from cached dict
+            profile = UserProfile(**cached)
+            return profile
+    
     profile = UserProfile()
     
     # Build list weight lookup
@@ -197,6 +212,13 @@ def build_profile(
     profile.n_rated = len(rated_films)
     profile.n_liked = sum(1 for f in user_films if f.get('liked'))
     profile.avg_liked_rating = sum(rated_films) / len(rated_films) if rated_films else None
+    
+    # Save to cache if username provided
+    if username:
+        from .database import save_user_profile
+        from dataclasses import asdict
+        save_user_profile(username, asdict(profile))
+        logger.debug(f"Cached profile for {username}")
     
     return profile
 

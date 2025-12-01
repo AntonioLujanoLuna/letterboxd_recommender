@@ -14,6 +14,31 @@ import asyncio
 logger = logging.getLogger(__name__)
 
 
+def _validate_slug(slug: str) -> str:
+    """
+    Sanitize a film slug to prevent injection or invalid characters.
+    Returns lowercased alphanumeric + hyphens only.
+    """
+    import re
+    # Remove invalid characters, keep only alphanumeric and hyphens
+    sanitized = re.sub(r'[^a-z0-9-]', '', slug.lower())
+    if sanitized != slug.lower().replace(' ', '-'):
+        logger.warning(f"Slug '{slug}' sanitized to '{sanitized}'")
+    return sanitized
+
+
+def _validate_username(username: str) -> str:
+    """
+    Sanitize a Letterboxd username.
+    Returns lowercased alphanumeric + underscores/hyphens only.
+    """
+    import re
+    sanitized = re.sub(r'[^a-z0-9_-]', '', username.lower())
+    if sanitized != username.lower():
+        logger.warning(f"Username '{username}' sanitized to '{sanitized}'")
+    return sanitized
+
+
 def _load_all_user_films(conn) -> dict[str, list[dict]]:
     """
     Load all user films in a single query.
@@ -69,6 +94,11 @@ def _scrape_film_metadata(scraper, slugs, max_per_batch=100, use_async=True):
                 json.dumps(m.writers), json.dumps(m.cinematographers),
                 json.dumps(m.composers)
             ) for m in metadata_list])
+            
+            # Populate normalized tables for fast queries
+            from .database import populate_normalized_tables
+            for m in metadata_list:
+                populate_normalized_tables(conn, m)
         
         logger.info(f"Saved {len(metadata_list)} films")
 
@@ -76,11 +106,16 @@ def _scrape_film_metadata(scraper, slugs, max_per_batch=100, use_async=True):
 def cmd_scrape(args):
     """Scrape a user's Letterboxd data."""
     init_db()
+    
+    # Validate and sanitize username
+    username = _validate_username(args.username)
+    
     scraper = LetterboxdScraper(delay=1.0)
     
     try:
         # Check if refresh is needed
-        if hasattr(args, 'refresh') and args.refresh:
+        refresh = getattr(args, 'refresh', None)
+        if refresh:
             with get_db() as conn:
                 result = conn.execute("""
                     SELECT MAX(scraped_at) as last_scrape 
@@ -269,20 +304,29 @@ def cmd_discover(args):
 
 def cmd_recommend(args):
     """Generate recommendations."""
+    # Validate username
+    username = _validate_username(args.username)
+    
     with get_db() as conn:
         user_films = [dict(r) for r in conn.execute("""
             SELECT film_slug as slug, rating, watched, watchlisted, liked
             FROM user_films WHERE username = ?
-        """, (args.username,))]
+        """, (username,))]
         
         if not user_films:
-            print(f"No data for '{args.username}'. Run: python main.py scrape {args.username}")
+            print(f"No data for '{username}'. Run: python main.py scrape {username}")
             return
         
         # Load film metadata (needed by both strategies)
         all_films = {r['slug']: dict(r) for r in conn.execute("SELECT * FROM films")}
         
-        strategy = args.strategy if hasattr(args, 'strategy') else 'metadata'
+        # Check for missing metadata
+        seen_slugs = {f['slug'] for f in user_films}
+        missing_slugs = seen_slugs - set(all_films.keys())
+        if missing_slugs:
+            logger.warning(f"Missing metadata for {len(missing_slugs)} films in {username}'s history. Consider running 'scrape' again.")
+        
+        strategy = getattr(args, 'strategy', 'metadata')
         
         if strategy == 'hybrid':
             # Hybrid: combine metadata and collaborative (single query)
@@ -353,7 +397,8 @@ def cmd_recommend(args):
             )
         else:
             # Metadata-based (default)
-            diversity = args.diversity if hasattr(args, 'diversity') else False
+            diversity = getattr(args, 'diversity', False)
+            max_per_director = getattr(args, 'max_per_director', 2)
             recommender = MetadataRecommender(list(all_films.values()))
             recs = recommender.recommend(
                 user_films,
@@ -364,11 +409,12 @@ def cmd_recommend(args):
                 exclude_genres=args.exclude_genres,
                 min_rating=args.min_rating,
                 diversity=diversity,
-                max_per_director=args.max_per_director if hasattr(args, 'max_per_director') else 2
+                max_per_director=max_per_director
             )
     
     # Format and print results
-    if hasattr(args, 'format') and args.format == 'json':
+    output_format = getattr(args, 'format', 'text')
+    if output_format == 'json':
         output = [{
             "title": r.title,
             "year": r.year,
@@ -378,12 +424,12 @@ def cmd_recommend(args):
             "url": f"https://letterboxd.com/film/{r.slug}/"
         } for r in recs]
         print(json.dumps(output, indent=2))
-    elif hasattr(args, 'format') and args.format == 'csv':
+    elif output_format == 'csv':
         print("Title,Year,URL,Score,Reasons")
         for r in recs:
             reasons = "; ".join(r.reasons).replace('"', '""')
             print(f'"{r.title}",{r.year},https://letterboxd.com/film/{r.slug}/,{r.score:.2f},"{reasons}"')
-    elif hasattr(args, 'format') and args.format == 'markdown':
+    elif output_format == 'markdown':
         print(f"\n# Top {len(recs)} recommendations for {args.username} ({strategy})\n")
         for i, r in enumerate(recs, 1):
             print(f"## {i}. [{r.title} ({r.year})](https://letterboxd.com/film/{r.slug}/)")
@@ -423,7 +469,8 @@ def cmd_stats(args):
             for user, count in top_users:
                 print(f"  {user}: {count} films")
         
-        if hasattr(args, 'verbose') and args.verbose:
+        verbose = getattr(args, 'verbose', False)
+        if verbose:
             missing_metadata = conn.execute("""
                 SELECT COUNT(DISTINCT uf.film_slug) 
                 FROM user_films uf 
@@ -532,7 +579,7 @@ def cmd_profile(args):
         print(f"No data for '{args.username}'. Run: python main.py scrape {args.username}")
         return
     
-    profile = build_profile(user_films, all_films)
+    profile = build_profile(user_films, all_films, username=args.username)
     
     print(f"\nProfile for {args.username}")
     print(f"  Films: {profile.n_films} ({profile.n_rated} rated, {profile.n_liked} liked)")
@@ -565,6 +612,9 @@ def cmd_profile(args):
 
 def cmd_similar(args):
     """Find films similar to a specific film."""
+    # Validate slug
+    slug = _validate_slug(args.slug)
+    
     with get_db() as conn:
         all_films = [dict(r) for r in conn.execute("SELECT * FROM films")]
     
@@ -573,7 +623,7 @@ def cmd_similar(args):
         return
     
     recommender = MetadataRecommender(all_films)
-    recs = recommender.similar_to(args.slug, n=args.limit)
+    recs = recommender.similar_to(slug, n=args.limit)
     
     if not recs:
         print(f"No film found with slug '{args.slug}'")
@@ -696,8 +746,6 @@ def main():
     
     # Stats command
     stats_parser = subparsers.add_parser("stats", help="Show database statistics")
-    stats_parser.add_argument("--verbose", action="store_true",
-                               help="Show detailed stats (missing metadata, genre distribution, staleness)")
     stats_parser.set_defaults(func=cmd_stats)
     
     # Export command

@@ -132,6 +132,9 @@ class LetterboxdScraper:
         time.sleep(self.delay)
         
         retries = 0
+        total_429_wait_time = 0
+        MAX_429_WAIT_TIME = 300  # Maximum 5 minutes total waiting for 429s
+        
         while retries < max_retries:
             try:
                 resp = self.client.get(url)
@@ -140,9 +143,16 @@ class LetterboxdScraper:
                 
                 if resp.status_code == 429:
                     retry_after = int(resp.headers.get("Retry-After", 60))
-                    logger.warning(f"Rate limited (429) on {url}, waiting {retry_after}s...")
+                    
+                    # Check if we've waited too long for 429s
+                    if total_429_wait_time + retry_after > MAX_429_WAIT_TIME:
+                        logger.error(f"Max 429 wait time exceeded for {url} (waited {total_429_wait_time}s, would need {retry_after}s more)")
+                        return None
+                    
+                    logger.warning(f"Rate limited (429) on {url}, waiting {retry_after}s... (total 429 wait: {total_429_wait_time}s)")
                     time.sleep(retry_after)
-                    # Do not increment retries for 429
+                    total_429_wait_time += retry_after
+                    # Do not increment retries for 429, but track total wait time
                     continue
                 
                 resp.raise_for_status()
@@ -157,9 +167,6 @@ class LetterboxdScraper:
                     logger.error(f"Max retries exceeded for {url}: {e}")
                     return None
             except httpx.HTTPStatusError as e:
-                # 429 is handled above if it comes as a status code without raising (depending on client config)
-                # But raise_for_status might raise it.
-                # Actually, I checked status_code before raise_for_status, so 429 is caught.
                 logger.error(f"HTTP error on {url}: {e}")
                 return None
             except httpx.HTTPError as e:
@@ -455,6 +462,7 @@ class LetterboxdScraper:
         """Scrape films from a specific list."""
         films = []
         page = 1
+        cumulative_count = 0  # Track total films seen across all pages
         
         while True:
             tree = self._get(f"{self.BASE}/{username}/list/{list_slug}/page/{page}/")
@@ -490,15 +498,17 @@ class LetterboxdScraper:
                             pos_text = pos_el.text(strip=True).rstrip(".")
                             position = int(pos_text)
                         except (ValueError, AttributeError):
-                            position = (page - 1) * len(items) + idx + 1
+                            # Fallback: use cumulative count instead of page-based calculation
+                            position = cumulative_count + idx + 1
                     else:
-                        position = (page - 1) * len(items) + idx + 1
+                        position = cumulative_count + idx + 1
                 
                 films.append({
                     "film_slug": film_slug,
                     "position": position
                 })
             
+            cumulative_count += len(items)  # Update cumulative count after processing page
             page += 1
         
         return films
@@ -517,16 +527,41 @@ class AsyncLetterboxdScraper:
     def __init__(self, delay: float = 0.2, max_concurrent: int = 5):
         self.delay = delay
         self.semaphore = asyncio.Semaphore(max_concurrent)
+        self.client = None
     
-    async def scrape_films_batch(self, slugs: list[str]) -> list[FilmMetadata]:
-        """Scrape multiple films concurrently."""
-        async with httpx.AsyncClient(
+    async def __aenter__(self):
+        """Async context manager entry."""
+        self.client = httpx.AsyncClient(
             headers={"User-Agent": "Mozilla/5.0 (compatible; letterboxd-rec/1.0)"},
             follow_redirects=True,
             timeout=30.0
-        ) as client:
-            tasks = [self._scrape_film_async(client, slug) for slug in slugs]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+        )
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit."""
+        if self.client:
+            await self.client.aclose()
+        return False
+    
+    async def scrape_films_batch(self, slugs: list[str]) -> list[FilmMetadata]:
+        """Scrape multiple films concurrently."""
+        if not self.client:
+            # If not used as context manager, create temporary client
+            async with httpx.AsyncClient(
+                headers={"User-Agent": "Mozilla/5.0 (compatible; letterboxd-rec/1.0)"},
+                follow_redirects=True,
+                timeout=30.0
+            ) as client:
+                return await self._scrape_batch_with_client(client, slugs)
+        else:
+            # Use existing client from context manager
+            return await self._scrape_batch_with_client(self.client, slugs)
+    
+    async def _scrape_batch_with_client(self, client: httpx.AsyncClient, slugs: list[str]) -> list[FilmMetadata]:
+        """Internal method to scrape batch with provided client."""
+        tasks = [self._scrape_film_async(client, slug) for slug in slugs]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
         
         # Filter out failures and log them
         successful = []

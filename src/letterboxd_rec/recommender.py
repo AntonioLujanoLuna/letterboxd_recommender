@@ -354,7 +354,7 @@ class MetadataRecommender:
         target_genres = set(load_json(target.get('genres')))
         target_directors = set(load_json(target.get('directors')))
         target_cast = set(load_json(target.get('cast', []))[:5])
-        target_decade = (target.get('year') // 10) * 10 if target.get('year') else None
+        target_decade = (target.get('year') // 10) * 10 if target.get('year') is not None else None
         
         candidates = []
         for other_slug, film in self.films.items():

@@ -109,19 +109,55 @@ def _migrate_films_table(conn):
                 logger.warning(f"Could not add column '{col_name}': {e}")
 
 
+def populate_normalized_tables(conn, film_metadata):
+    """
+    Populate normalized tables from film metadata.
+    
+    Args:
+        conn: Database connection
+        film_metadata: FilmMetadata object or dict with slug and attribute lists
+    """
+    slug = film_metadata.slug if hasattr(film_metadata, 'slug') else film_metadata['slug']
+    
+    # Clear existing entries for this film
+    conn.execute("DELETE FROM film_directors WHERE film_slug = ?", (slug,))
+    conn.execute("DELETE FROM film_genres WHERE film_slug = ?", (slug,))
+    conn.execute("DELETE FROM film_cast WHERE film_slug = ?", (slug,))
+    conn.execute("DELETE FROM film_themes WHERE film_slug = ?", (slug,))
+    
+    # Get attributes (handle both dataclass and dict)
+    directors = film_metadata.directors if hasattr(film_metadata, 'directors') else load_json(film_metadata.get('directors', []))
+    genres = film_metadata.genres if hasattr(film_metadata, 'genres') else load_json(film_metadata.get('genres', []))
+    cast = film_metadata.cast if hasattr(film_metadata, 'cast') else load_json(film_metadata.get('cast', []))
+    themes = film_metadata.themes if hasattr(film_metadata, 'themes') else load_json(film_metadata.get('themes', []))
+    
+    # Insert into normalized tables
+    for director in directors:
+        conn.execute("INSERT OR IGNORE INTO film_directors (film_slug, director) VALUES (?, ?)", (slug, director))
+    
+    for genre in genres:
+        conn.execute("INSERT OR IGNORE INTO film_genres (film_slug, genre) VALUES (?, ?)", (slug, genre))
+    
+    for actor in cast:
+        conn.execute("INSERT OR IGNORE INTO film_cast (film_slug, actor) VALUES (?, ?)", (slug, actor))
+    
+    for theme in themes:
+        conn.execute("INSERT OR IGNORE INTO film_themes (film_slug, theme) VALUES (?, ?)", (slug, theme))
+
+
 @contextmanager
-def get_db(readonly: bool = False):
+def get_db(exclude_commit: bool = False):
     """
     Get database connection context manager.
     
     Args:
-        readonly: If True, skip commit on exit (for read-only operations)
+        exclude_commit: If True, skip commit on exit (for read-only operations)
     """
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     try:
         yield conn
-        if not readonly:
+        if not exclude_commit:
             conn.commit()
     finally:
         conn.close()
@@ -142,7 +178,7 @@ def load_json(val):
 
 def load_user_lists(username: str) -> list[dict]:
     """Load all list entries for a user from database."""
-    with get_db(readonly=True) as conn:
+    with get_db(exclude_commit=True) as conn:
         cursor = conn.execute("""
             SELECT username, list_slug, list_name, is_ranked, is_favorites, position, film_slug
             FROM user_lists
