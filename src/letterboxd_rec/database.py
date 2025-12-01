@@ -2,6 +2,7 @@ import sqlite3
 import json
 import logging
 import os
+import threading
 from pathlib import Path
 from contextlib import contextmanager
 
@@ -9,6 +10,10 @@ logger = logging.getLogger(__name__)
 
 # Adjust DB_PATH to be relative to the project root or a specific location
 DB_PATH = Path(os.environ.get("LETTERBOXD_DB", "data/letterboxd.db"))
+
+# Connection pool singleton
+_connection_pool_lock = threading.Lock()
+_connection_pool = {}
 
 
 def init_db():
@@ -145,22 +150,42 @@ def populate_normalized_tables(conn, film_metadata):
         conn.execute("INSERT OR IGNORE INTO film_themes (film_slug, theme) VALUES (?, ?)", (slug, theme))
 
 
+def _get_thread_connection():
+    """
+    Get a connection for the current thread from the pool.
+    Each thread gets its own connection to avoid SQLite threading issues.
+    """
+    thread_id = threading.get_ident()
+
+    with _connection_pool_lock:
+        if thread_id not in _connection_pool:
+            conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            _connection_pool[thread_id] = conn
+            logger.debug(f"Created new DB connection for thread {thread_id}")
+
+        return _connection_pool[thread_id]
+
+
 @contextmanager
 def get_db(exclude_commit: bool = False):
     """
-    Get database connection context manager.
-    
+    Get database connection context manager with connection pooling.
+
+    Each thread gets its own persistent connection from the pool.
+    This reduces the overhead of creating new connections for every operation.
+
     Args:
         exclude_commit: If True, skip commit on exit (for read-only operations)
     """
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = _get_thread_connection()
     try:
         yield conn
         if not exclude_commit:
             conn.commit()
-    finally:
-        conn.close()
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def load_json(val):
@@ -190,23 +215,60 @@ def load_user_lists(username: str) -> list[dict]:
 
 
 def load_cached_profile(username: str, max_age_days: int = 7) -> dict | None:
-    """Load cached user profile if it exists and is recent enough."""
+    """
+    Load cached user profile if it exists and is recent enough.
+
+    Cache is invalidated if:
+    - Profile is older than max_age_days
+    - User's lists have been updated more recently than the profile
+    - User's films have been updated more recently than the profile
+    """
     with get_db(exclude_commit=True) as conn:
         cursor = conn.execute("""
-            SELECT profile_data, updated_at 
-            FROM user_profiles 
+            SELECT profile_data, updated_at
+            FROM user_profiles
             WHERE username = ?
         """, (username,))
         row = cursor.fetchone()
-        
+
         if not row:
             return None
-        
+
         from datetime import datetime
-        updated_at = datetime.fromisoformat(row['updated_at'])
-        if (datetime.now() - updated_at).days > max_age_days:
+        profile_updated_at = datetime.fromisoformat(row['updated_at'])
+
+        # Check age
+        if (datetime.now() - profile_updated_at).days > max_age_days:
             return None
-        
+
+        # Check if user_lists have been updated more recently
+        lists_cursor = conn.execute("""
+            SELECT MAX(scraped_at) as last_list_update
+            FROM user_lists
+            WHERE username = ?
+        """, (username,))
+        lists_row = lists_cursor.fetchone()
+
+        if lists_row and lists_row['last_list_update']:
+            last_list_update = datetime.fromisoformat(lists_row['last_list_update'])
+            if last_list_update > profile_updated_at:
+                logger.debug(f"Profile cache invalidated for {username} - lists updated more recently")
+                return None
+
+        # Check if user_films have been updated more recently
+        films_cursor = conn.execute("""
+            SELECT MAX(scraped_at) as last_film_update
+            FROM user_films
+            WHERE username = ?
+        """, (username,))
+        films_row = films_cursor.fetchone()
+
+        if films_row and films_row['last_film_update']:
+            last_film_update = datetime.fromisoformat(films_row['last_film_update'])
+            if last_film_update > profile_updated_at:
+                logger.debug(f"Profile cache invalidated for {username} - films updated more recently")
+                return None
+
         return json.loads(row['profile_data'])
 
 

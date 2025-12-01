@@ -2,34 +2,28 @@ import logging
 from collections import defaultdict
 from dataclasses import dataclass, field
 from .database import load_json
+from .config import (
+    MAX_CAST_CONSIDERED,
+    MAX_THEMES_CONSIDERED,
+    SECONDARY_COUNTRY_WEIGHT,
+    WEIGHT_LOVED,
+    WEIGHT_LIKED,
+    WEIGHT_NEUTRAL,
+    WEIGHT_DISLIKED,
+    WEIGHT_HATED,
+    WEIGHT_LIKED_NO_RATING,
+    WEIGHT_WATCHED_ONLY,
+    WEIGHT_WATCHLISTED,
+    LIST_MULTIPLIER_FAVORITES,
+    LIST_MULTIPLIER_TOP_10,
+    LIST_MULTIPLIER_TOP_30,
+    LIST_MULTIPLIER_RANKED_OTHER,
+    LIST_MULTIPLIER_CURATED,
+    NORM_EXPONENT_DEFAULT,
+    NORM_EXPONENT_ACTORS,
+)
 
 logger = logging.getLogger(__name__)
-
-# Configuration constants
-MAX_CAST_CONSIDERED = 5
-MAX_THEMES_CONSIDERED = 10
-SECONDARY_COUNTRY_WEIGHT = 0.3
-
-# Weight constants for interaction types
-WEIGHT_LOVED = 2.0        # Rating 4.5-5.0
-WEIGHT_LIKED = 1.0        # Rating 3.5-4.0
-WEIGHT_NEUTRAL = 0.3      # Rating 3.0
-WEIGHT_DISLIKED = -0.5    # Rating 2.0-2.5
-WEIGHT_HATED = -1.5       # Rating 0.5-1.5
-WEIGHT_LIKED_NO_RATING = 1.5
-WEIGHT_WATCHED_ONLY = 0.4
-WEIGHT_WATCHLISTED = 0.2
-
-# List multipliers
-LIST_MULTIPLIER_FAVORITES = 3.0
-LIST_MULTIPLIER_TOP_10 = 2.0
-LIST_MULTIPLIER_TOP_30 = 1.5
-LIST_MULTIPLIER_RANKED_OTHER = 1.2
-LIST_MULTIPLIER_CURATED = 1.3
-
-# Normalization exponents (0 = no normalization, 0.5 = sqrt, 1.0 = full count normalization)
-NORM_EXPONENT_DEFAULT = 0.5
-NORM_EXPONENT_ACTORS = 0.3
 
 
 @dataclass

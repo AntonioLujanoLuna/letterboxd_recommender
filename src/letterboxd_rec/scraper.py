@@ -580,18 +580,48 @@ class AsyncLetterboxdScraper:
             return await self._scrape_batch_with_client(self.client, slugs)
     
     async def _scrape_batch_with_client(self, client: httpx.AsyncClient, slugs: list[str]) -> list[FilmMetadata]:
-        """Internal method to scrape batch with provided client."""
+        """
+        Internal method to scrape batch with provided client.
+
+        Returns list of successfully scraped FilmMetadata objects.
+        Failures are logged with comprehensive error information.
+        """
         tasks = [self._scrape_film_async(client, slug) for slug in slugs]
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Filter out failures and log them
+
+        # Track successes and failures
         successful = []
+        failed = []
+        error_summary = {}
+
         for slug, result in zip(slugs, results):
             if isinstance(result, Exception):
-                logger.error(f"Failed to scrape {slug}: {type(result).__name__}: {result}")
+                error_type = type(result).__name__
+                error_msg = str(result)
+                logger.error(f"Failed to scrape {slug}: {error_type}: {error_msg}")
+                failed.append(slug)
+
+                # Aggregate error types for summary
+                if error_type not in error_summary:
+                    error_summary[error_type] = []
+                error_summary[error_type].append(slug)
             elif result is not None:
                 successful.append(result)
-        
+            else:
+                # None result (e.g., 404 or max retries exceeded)
+                logger.debug(f"No result for {slug} (likely 404 or max retries)")
+                failed.append(slug)
+
+        # Log summary
+        if failed:
+            logger.warning(
+                f"Batch complete: {len(successful)}/{len(slugs)} successful, {len(failed)} failed"
+            )
+            if error_summary:
+                logger.info(f"Error breakdown: {dict((k, len(v)) for k, v in error_summary.items())}")
+        else:
+            logger.info(f"Batch complete: {len(successful)}/{len(slugs)} successful")
+
         return successful
     
     async def _scrape_film_async(self, client: httpx.AsyncClient, slug: str) -> FilmMetadata | None:
@@ -614,8 +644,9 @@ class AsyncLetterboxdScraper:
                         continue
                     
                     resp.raise_for_status()
-                    return self._parse_film_page(resp.text, slug)
-                    
+                    tree = HTMLParser(resp.text)
+                    return parse_film_page(tree, slug)
+
                 except httpx.TimeoutException:
                     wait_time = 2 ** attempt
                     logger.warning(f"Timeout on {slug}, retrying in {wait_time}s (attempt {attempt + 1}/{self.MAX_RETRIES})")
@@ -631,8 +662,3 @@ class AsyncLetterboxdScraper:
             
             logger.error(f"Max retries exceeded for {slug}")
             return None
-    
-    def _parse_film_page(self, html: str, slug: str) -> FilmMetadata:
-        """Parse film page HTML."""
-        tree = HTMLParser(html)
-        return parse_film_page(tree, slug)
