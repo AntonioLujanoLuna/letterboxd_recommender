@@ -4,7 +4,7 @@ import logging
 from collections import defaultdict
 from datetime import datetime, timedelta
 
-from .database import init_db, get_db, load_json, load_user_lists
+from .database import init_db, get_db, load_json, load_user_lists, parse_timestamp_naive
 from .scraper import LetterboxdScraper
 from .recommender import MetadataRecommender, CollaborativeRecommender, Recommendation
 from .profile import build_profile
@@ -187,7 +187,7 @@ def cmd_scrape(args: argparse.Namespace) -> None:
                 """, (username,)).fetchone()
                 
                 if result and result['last_scrape']:
-                    last_scrape = datetime.fromisoformat(result['last_scrape'])
+                    last_scrape = parse_timestamp_naive(result['last_scrape'])
                     age_days = (datetime.now() - last_scrape).days
 
                     if age_days < args.refresh:
@@ -211,24 +211,17 @@ def cmd_scrape(args: argparse.Namespace) -> None:
 
         interactions = scraper.scrape_user(username, existing_slugs=existing_slugs, stop_on_existing=incremental)
 
-        # Batch insert user films within a transaction
+        # Batch insert user films (get_db() context manager handles transaction)
         with get_db() as conn:
-            # Start explicit transaction for atomicity
-            conn.execute("BEGIN")
-            try:
-                scraped_at = datetime.now().isoformat()
-                conn.executemany("""
-                    INSERT OR REPLACE INTO user_films
-                    (username, film_slug, rating, watched, watchlisted, liked, scraped_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, [(username, i.film_slug, i.rating, i.watched, i.watchlisted, i.liked, scraped_at)
-                      for i in interactions])
+            scraped_at = datetime.now().isoformat()
+            conn.executemany("""
+                INSERT OR REPLACE INTO user_films
+                (username, film_slug, rating, watched, watchlisted, liked, scraped_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, [(username, i.film_slug, i.rating, i.watched, i.watchlisted, i.liked, scraped_at)
+                  for i in interactions])
 
-                existing = {r['slug'] for r in conn.execute("SELECT slug FROM films")}
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
+            existing = {r['slug'] for r in conn.execute("SELECT slug FROM films")}
 
         new_slugs = [i.film_slug for i in interactions if i.film_slug not in existing]
         
@@ -245,21 +238,15 @@ def cmd_scrape(args: argparse.Namespace) -> None:
             if favorites:
                 print(f"  Found {len(favorites)} profile favorites")
                 with get_db() as conn:
-                    conn.execute("BEGIN")
-                    try:
-                        for slug in favorites:
-                            conn.execute("""
-                                INSERT OR REPLACE INTO user_lists
-                                (username, list_slug, list_name, is_ranked, is_favorites, position, film_slug, scraped_at)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                            """, (
-                                username, "profile-favorites", "Profile Favorites",
-                                0, 1, None, slug, datetime.now().isoformat()
-                            ))
-                        conn.commit()
-                    except Exception:
-                        conn.rollback()
-                        raise
+                    for slug in favorites:
+                        conn.execute("""
+                            INSERT OR REPLACE INTO user_lists
+                            (username, list_slug, list_name, is_ranked, is_favorites, position, film_slug, scraped_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            username, "profile-favorites", "Profile Favorites",
+                            0, 1, None, slug, datetime.now().isoformat()
+                        ))
             
             # Get all user lists
             lists = scraper.scrape_user_lists(username, limit=args.max_lists)
@@ -282,22 +269,16 @@ def cmd_scrape(args: argparse.Namespace) -> None:
                 
                 # Save to database
                 with get_db() as conn:
-                    conn.execute("BEGIN")
-                    try:
-                        for film in films:
-                            conn.execute("""
-                                INSERT OR REPLACE INTO user_lists
-                                (username, list_slug, list_name, is_ranked, is_favorites, position, film_slug, scraped_at)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                            """, (
-                                username, list_slug, list_name,
-                                is_ranked, is_favorites, film.get('position'),
-                                film['film_slug'], datetime.now().isoformat()
-                            ))
-                        conn.commit()
-                    except Exception:
-                        conn.rollback()
-                        raise
+                    for film in films:
+                        conn.execute("""
+                            INSERT OR REPLACE INTO user_lists
+                            (username, list_slug, list_name, is_ranked, is_favorites, position, film_slug, scraped_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            username, list_slug, list_name,
+                            is_ranked, is_favorites, film.get('position'),
+                            film['film_slug'], datetime.now().isoformat()
+                        ))
                 
                 print(f"    {len(films)} films")
 
@@ -388,21 +369,15 @@ def cmd_discover(args: argparse.Namespace) -> None:
                 interactions = scraper.scrape_user(username)
 
                 with get_db() as conn:
-                    conn.execute("BEGIN")
-                    try:
-                        scraped_at = datetime.now().isoformat()
-                        conn.executemany("""
-                            INSERT OR REPLACE INTO user_films
-                            (username, film_slug, rating, watched, watchlisted, liked, scraped_at)
-                            VALUES (?, ?, ?, ?, ?, ?, ?)
-                        """, [(username, i.film_slug, i.rating, i.watched, i.watchlisted, i.liked, scraped_at)
-                              for i in interactions])
+                    scraped_at = datetime.now().isoformat()
+                    conn.executemany("""
+                        INSERT OR REPLACE INTO user_films
+                        (username, film_slug, rating, watched, watchlisted, liked, scraped_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, [(username, i.film_slug, i.rating, i.watched, i.watchlisted, i.liked, scraped_at)
+                          for i in interactions])
 
-                        existing_film_slugs = {r['slug'] for r in conn.execute("SELECT slug FROM films")}
-                        conn.commit()
-                    except Exception:
-                        conn.rollback()
-                        raise
+                    existing_film_slugs = {r['slug'] for r in conn.execute("SELECT slug FROM films")}
 
                 existing_users.add(username)
                 
@@ -423,11 +398,20 @@ def cmd_recommend(args: argparse.Namespace) -> None:
     # Validate username
     username = _validate_username(args.username)
 
+    strategy = getattr(args, 'strategy', 'metadata')
+
     with get_db() as conn:
-        user_films = [dict(r) for r in conn.execute("""
-            SELECT film_slug as slug, rating, watched, watchlisted, liked
-            FROM user_films WHERE username = ?
-        """, (username,))]
+        # Load user films based on strategy to avoid duplicate queries
+        if strategy in ('hybrid', 'collaborative'):
+            # Load all users' films once (includes target user)
+            all_user_films = _load_all_user_films(conn)
+            user_films = all_user_films.get(username, [])
+        else:
+            # Metadata-only: just load target user's films
+            user_films = [dict(r) for r in conn.execute("""
+                SELECT film_slug as slug, rating, watched, watchlisted, liked
+                FROM user_films WHERE username = ?
+            """, (username,))]
 
         if not user_films:
             print(f"No data for '{username}'. Run: python main.py scrape {username}")
@@ -441,18 +425,15 @@ def cmd_recommend(args: argparse.Namespace) -> None:
             max_year=args.max_year,
             min_rating=args.min_rating
         )
-        
+
         # Check for missing metadata
         seen_slugs = {f['slug'] for f in user_films}
         missing_slugs = seen_slugs - set(all_films.keys())
         if missing_slugs:
             logger.warning(f"Missing metadata for {len(missing_slugs)} films in {username}'s history. Consider running 'scrape' again.")
-        
-        strategy = getattr(args, 'strategy', 'metadata')
-        
+
         if strategy == 'hybrid':
-            # Hybrid: combine metadata and collaborative (single query)
-            all_user_films = _load_all_user_films(conn)
+            # Hybrid: combine metadata and collaborative (all_user_films already loaded)
             
             # Get recommendations from both strategies
             meta_rec = MetadataRecommender(list(all_films.values()))
@@ -535,9 +516,7 @@ def cmd_recommend(args: argparse.Namespace) -> None:
                     ))
                     
         elif strategy == 'collaborative':
-            # Load all user data (single query)
-            all_user_films = _load_all_user_films(conn)
-            
+            # Collaborative: all_user_films already loaded above
             recommender = CollaborativeRecommender(all_user_films, all_films)
             recs = recommender.recommend(
                 username,

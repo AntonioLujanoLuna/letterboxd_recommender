@@ -5,8 +5,22 @@ import os
 import threading
 from pathlib import Path
 from contextlib import contextmanager
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
+
+
+def parse_timestamp_naive(timestamp_str: str) -> datetime:
+    """
+    Parse ISO format timestamp string to naive datetime.
+
+    Ensures consistency by always returning naive datetime regardless of
+    whether the stored timestamp had timezone info.
+    This prevents timezone comparison bugs when mixing naive and aware datetimes.
+    """
+    dt = datetime.fromisoformat(timestamp_str)
+    # Always return naive datetime for consistency
+    return dt.replace(tzinfo=None) if dt.tzinfo else dt
 
 # Adjust DB_PATH to be relative to the project root or a specific location
 DB_PATH = Path(os.environ.get("LETTERBOXD_DB", "data/letterboxd.db"))
@@ -278,9 +292,8 @@ def load_cached_profile(username: str, max_age_days: int = 7) -> dict | None:
         if not row:
             return None
 
-        from datetime import datetime
-        # Ensure naive datetime by replacing tzinfo if present
-        profile_updated_at = datetime.fromisoformat(row['updated_at']).replace(tzinfo=None)
+        # Use helper to ensure naive datetime for consistent comparisons
+        profile_updated_at = parse_timestamp_naive(row['updated_at'])
         now = datetime.now()
 
         # Check age
@@ -296,7 +309,7 @@ def load_cached_profile(username: str, max_age_days: int = 7) -> dict | None:
         lists_row = lists_cursor.fetchone()
 
         if lists_row and lists_row['last_list_update']:
-            last_list_update = datetime.fromisoformat(lists_row['last_list_update']).replace(tzinfo=None)
+            last_list_update = parse_timestamp_naive(lists_row['last_list_update'])
             if last_list_update > profile_updated_at:
                 logger.debug(f"Profile cache invalidated for {username} - lists updated more recently")
                 return None
@@ -310,7 +323,7 @@ def load_cached_profile(username: str, max_age_days: int = 7) -> dict | None:
         films_row = films_cursor.fetchone()
 
         if films_row and films_row['last_film_update']:
-            last_film_update = datetime.fromisoformat(films_row['last_film_update']).replace(tzinfo=None)
+            last_film_update = parse_timestamp_naive(films_row['last_film_update'])
             if last_film_update > profile_updated_at:
                 logger.debug(f"Profile cache invalidated for {username} - films updated more recently")
                 return None
@@ -319,9 +332,9 @@ def load_cached_profile(username: str, max_age_days: int = 7) -> dict | None:
 
 
 def save_user_profile(username: str, profile_data: dict) -> None:
-    """Save user profile to cache."""
+    """Save user profile to cache with naive datetime timestamp."""
     with get_db() as conn:
-        from datetime import datetime
+        # Always use naive datetime for consistency
         conn.execute("""
             INSERT OR REPLACE INTO user_profiles (username, profile_data, updated_at)
             VALUES (?, ?, ?)
