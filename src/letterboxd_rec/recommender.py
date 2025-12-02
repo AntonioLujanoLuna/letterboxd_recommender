@@ -77,11 +77,14 @@ class MetadataRecommender:
                 continue
             
             film_genres = load_json(film.get('genres'))
+            # Genres are now stored lowercase, so normalize user input for comparison
             if genres:
-                if not any(g.lower() in [fg.lower() for fg in film_genres] for g in genres):
+                genres_lower = [g.lower() for g in genres]
+                if not any(g in film_genres for g in genres_lower):
                     continue
             if exclude_genres:
-                if any(g.lower() in [fg.lower() for fg in film_genres] for g in exclude_genres):
+                exclude_genres_lower = [g.lower() for g in exclude_genres]
+                if any(g in film_genres for g in exclude_genres_lower):
                     continue
             
             if min_rating and film.get('avg_rating') and film['avg_rating'] < min_rating:
@@ -462,7 +465,15 @@ class MetadataRecommender:
             
             if len(results) >= n:
                 break
-        
+
+        # Warn if diversity constraints prevented reaching requested count
+        if len(results) < n:
+            logger.warning(
+                f"Diversity mode returned only {len(results)}/{n} results. "
+                f"Director constraint (max {max_per_director} per director) limited options. "
+                f"Consider increasing --max-per-director or disabling --diversity for more results."
+            )
+
         return results
 
 
@@ -592,13 +603,15 @@ class CollaborativeRecommender:
                     if max_year and year and year > max_year:
                         continue
 
-                    # Apply genre filters
+                    # Apply genre filters (genres are stored lowercase)
                     film_genres = load_json(film.get('genres'))
                     if genres:
-                        if not any(g.lower() in [fg.lower() for fg in film_genres] for g in genres):
+                        genres_lower = [g.lower() for g in genres]
+                        if not any(g in film_genres for g in genres_lower):
                             continue
                     if exclude_genres:
-                        if any(g.lower() in [fg.lower() for fg in film_genres] for g in exclude_genres):
+                        exclude_genres_lower = [g.lower() for g in exclude_genres]
+                        if any(g in film_genres for g in exclude_genres_lower):
                             continue
                 
                 rating = film.get('rating')

@@ -2,12 +2,39 @@ import httpx
 import json
 import time
 import logging
+import re
 from selectolax.parser import HTMLParser
 from dataclasses import dataclass
 from tqdm import tqdm
 import asyncio
 
 logger = logging.getLogger(__name__)
+
+
+def validate_slug(slug: str | None) -> str | None:
+    """
+    Validate film slug format to prevent injection or malformed data.
+
+    Returns cleaned slug or None if invalid.
+    Letterboxd slugs should be lowercase alphanumeric with hyphens only.
+    """
+    if not slug:
+        return None
+
+    # Remove any whitespace
+    slug = slug.strip()
+
+    # Check format: lowercase alphanumeric and hyphens only
+    if not re.match(r'^[a-z0-9-]+$', slug.lower()):
+        logger.warning(f"Invalid slug format (contains disallowed characters): '{slug}'")
+        return None
+
+    # Additional safety: reject excessively long slugs (Letterboxd slugs are typically < 100 chars)
+    if len(slug) > 200:
+        logger.warning(f"Slug exceeds maximum length: '{slug[:50]}...'")
+        return None
+
+    return slug.lower()
 
 
 def _parse_rating_count(text: str) -> int | None:
@@ -79,8 +106,8 @@ def parse_film_page(tree: HTMLParser, slug: str) -> FilmMetadata:
     # Directors
     directors = list(dict.fromkeys([a.text(strip=True) for a in tree.css("a[href*='/director/']") if a.text(strip=True)]))
 
-    # Genres
-    genres = list(dict.fromkeys([a.text(strip=True) for a in tree.css("a[href*='/films/genre/']") if a.text(strip=True)]))
+    # Genres (normalize to lowercase for consistent matching)
+    genres = list(dict.fromkeys([a.text(strip=True).lower() for a in tree.css("a[href*='/films/genre/']") if a.text(strip=True)]))
 
     # Cast (top billed)
     cast = list(dict.fromkeys([a.text(strip=True) for a in tree.css("a[href*='/actor/']")[:10] if a.text(strip=True)]))
@@ -230,7 +257,7 @@ class LetterboxdScraper:
                 if not react_comp:
                     continue
 
-                slug = react_comp.attributes.get("data-item-slug")
+                slug = validate_slug(react_comp.attributes.get("data-item-slug"))
                 if not slug:
                     continue
 
@@ -282,8 +309,8 @@ class LetterboxdScraper:
                 react_comp = item.css_first("div.react-component")
                 if not react_comp:
                     continue
-                    
-                slug = react_comp.attributes.get("data-item-slug")
+
+                slug = validate_slug(react_comp.attributes.get("data-item-slug"))
                 if not slug:
                     continue
                 
@@ -307,6 +334,12 @@ class LetterboxdScraper:
         return parse_film_page(tree, slug)
     
     def _parse_rating(self, span) -> float | None:
+        """
+        Parse rating from span element with class like 'rated-8' (representing 4.0 stars).
+
+        Returns rating float or None if parsing fails.
+        Logs warning if unexpected format detected to catch Letterboxd HTML changes.
+        """
         classes = span.attributes.get("class", "")
         for cls in classes.split():
             if cls.startswith("rated-"):
@@ -314,8 +347,18 @@ class LetterboxdScraper:
                     val = int(cls.replace("rated-", "")) / 2
                     if 0.5 <= val <= 5.0:
                         return val
-                except ValueError:
-                    pass
+                    else:
+                        # Rating outside expected range - log for investigation
+                        logger.warning(f"Rating value outside range [0.5-5.0]: {val} from class '{cls}'")
+                        return None
+                except ValueError as e:
+                    # Non-integer after "rated-" prefix - unexpected format
+                    logger.warning(f"Unexpected rating format in class '{cls}': {e}")
+                    return None
+
+        # No 'rated-*' class found - might indicate HTML structure change
+        if classes:
+            logger.debug(f"No 'rated-*' class found in span classes: {classes}")
         return None
     
     def scrape_following(self, username: str, limit: int = 100) -> list[str]:
@@ -446,14 +489,14 @@ class LetterboxdScraper:
         for item in showcase[:4]:
             react_comp = item.css_first("div.react-component")
             if react_comp:
-                slug = react_comp.attributes.get("data-film-slug")
+                slug = validate_slug(react_comp.attributes.get("data-film-slug"))
                 if slug:
                     favorites.append(slug)
                     continue
-            
+
             link = item.css_first("div[data-film-slug]")
             if link:
-                slug = link.attributes.get("data-film-slug")
+                slug = validate_slug(link.attributes.get("data-film-slug"))
                 if slug:
                     favorites.append(slug)
         
@@ -530,15 +573,15 @@ class LetterboxdScraper:
             for idx, item in enumerate(items):
                 react_comp = item.css_first("div.react-component")
                 film_slug = None
-                
+
                 if react_comp:
-                    film_slug = react_comp.attributes.get("data-film-slug")
-                
+                    film_slug = validate_slug(react_comp.attributes.get("data-film-slug"))
+
                 if not film_slug:
                     link = item.css_first("div[data-film-slug]")
                     if link:
-                        film_slug = link.attributes.get("data-film-slug")
-                
+                        film_slug = validate_slug(link.attributes.get("data-film-slug"))
+
                 if not film_slug:
                     continue
                 
@@ -570,16 +613,19 @@ class LetterboxdScraper:
 
 
 class AsyncLetterboxdScraper:
-    """Async scraper for parallel metadata fetching."""
-    
+    """Async scraper for parallel metadata fetching with coordinated rate limiting."""
+
     BASE = "https://letterboxd.com"
     DEFAULT_RETRY_AFTER = 60
     MAX_RETRIES = 3
-    
+
     def __init__(self, delay: float = 0.2, max_concurrent: int = 5):
         self.delay = delay
         self.semaphore = asyncio.Semaphore(max_concurrent)
         self.client = None
+        # Coordinated rate limiting: when one task hits 429, all tasks pause
+        self._rate_limit_event = asyncio.Event()
+        self._rate_limit_event.set()  # Start in "not rate limited" state
     
     async def __aenter__(self):
         """Async context manager entry."""
@@ -662,24 +708,32 @@ class AsyncLetterboxdScraper:
         return successful
     
     async def _scrape_film_async(self, client: httpx.AsyncClient, slug: str) -> FilmMetadata | None:
-        """Scrape a single film asynchronously with proper retry logic."""
+        """Scrape a single film asynchronously with proper retry logic and coordinated rate limiting."""
         async with self.semaphore:
             await asyncio.sleep(self.delay)
-            
+
             for attempt in range(self.MAX_RETRIES):
+                # Wait if globally rate limited by another task
+                await self._rate_limit_event.wait()
+
                 try:
                     resp = await client.get(f"{self.BASE}/film/{slug}/")
-                    
+
                     if resp.status_code == 404:
                         logger.debug(f"Film not found: {slug}")
                         return None
-                    
+
                     if resp.status_code == 429:
                         retry_after = int(resp.headers.get("Retry-After", self.DEFAULT_RETRY_AFTER))
-                        logger.warning(f"Rate limited on {slug}, waiting {retry_after}s (attempt {attempt + 1}/{self.MAX_RETRIES})")
+                        logger.warning(f"Rate limited on {slug}, pausing ALL tasks for {retry_after}s (attempt {attempt + 1}/{self.MAX_RETRIES})")
+
+                        # Pause all concurrent tasks
+                        self._rate_limit_event.clear()
                         await asyncio.sleep(retry_after)
+                        # Resume all tasks
+                        self._rate_limit_event.set()
                         continue
-                    
+
                     resp.raise_for_status()
                     tree = HTMLParser(resp.text)
                     return parse_film_page(tree, slug)
@@ -688,14 +742,14 @@ class AsyncLetterboxdScraper:
                     wait_time = 2 ** attempt
                     logger.warning(f"Timeout on {slug}, retrying in {wait_time}s (attempt {attempt + 1}/{self.MAX_RETRIES})")
                     await asyncio.sleep(wait_time)
-                    
+
                 except httpx.HTTPStatusError as e:
                     logger.error(f"HTTP {e.response.status_code} on {slug}: {e}")
                     return None
-                    
+
                 except httpx.HTTPError as e:
                     logger.error(f"Request error on {slug}: {type(e).__name__}: {e}")
                     return None
-            
+
             logger.error(f"Max retries exceeded for {slug}")
             return None
