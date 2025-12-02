@@ -159,9 +159,7 @@ class MetadataRecommender:
         min_year: int | None = None,
         max_year: int | None = None
     ) -> dict[str, list[Recommendation]]:
-        """Find unseen films from directors the user loves (parallelized)."""
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
+        """Find unseen films from directors the user loves."""
         profile = build_profile(user_films, self.films)
         seen = {f['slug'] for f in user_films}
 
@@ -171,8 +169,10 @@ class MetadataRecommender:
         if not favorite_directors:
             return {}
 
-        def process_director(director: str) -> tuple[str, list[Recommendation] | None]:
-            """Process a single director and return recommendations."""
+        gaps = {}
+
+        # Process each director (no threading - CPU-bound work where GIL prevents speedup)
+        for director in favorite_directors:
             # Find all films by this director
             director_films = []
             for slug, film in self.films.items():
@@ -191,7 +191,7 @@ class MetadataRecommender:
                     director_films.append(film)
 
             if not director_films:
-                return (director, None)
+                continue
 
             # Rank by community rating/popularity (using simple heuristic)
             # We want "essential" films, so rating count and avg rating matter
@@ -218,19 +218,8 @@ class MetadataRecommender:
                     reasons=[f"Essential {director}"]
                 ))
 
-            return (director, recs if recs else None)
-
-        # Parallelize director queries
-        gaps = {}
-        with ThreadPoolExecutor(max_workers=min(len(favorite_directors), 10)) as executor:
-            # Submit all director processing tasks
-            futures = {executor.submit(process_director, director): director for director in favorite_directors}
-
-            # Collect results as they complete
-            for future in as_completed(futures):
-                director, recs = future.result()
-                if recs:
-                    gaps[director] = recs
+            if recs:
+                gaps[director] = recs
 
         return gaps
     
@@ -659,7 +648,7 @@ class CollaborativeRecommender:
     
     def _find_neighbors(self, username: str, target_films: list[dict], k: int = 10, max_users_to_compare: int = 10000) -> list[tuple[str, float]]:
         """
-        Find k most similar users based on rating overlap using sparse matrix operations.
+        Find k most similar users based on rating overlap using vectorized sparse matrix operations.
         Uses mean-centered ratings to account for different rating scales (Pearson correlation).
         Returns list of (username, similarity_score) tuples.
 
@@ -670,6 +659,7 @@ class CollaborativeRecommender:
             max_users_to_compare: Maximum number of users to compare (for large datasets) - ignored when using sparse matrix
         """
         import numpy as np
+        from sklearn.metrics.pairwise import cosine_similarity
 
         if username not in self._user_index or self._user_matrix is None:
             return []
@@ -679,60 +669,54 @@ class CollaborativeRecommender:
         # Get target user's ratings as sparse row
         target_row = self._user_matrix[target_idx]
 
-        # Filter out users with too few common ratings
-        # Compute number of common rated films for each user
+        # Check if target has any ratings
         target_nonzero = target_row.nonzero()[1]
         if len(target_nonzero) == 0:
             return []
 
-        # Mean-center the target user's ratings
-        target_ratings = target_row.toarray().flatten()
-        target_mask = target_ratings > 0
-        target_mean = target_ratings[target_mask].mean()
-        target_centered = target_ratings.copy()
-        target_centered[target_mask] -= target_mean
+        # Mean-center all users' ratings for Pearson correlation
+        # Convert to dense for efficient row-wise operations (still faster than looping)
+        all_ratings = self._user_matrix.toarray()
 
-        # Compute similarities with all other users
-        similarities = []
+        # Compute masks and means for all users at once
+        masks = all_ratings > 0
+        row_means = np.sum(all_ratings * masks, axis=1) / np.maximum(masks.sum(axis=1), 1)
 
-        # Vectorized computation for all users at once
-        for other_idx, other_username in enumerate(self._user_index.keys()):
-            if other_username == username:
-                continue
+        # Mean-center all ratings
+        centered_ratings = all_ratings.copy()
+        for i in range(len(centered_ratings)):
+            centered_ratings[i, masks[i]] -= row_means[i]
 
-            other_row = self._user_matrix[other_idx]
-            other_ratings = other_row.toarray().flatten()
-            other_mask = other_ratings > 0
+        # Compute number of common rated films between target and all other users
+        target_mask = masks[target_idx]
+        common_counts = (masks & target_mask).sum(axis=1)
 
-            # Find common films
-            common_mask = target_mask & other_mask
-            n_common = common_mask.sum()
+        # Filter users with at least 5 common films
+        valid_users_mask = (common_counts >= 5) & (np.arange(len(all_ratings)) != target_idx)
 
-            if n_common < 5:  # Need at least 5 common films
-                continue
+        if not valid_users_mask.any():
+            return []
 
-            # Mean-center other user's ratings
-            other_mean = other_ratings[other_mask].mean()
-            other_centered = other_ratings.copy()
-            other_centered[other_mask] -= other_mean
+        # Use cosine similarity on centered ratings (equivalent to Pearson correlation)
+        # Only compute for valid users
+        target_centered = centered_ratings[target_idx:target_idx+1]  # Keep 2D shape
+        valid_centered = centered_ratings[valid_users_mask]
 
-            # Compute Pearson correlation on common films
-            numerator = (target_centered[common_mask] * other_centered[common_mask]).sum()
-            target_variance = np.sqrt((target_centered[common_mask] ** 2).sum())
-            other_variance = np.sqrt((other_centered[common_mask] ** 2).sum())
+        # Cosine similarity on mean-centered ratings = Pearson correlation
+        similarities = cosine_similarity(target_centered, valid_centered).flatten()
 
-            if target_variance == 0 or other_variance == 0:
-                continue
+        # Apply significance weighting - more common films = more reliable
+        valid_common_counts = common_counts[valid_users_mask]
+        confidence = np.minimum(valid_common_counts / 20.0, 1.0)  # Full confidence at 20+ common films
+        weighted_similarities = similarities * confidence
 
-            similarity = numerator / (target_variance * other_variance)
+        # Build result list with usernames
+        usernames = list(self._user_index.keys())
+        valid_usernames = [usernames[i] for i in np.where(valid_users_mask)[0]]
 
-            # Apply significance weighting - more common films = more reliable
-            confidence = min(n_common / 20.0, 1.0)  # Full confidence at 20+ common films
-            weighted_similarity = similarity * confidence
+        # Combine usernames and scores, sort by score
+        results = list(zip(valid_usernames, weighted_similarities))
+        results.sort(key=lambda x: x[1], reverse=True)
 
-            similarities.append((other_username, weighted_similarity))
-
-        # Sort by similarity and return top k
-        similarities.sort(key=lambda x: x[1], reverse=True)
-        return similarities[:k]
+        return results[:k]
 
