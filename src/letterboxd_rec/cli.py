@@ -73,6 +73,50 @@ def _load_all_user_films(conn, username_filter: str | None = None) -> dict[str, 
     return dict(all_user_films)
 
 
+def _load_films_with_filters(
+    conn,
+    min_year: int | None = None,
+    max_year: int | None = None,
+    min_rating: float | None = None
+) -> dict[str, dict]:
+    """
+    Load films from database with optional SQL-side filtering.
+
+    This reduces memory usage and improves performance by filtering at the database level
+    rather than loading all films into memory.
+
+    Args:
+        conn: Database connection
+        min_year: Minimum release year filter
+        max_year: Maximum release year filter
+        min_rating: Minimum average rating filter
+
+    Returns:
+        Dict mapping slug -> film dict
+    """
+    where_clauses = []
+    params = []
+
+    if min_year is not None:
+        where_clauses.append("year >= ?")
+        params.append(min_year)
+
+    if max_year is not None:
+        where_clauses.append("year <= ?")
+        params.append(max_year)
+
+    if min_rating is not None:
+        where_clauses.append("avg_rating >= ?")
+        params.append(min_rating)
+
+    query = "SELECT * FROM films"
+    if where_clauses:
+        query += " WHERE " + " AND ".join(where_clauses)
+
+    rows = conn.execute(query, params).fetchall()
+    return {r['slug']: dict(r) for r in rows}
+
+
 def _scrape_film_metadata(scraper: 'LetterboxdScraper', slugs: list[str], max_per_batch: int = 100, use_async: bool = True) -> None:
     """Helper to scrape film metadata for a list of slugs."""
     if not slugs:
@@ -172,11 +216,12 @@ def cmd_scrape(args: argparse.Namespace) -> None:
             # Start explicit transaction for atomicity
             conn.execute("BEGIN")
             try:
+                scraped_at = datetime.now().isoformat()
                 conn.executemany("""
                     INSERT OR REPLACE INTO user_films
                     (username, film_slug, rating, watched, watchlisted, liked, scraped_at)
-                    VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
-                """, [(username, i.film_slug, i.rating, i.watched, i.watchlisted, i.liked)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, [(username, i.film_slug, i.rating, i.watched, i.watchlisted, i.liked, scraped_at)
                       for i in interactions])
 
                 existing = {r['slug'] for r in conn.execute("SELECT slug FROM films")}
@@ -287,19 +332,22 @@ def cmd_discover(args: argparse.Namespace) -> None:
                 if not args.username:
                     print("--username is required for 'following' source")
                     return
-                usernames = scraper.scrape_following(args.username, limit=batch_size)
+                username = _validate_username(args.username)
+                usernames = scraper.scrape_following(username, limit=batch_size)
             elif args.source == 'followers':
                 if not args.username:
                     print("--username is required for 'followers' source")
                     return
-                usernames = scraper.scrape_followers(args.username, limit=batch_size)
+                username = _validate_username(args.username)
+                usernames = scraper.scrape_followers(username, limit=batch_size)
             elif args.source == 'popular':
                 usernames = scraper.scrape_popular_members(limit=batch_size)
             elif args.source == 'film':
                 if not args.film_slug:
                     print("--film-slug is required for 'film' source")
                     return
-                usernames = scraper.scrape_film_fans(args.film_slug, limit=batch_size)
+                film_slug = _validate_slug(args.film_slug)
+                usernames = scraper.scrape_film_fans(film_slug, limit=batch_size)
             else:
                 print(f"Unknown source: {args.source}")
                 return
@@ -342,11 +390,12 @@ def cmd_discover(args: argparse.Namespace) -> None:
                 with get_db() as conn:
                     conn.execute("BEGIN")
                     try:
+                        scraped_at = datetime.now().isoformat()
                         conn.executemany("""
                             INSERT OR REPLACE INTO user_films
                             (username, film_slug, rating, watched, watchlisted, liked, scraped_at)
-                            VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
-                        """, [(username, i.film_slug, i.rating, i.watched, i.watchlisted, i.liked)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """, [(username, i.film_slug, i.rating, i.watched, i.watchlisted, i.liked, scraped_at)
                               for i in interactions])
 
                         existing_film_slugs = {r['slug'] for r in conn.execute("SELECT slug FROM films")}
@@ -373,19 +422,25 @@ def cmd_recommend(args: argparse.Namespace) -> None:
     """Generate recommendations."""
     # Validate username
     username = _validate_username(args.username)
-    
+
     with get_db() as conn:
         user_films = [dict(r) for r in conn.execute("""
             SELECT film_slug as slug, rating, watched, watchlisted, liked
             FROM user_films WHERE username = ?
         """, (username,))]
-        
+
         if not user_films:
             print(f"No data for '{username}'. Run: python main.py scrape {username}")
             return
-        
-        # Load film metadata (needed by both strategies)
-        all_films = {r['slug']: dict(r) for r in conn.execute("SELECT * FROM films")}
+
+        # Load film metadata with SQL-side filtering for better performance
+        # This avoids loading all films into memory when filters are specified
+        all_films = _load_films_with_filters(
+            conn,
+            min_year=args.min_year,
+            max_year=args.max_year,
+            min_rating=args.min_rating
+        )
         
         # Check for missing metadata
         seen_slugs = {f['slug'] for f in user_films}
@@ -417,24 +472,51 @@ def cmd_recommend(args: argparse.Namespace) -> None:
                 username,
                 n=args.limit * 2,
                 min_year=args.min_year,
-                max_year=args.max_year
+                max_year=args.max_year,
+                genres=args.genres,
+                exclude_genres=args.exclude_genres
             )
             
-            # Merge by rank (Borda count style)
+            # Merge using normalized scores to preserve score magnitude
+            # Normalize scores from each strategy to [0, 1] range for fair combination
             scores = {}
             reasons_map = {}
-            
-            for rank, r in enumerate(meta_recs):
-                scores[r.slug] = scores.get(r.slug, 0) + (len(meta_recs) - rank)
-                if r.slug not in reasons_map:
-                    reasons_map[r.slug] = []
-                reasons_map[r.slug].extend(r.reasons)
 
-            for rank, r in enumerate(collab_recs):
-                scores[r.slug] = scores.get(r.slug, 0) + (len(collab_recs) - rank)
-                if r.slug not in reasons_map:
-                    reasons_map[r.slug] = []
-                reasons_map[r.slug].extend(r.reasons)
+            # Normalize metadata scores
+            meta_scores = {r.slug: r.score for r in meta_recs}
+            if meta_scores:
+                max_meta_score = max(meta_scores.values())
+                min_meta_score = min(meta_scores.values())
+                score_range = max_meta_score - min_meta_score
+
+                for r in meta_recs:
+                    # Normalize to [0, 1] and weight by 0.5
+                    if score_range > 0:
+                        normalized = (r.score - min_meta_score) / score_range
+                    else:
+                        normalized = 1.0
+                    scores[r.slug] = normalized * 0.5
+                    if r.slug not in reasons_map:
+                        reasons_map[r.slug] = []
+                    reasons_map[r.slug].extend(r.reasons)
+
+            # Normalize collaborative scores
+            collab_scores = {r.slug: r.score for r in collab_recs}
+            if collab_scores:
+                max_collab_score = max(collab_scores.values())
+                min_collab_score = min(collab_scores.values())
+                score_range = max_collab_score - min_collab_score
+
+                for r in collab_recs:
+                    # Normalize to [0, 1] and weight by 0.5
+                    if score_range > 0:
+                        normalized = (r.score - min_collab_score) / score_range
+                    else:
+                        normalized = 1.0
+                    scores[r.slug] = scores.get(r.slug, 0) + normalized * 0.5
+                    if r.slug not in reasons_map:
+                        reasons_map[r.slug] = []
+                    reasons_map[r.slug].extend(r.reasons)
             
             # Build final recommendations
             merged = sorted(scores.items(), key=lambda x: -x[1])[:args.limit]
@@ -461,7 +543,9 @@ def cmd_recommend(args: argparse.Namespace) -> None:
                 username,
                 n=args.limit,
                 min_year=args.min_year,
-                max_year=args.max_year
+                max_year=args.max_year,
+                genres=args.genres,
+                exclude_genres=args.exclude_genres
             )
         else:
             # Metadata-based (default)
@@ -650,20 +734,23 @@ def cmd_import(args: argparse.Namespace) -> None:
 
 def cmd_profile(args: argparse.Namespace) -> None:
     """Show user's preference profile."""
+    # Validate username
+    username = _validate_username(args.username)
+
     with get_db() as conn:
         user_films = [dict(r) for r in conn.execute("""
             SELECT film_slug as slug, rating, watched, watchlisted, liked
             FROM user_films WHERE username = ?
-        """, (args.username,))]
+        """, (username,))]
         all_films = {r['slug']: dict(r) for r in conn.execute("SELECT * FROM films")}
     
     if not user_films:
-        print(f"No data for '{args.username}'. Run: python main.py scrape {args.username}")
+        print(f"No data for '{username}'. Run: python main.py scrape {username}")
         return
-    
-    profile = build_profile(user_films, all_films, username=args.username)
-    
-    print(f"\nProfile for {args.username}")
+
+    profile = build_profile(user_films, all_films, username=username)
+
+    print(f"\nProfile for {username}")
     print(f"  Films: {profile.n_films} ({profile.n_rated} rated, {profile.n_liked} liked)")
     if profile.avg_liked_rating:
         print(f"  Average rating: {profile.avg_liked_rating:.2f}★")
@@ -719,31 +806,34 @@ def cmd_similar(args: argparse.Namespace) -> None:
 
 def cmd_triage(args: argparse.Namespace) -> None:
     """Rank user's watchlist by predicted enjoyment."""
+    # Validate username
+    username = _validate_username(args.username)
+
     with get_db() as conn:
         user_films = [dict(r) for r in conn.execute("""
             SELECT film_slug as slug, rating, watched, watchlisted, liked
             FROM user_films WHERE username = ?
-        """, (args.username,))]
-        
+        """, (username,))]
+
         watchlist = [r['film_slug'] for r in conn.execute("""
-            SELECT film_slug FROM user_films 
+            SELECT film_slug FROM user_films
             WHERE username = ? AND watchlisted = 1
-        """, (args.username,))]
+        """, (username,))]
         
         all_films = {r['slug']: dict(r) for r in conn.execute("SELECT * FROM films")}
     
     if not user_films:
-        print(f"No data for '{args.username}'. Run: python main.py scrape {args.username}")
+        print(f"No data for '{username}'. Run: python main.py scrape {username}")
         return
-    
+
     if not watchlist:
-        print(f"No watchlist data for '{args.username}'.")
+        print(f"No watchlist data for '{username}'.")
         return
-    
+
     recommender = MetadataRecommender(list(all_films.values()))
     recs = recommender.recommend_from_candidates(user_films, watchlist, n=args.limit)
-    
-    print(f"\nWatchlist Triage for {args.username} (Top {len(recs)}):")
+
+    print(f"\nWatchlist Triage for {username} (Top {len(recs)}):")
     for i, r in enumerate(recs, 1):
         print(f"{i}. {r.title} ({r.year}) - Score: {r.score:.1f}")
         print(f"   Why: {', '.join(r.reasons)}")
@@ -751,18 +841,21 @@ def cmd_triage(args: argparse.Namespace) -> None:
 
 def cmd_gaps(args: argparse.Namespace) -> None:
     """Find gaps in filmography of favorite directors."""
+    # Validate username
+    username = _validate_username(args.username)
+
     with get_db() as conn:
         user_films = [dict(r) for r in conn.execute("""
             SELECT film_slug as slug, rating, watched, watchlisted, liked
             FROM user_films WHERE username = ?
-        """, (args.username,))]
+        """, (username,))]
         
         all_films = {r['slug']: dict(r) for r in conn.execute("SELECT * FROM films")}
     
     if not user_films:
-        print(f"No data for '{args.username}'. Run: python main.py scrape {args.username}")
+        print(f"No data for '{username}'. Run: python main.py scrape {username}")
         return
-    
+
     recommender = MetadataRecommender(list(all_films.values()))
     gaps = recommender.find_gaps(
         user_films,
@@ -771,12 +864,12 @@ def cmd_gaps(args: argparse.Namespace) -> None:
         min_year=args.min_year,
         max_year=args.max_year
     )
-    
+
     if not gaps:
-        print(f"No gaps found for {args.username}. Try lowering --min-score.")
+        print(f"No gaps found for {username}. Try lowering --min-score.")
         return
-    
-    print(f"\nFilmography Gaps for {args.username}:")
+
+    print(f"\nFilmography Gaps for {username}:")
     for director, recs in sorted(gaps.items(), key=lambda x: -len(x[1])):
         print(f"\n{director}:")
         for r in recs:
@@ -823,8 +916,8 @@ def main():
     rec_parser.add_argument("--limit", type=int, default=20, help="Number of recommendations")
     rec_parser.add_argument("--min-year", type=int, help="Minimum release year")
     rec_parser.add_argument("--max-year", type=int, help="Maximum release year")
-    rec_parser.add_argument("--genres", nargs="+", help="Filter by genres (metadata only)")
-    rec_parser.add_argument("--exclude-genres", nargs="+", help="Exclude genres (metadata only)")
+    rec_parser.add_argument("--genres", nargs="+", help="Filter by genres")
+    rec_parser.add_argument("--exclude-genres", nargs="+", help="Exclude genres")
     rec_parser.add_argument("--min-rating", type=float, help="Minimum community rating (metadata only)")
     rec_parser.add_argument("--diversity", action="store_true", help="Enable diversity mode (metadata only)")
     rec_parser.add_argument("--max-per-director", type=int, default=2, help="Max films per director (diversity mode)")

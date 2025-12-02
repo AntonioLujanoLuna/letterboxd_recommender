@@ -563,6 +563,8 @@ class CollaborativeRecommender:
         min_neighbors: int = 3,
         min_year: int | None = None,
         max_year: int | None = None,
+        genres: list[str] | None = None,
+        exclude_genres: list[str] | None = None,
     ) -> list[Recommendation]:
         """Generate collaborative recommendations."""
         
@@ -592,13 +594,23 @@ class CollaborativeRecommender:
                 if slug in seen:
                     continue
                 
-                # Apply year filters if metadata available
+                # Apply filters if metadata available
                 if self.films and slug in self.films:
-                    year = self.films[slug].get('year')
+                    film = self.films[slug]
+                    year = film.get('year')
                     if min_year and year and year < min_year:
                         continue
                     if max_year and year and year > max_year:
                         continue
+
+                    # Apply genre filters
+                    film_genres = load_json(film.get('genres'))
+                    if genres:
+                        if not any(g.lower() in [fg.lower() for fg in film_genres] for g in genres):
+                            continue
+                    if exclude_genres:
+                        if any(g.lower() in [fg.lower() for fg in film_genres] for g in exclude_genres):
+                            continue
                 
                 rating = film.get('rating')
                 liked = film.get('liked', False)
@@ -721,6 +733,6 @@ class CollaborativeRecommender:
             similarities.append((other_username, weighted_similarity))
 
         # Sort by similarity and return top k
-        similarities.sort(key=lambda x: -x[1], reverse=False)
+        similarities.sort(key=lambda x: x[1], reverse=True)
         return similarities[:k]
 

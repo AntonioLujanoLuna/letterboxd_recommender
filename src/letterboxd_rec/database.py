@@ -91,6 +91,10 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_user_watchlisted ON user_films(username, watchlisted);
             CREATE INDEX IF NOT EXISTS idx_user_rating ON user_films(username, rating);
 
+            -- Covering indexes for common film filter patterns (year + rating)
+            CREATE INDEX IF NOT EXISTS idx_film_year_rating ON films(year, avg_rating);
+            CREATE INDEX IF NOT EXISTS idx_film_rating ON films(avg_rating);
+
             CREATE INDEX IF NOT EXISTS idx_fd_director ON film_directors(director);
             CREATE INDEX IF NOT EXISTS idx_fg_genre ON film_genres(genre);
             CREATE INDEX IF NOT EXISTS idx_fc_actor ON film_cast(actor);
@@ -189,6 +193,8 @@ def _get_thread_connection():
         if thread_id not in _connection_pool:
             conn = sqlite3.connect(DB_PATH, check_same_thread=False)
             conn.row_factory = sqlite3.Row
+            # Set busy timeout to handle lock contention (5 seconds)
+            conn.execute("PRAGMA busy_timeout = 5000")
             _connection_pool[thread_id] = conn
             logger.debug(f"Created new DB connection for thread {thread_id}")
 
@@ -235,7 +241,7 @@ def load_json(val):
     try:
         return json.loads(val)
     except (json.JSONDecodeError, TypeError) as e:
-        logger.debug(f"Failed to parse JSON '{val[:50]}...': {e}")
+        logger.warning(f"Failed to parse JSON '{val[:50]}...': {e}")
         return []
 
 

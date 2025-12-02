@@ -6,7 +6,6 @@ from selectolax.parser import HTMLParser
 from dataclasses import dataclass
 from tqdm import tqdm
 import asyncio
-from .utils import retry_with_backoff, async_retry_with_backoff
 
 logger = logging.getLogger(__name__)
 
@@ -598,18 +597,24 @@ class AsyncLetterboxdScraper:
         return False
     
     async def scrape_films_batch(self, slugs: list[str]) -> list[FilmMetadata]:
-        """Scrape multiple films concurrently."""
-        if not self.client:
-            # If not used as context manager, create temporary client
-            async with httpx.AsyncClient(
-                headers={"User-Agent": "Mozilla/5.0 (compatible; letterboxd-rec/1.0)"},
-                follow_redirects=True,
-                timeout=30.0
-            ) as client:
-                return await self._scrape_batch_with_client(client, slugs)
-        else:
+        """
+        Scrape multiple films concurrently.
+
+        This method can be called either:
+        1. With the async context manager: async with AsyncLetterboxdScraper() as scraper
+        2. Standalone (creates and cleans up a temporary client automatically)
+        """
+        if self.client:
             # Use existing client from context manager
             return await self._scrape_batch_with_client(self.client, slugs)
+
+        # Create temporary client - async with ensures cleanup even on exceptions
+        async with httpx.AsyncClient(
+            headers={"User-Agent": "Mozilla/5.0 (compatible; letterboxd-rec/1.0)"},
+            follow_redirects=True,
+            timeout=30.0
+        ) as temp_client:
+            return await self._scrape_batch_with_client(temp_client, slugs)
     
     async def _scrape_batch_with_client(self, client: httpx.AsyncClient, slugs: list[str]) -> list[FilmMetadata]:
         """
