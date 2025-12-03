@@ -4,7 +4,11 @@ import logging
 from collections import defaultdict
 from datetime import datetime, timedelta
 
-from .database import init_db, get_db, load_json, load_user_lists, parse_timestamp_naive
+from .database import (
+    init_db, get_db, load_json, load_user_lists, parse_timestamp_naive,
+    get_discovery_source, update_discovery_source, add_pending_users,
+    get_pending_users, remove_pending_user, get_pending_queue_stats
+)
 from .scraper import LetterboxdScraper
 from .recommender import MetadataRecommender, CollaborativeRecommender, Recommendation
 from .profile import build_profile
@@ -289,84 +293,192 @@ def cmd_scrape(args: argparse.Namespace) -> None:
 
 
 def cmd_discover(args: argparse.Namespace) -> None:
-    """Discover and scrape other users."""
+    """Discover and scrape other users with caching and pending queue support."""
     init_db()
     scraper = LetterboxdScraper(delay=1.0)
-    
+
     try:
-        # Get existing users
-        with get_db() as conn:
-            existing_users = {r['username'] for r in conn.execute("SELECT DISTINCT username FROM user_films")}
-        
-        all_discovered = []
-        max_attempts = 5
-        attempts = 0
-        
-        print(f"Target: {args.limit} new users (have {len(existing_users)} existing)")
-        
-        while len(all_discovered) < args.limit and attempts < max_attempts:
-            attempts += 1
-            batch_size = args.limit * (attempts + 1)
-            
-            # Discover users based on source
-            if args.source == 'following':
-                if not args.username:
-                    print("--username is required for 'following' source")
-                    return
-                username = _validate_username(args.username)
-                usernames = scraper.scrape_following(username, limit=batch_size)
-            elif args.source == 'followers':
-                if not args.username:
-                    print("--username is required for 'followers' source")
-                    return
-                username = _validate_username(args.username)
-                usernames = scraper.scrape_followers(username, limit=batch_size)
-            elif args.source == 'popular':
-                usernames = scraper.scrape_popular_members(limit=batch_size)
-            elif args.source == 'film':
-                if not args.film_slug:
-                    print("--film-slug is required for 'film' source")
-                    return
-                film_slug = _validate_slug(args.film_slug)
-                usernames = scraper.scrape_film_fans(film_slug, limit=batch_size)
-            else:
-                print(f"Unknown source: {args.source}")
+        # Priority mapping for different sources
+        PRIORITY_MAP = {
+            'film_reviews': 100,
+            'followers': 80,
+            'following': 80,
+            'popular': 70,
+            'film': 50,
+        }
+
+        # Check if we're in continue mode (drain pending queue only)
+        continue_mode = getattr(args, 'continue_mode', False)
+        source_refresh_days = getattr(args, 'source_refresh_days', 7)
+
+        if continue_mode:
+            # Drain pending queue only
+            queue_stats = get_pending_queue_stats()
+            print(f"\nPending queue stats:")
+            print(f"  Total pending users: {queue_stats['total']}")
+            if queue_stats['breakdown']:
+                print(f"  By source type:")
+                for source_type, count in queue_stats['breakdown'].items():
+                    print(f"    {source_type}: {count}")
+
+            if queue_stats['total'] == 0:
+                print("\nNo pending users to scrape!")
                 return
-            
-            # Filter to new users only
-            new_usernames = [u for u in usernames if u not in existing_users and u not in all_discovered]
-            all_discovered.extend(new_usernames)
-            
-            print(f"  Attempt {attempts}: found {len(usernames)} users, {len(new_usernames)} new")
-            
-            if len(usernames) < batch_size:
-                break
-            
-            if len(all_discovered) >= args.limit:
-                break
-        
-        new_usernames = all_discovered[:args.limit]
-        
-        if not new_usernames:
-            print(f"No new users found! All discovered users already in database.")
-            return
+
+            pending = get_pending_users(limit=args.limit)
+            usernames_to_scrape = [p['username'] for p in pending]
+            print(f"\nProcessing {len(usernames_to_scrape)} users from pending queue...")
+
+        else:
+            # Normal discovery mode with caching
+            source = args.source
+
+            if not source:
+                print("Error: source is required unless using --continue")
+                return
+
+            # Determine source_id based on source type
+            if source in ('following', 'followers'):
+                if not args.username:
+                    print(f"--username is required for '{source}' source")
+                    return
+                source_id = _validate_username(args.username)
+            elif source in ('film', 'film_reviews'):
+                if not args.film_slug:
+                    print(f"--film-slug is required for '{source}' source")
+                    return
+                source_id = _validate_slug(args.film_slug)
+            elif source == 'popular':
+                source_id = 'members'  # Popular members endpoint
+            else:
+                print(f"Unknown source: {source}")
+                return
+
+            # Check for cached discovery source
+            cached_source = get_discovery_source(source, source_id)
+            start_page = 1
+
+            if cached_source:
+                scraped_at = parse_timestamp_naive(cached_source['scraped_at'])
+                age_days = (datetime.now() - scraped_at).days
+
+                if age_days < source_refresh_days:
+                    # Resume from last page
+                    start_page = cached_source['last_page_scraped'] + 1
+                    print(f"Resuming {source}:{source_id} from page {start_page} (last scraped {age_days} days ago)")
+                else:
+                    print(f"Re-crawling {source}:{source_id} from page 1 (stale: {age_days} days > {source_refresh_days} days)")
+
+            # Discover users
+            print(f"Discovering users from {source}:{source_id}...")
+            all_discovered = []
+            page = start_page
+            priority = PRIORITY_MAP.get(source, 50)
+            min_films = getattr(args, 'min_films', 50)
+
+            # Calculate how many to discover (more than limit to account for duplicates)
+            discover_limit = args.limit * 3
+
+            # Apply activity pre-filtering
+            filtered_count = 0
+            activity_checked = 0
+
+            while len(all_discovered) < discover_limit:
+                # Get page of users based on source
+                if source == 'following':
+                    usernames = scraper.scrape_following(source_id, limit=page * 50)
+                    usernames = usernames[(page-1)*50:page*50] if len(usernames) > (page-1)*50 else []
+                elif source == 'followers':
+                    usernames = scraper.scrape_followers(source_id, limit=page * 50)
+                    usernames = usernames[(page-1)*50:page*50] if len(usernames) > (page-1)*50 else []
+                elif source == 'popular':
+                    usernames = scraper.scrape_popular_members(limit=page * 50)
+                    usernames = usernames[(page-1)*50:page*50] if len(usernames) > (page-1)*50 else []
+                elif source == 'film':
+                    usernames = scraper.scrape_film_fans(source_id, limit=page * 50)
+                    usernames = usernames[(page-1)*50:page*50] if len(usernames) > (page-1)*50 else []
+                elif source == 'film_reviews':
+                    # Get reviewers (returns list of dicts)
+                    reviewers = scraper.scrape_film_reviewers(source_id, limit=page * 50)
+                    reviewers = reviewers[(page-1)*50:page*50] if len(reviewers) > (page-1)*50 else []
+                    usernames = [r['username'] for r in reviewers]
+                else:
+                    break
+
+                if not usernames:
+                    break
+
+                # Apply activity pre-filtering for all sources
+                filtered_usernames = []
+                for username in usernames:
+                    activity = scraper.check_user_activity(username)
+                    activity_checked += 1
+
+                    if not activity:
+                        logger.debug(f"Skipping {username} (profile not accessible)")
+                        filtered_count += 1
+                        continue
+
+                    # Filter by minimum film count
+                    if activity['film_count'] < min_films:
+                        logger.debug(f"Skipping {username} (only {activity['film_count']} films < {min_films})")
+                        filtered_count += 1
+                        continue
+
+                    # Require ratings (they actually rate, not just log)
+                    if not activity['has_ratings']:
+                        logger.debug(f"Skipping {username} (no ratings)")
+                        filtered_count += 1
+                        continue
+
+                    filtered_usernames.append(username)
+
+                all_discovered.extend(filtered_usernames)
+                page += 1
+
+                print(f"  Page {page-1}: found {len(usernames)} users, {len(filtered_usernames)} passed filters (total: {len(all_discovered)})")
+
+            print(f"\nActivity filtering: {activity_checked} checked, {filtered_count} filtered out, {len(all_discovered)} passed")
+
+            # Add discovered users to pending queue
+            new_pending = add_pending_users(all_discovered, source, source_id, priority)
+            print(f"Added {new_pending} new users to pending queue")
+
+            # Update discovery source cache
+            update_discovery_source(source, source_id, page - 1, len(all_discovered))
+
+            # Now get users to scrape from pending queue
+            pending = get_pending_users(limit=args.limit)
+            usernames_to_scrape = [p['username'] for p in pending]
+
+            if not usernames_to_scrape:
+                print("\nNo new users to scrape from pending queue!")
+                return
+
+            print(f"\nScraping {len(usernames_to_scrape)} users from pending queue...")
 
         # Check for dry-run mode
         dry_run = getattr(args, 'dry_run', False)
 
         if dry_run:
-            print(f"\n[DRY RUN] Would scrape {len(new_usernames)} new users:")
-            for i, username in enumerate(new_usernames, 1):
+            print(f"\n[DRY RUN] Would scrape {len(usernames_to_scrape)} users:")
+            for i, username in enumerate(usernames_to_scrape, 1):
                 print(f"  {i}. {username}")
             print(f"\nTo actually scrape these users, run without --dry-run flag")
             return
 
-        print(f"\nScraping {len(new_usernames)} new users...")
-
         # Scrape each user
-        for username in tqdm(new_usernames, desc="Users"):
+        with get_db() as conn:
+            existing_film_slugs = {r['slug'] for r in conn.execute("SELECT slug FROM films")}
+
+        for username in tqdm(usernames_to_scrape, desc="Users"):
             try:
                 interactions = scraper.scrape_user(username)
+
+                if not interactions:
+                    logger.warning(f"No interactions found for {username}")
+                    remove_pending_user(username)
+                    continue
 
                 with get_db() as conn:
                     scraped_at = datetime.now().isoformat()
@@ -377,18 +489,29 @@ def cmd_discover(args: argparse.Namespace) -> None:
                     """, [(username, i.film_slug, i.rating, i.watched, i.watchlisted, i.liked, scraped_at)
                           for i in interactions])
 
-                    existing_film_slugs = {r['slug'] for r in conn.execute("SELECT slug FROM films")}
+                    existing_film_slugs.update(
+                        r['slug'] for r in conn.execute("SELECT slug FROM films")
+                    )
 
-                existing_users.add(username)
-                
+                # Remove from pending queue after successful scrape
+                remove_pending_user(username)
+
+                # Scrape missing film metadata
                 new_slugs = [i.film_slug for i in interactions if i.film_slug not in existing_film_slugs]
                 _scrape_film_metadata(scraper, new_slugs, max_per_batch=100)
-                
+                existing_film_slugs.update(new_slugs)
+
             except Exception as e:
                 logger.error(f"Error scraping {username}: {e}")
-        
-        print(f"\nDone! Scraped {len(new_usernames)} new users.")
-        
+
+        print(f"\nDone! Scraped {len(usernames_to_scrape)} users.")
+
+        # Show remaining pending queue stats
+        queue_stats = get_pending_queue_stats()
+        if queue_stats['total'] > 0:
+            print(f"\nRemaining in pending queue: {queue_stats['total']} users")
+            print("Run with --continue to scrape more from the queue")
+
     finally:
         scraper.close()
 
@@ -877,14 +1000,21 @@ def main():
     
     # Discover command
     discover_parser = subparsers.add_parser("discover", help="Discover and scrape other users")
-    discover_parser.add_argument("source", 
-                                  choices=['following', 'followers', 'popular', 'film'], 
-                                  help="Source for user discovery")
+    discover_parser.add_argument("source",
+                                  nargs='?',
+                                  choices=['following', 'followers', 'popular', 'film', 'film_reviews'],
+                                  help="Source for user discovery (optional with --continue)")
     discover_parser.add_argument("--username", help="Username (for following/followers)")
-    discover_parser.add_argument("--film-slug", help="Film slug (for film source, e.g., 'perfect-blue')")
-    discover_parser.add_argument("--limit", type=int, default=50, help="Number of NEW users to scrape")
+    discover_parser.add_argument("--film-slug", help="Film slug (for film/film_reviews source, e.g., 'perfect-blue')")
+    discover_parser.add_argument("--limit", type=int, default=50, help="Number of users to scrape")
     discover_parser.add_argument("--dry-run", action="store_true",
                                   help="Show which users would be scraped without actually scraping")
+    discover_parser.add_argument("--continue", dest="continue_mode", action="store_true",
+                                  help="Continue scraping from pending user queue without discovering new users")
+    discover_parser.add_argument("--source-refresh-days", type=int, default=7,
+                                  help="Days before re-crawling a source from page 1 (default: 7)")
+    discover_parser.add_argument("--min-films", type=int, default=50,
+                                  help="Minimum film count for activity pre-filtering (default: 50)")
     discover_parser.set_defaults(func=cmd_discover)
     
     # Recommend command

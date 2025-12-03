@@ -33,7 +33,7 @@ class UserProfile:
     n_rated: int = 0
     n_liked: int = 0
     avg_liked_rating: float | None = None
-    
+
     genres: dict[str, float] = field(default_factory=dict)
     directors: dict[str, float] = field(default_factory=dict)
     actors: dict[str, float] = field(default_factory=dict)
@@ -44,6 +44,17 @@ class UserProfile:
     writers: dict[str, float] = field(default_factory=dict)
     cinematographers: dict[str, float] = field(default_factory=dict)
     composers: dict[str, float] = field(default_factory=dict)
+
+    # Observation counts for confidence weighting
+    genre_counts: dict[str, int] = field(default_factory=dict)
+    director_counts: dict[str, int] = field(default_factory=dict)
+    actor_counts: dict[str, int] = field(default_factory=dict)
+    theme_counts: dict[str, int] = field(default_factory=dict)
+    country_counts: dict[str, int] = field(default_factory=dict)
+    language_counts: dict[str, int] = field(default_factory=dict)
+    writer_counts: dict[str, int] = field(default_factory=dict)
+    cinematographer_counts: dict[str, int] = field(default_factory=dict)
+    composer_counts: dict[str, int] = field(default_factory=dict)
 
 
 def _normalize_scores(scores: dict, counts: dict, exponent: float = NORM_EXPONENT_DEFAULT) -> dict:
@@ -200,6 +211,17 @@ def build_profile(
     profile.writers = _normalize_scores(scores['writer'], counts['writer'])
     profile.cinematographers = _normalize_scores(scores['cinematographer'], counts['cinematographer'])
     profile.composers = _normalize_scores(scores['composer'], counts['composer'])
+
+    # Store observation counts for confidence weighting
+    profile.genre_counts = dict(counts['genre'])
+    profile.director_counts = dict(counts['director'])
+    profile.actor_counts = dict(counts['actor'])
+    profile.theme_counts = dict(counts['theme'])
+    profile.country_counts = dict(counts['country'])
+    profile.language_counts = dict(counts['language'])
+    profile.writer_counts = dict(counts['writer'])
+    profile.cinematographer_counts = dict(counts['cinematographer'])
+    profile.composer_counts = dict(counts['composer'])
     
     # Aggregate counts
     profile.n_films = len(user_films)

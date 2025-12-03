@@ -452,17 +452,17 @@ class LetterboxdScraper:
         """Scrape users who are fans of a specific film."""
         usernames = []
         page = 1
-        
+
         logger.info(f"Scraping fans of {slug}...")
         while len(usernames) < limit:
             tree = self._get(f"{self.BASE}/film/{slug}/fans/page/{page}/")
             if not tree:
                 break
-            
+
             links = tree.css("a.name")
             if not links:
                 break
-            
+
             for link in links:
                 href = link.attributes.get("href", "")
                 if href.startswith("/") and href.endswith("/"):
@@ -471,11 +471,116 @@ class LetterboxdScraper:
                         usernames.append(user)
                         if len(usernames) >= limit:
                             break
-            
+
             page += 1
-        
+
         logger.info(f"  Found {len(usernames)} fans of {slug}")
         return usernames
+
+    def scrape_film_reviewers(self, slug: str, limit: int = 50) -> list[dict]:
+        """
+        Scrape users who have reviewed a specific film.
+
+        Returns list of dicts with:
+        - username: str
+        - has_rating: bool (whether they showed a rating on the review)
+        - review_date: str | None (if visible)
+
+        Reviewers are higher-quality signal than fans since writing a review
+        requires more engagement.
+        """
+        reviewers = []
+        page = 1
+
+        logger.info(f"Scraping reviewers of {slug}...")
+        while len(reviewers) < limit:
+            tree = self._get(f"{self.BASE}/film/{slug}/reviews/page/{page}/")
+            if not tree:
+                break
+
+            # Reviews are in li.film-detail elements
+            review_items = tree.css("li.film-detail")
+            if not review_items:
+                break
+
+            for item in review_items:
+                # Extract username from the author link
+                author_link = item.css_first("a.context")
+                if not author_link:
+                    continue
+
+                href = author_link.attributes.get("href", "")
+                if not href.startswith("/") or not href.endswith("/"):
+                    continue
+
+                username = href.strip("/")
+                if not username:
+                    continue
+
+                # Check if they have a rating (star icons visible)
+                has_rating = item.css_first("span.rating") is not None
+
+                # Try to extract review date if visible
+                review_date = None
+                date_link = item.css_first("span._nobr a")
+                if date_link:
+                    review_date = date_link.text(strip=True)
+
+                reviewers.append({
+                    'username': username,
+                    'has_rating': has_rating,
+                    'review_date': review_date
+                })
+
+                if len(reviewers) >= limit:
+                    break
+
+            page += 1
+
+        logger.info(f"  Found {len(reviewers)} reviewers of {slug}")
+        return reviewers
+
+    def check_user_activity(self, username: str) -> dict | None:
+        """
+        Lightweight activity check by fetching just the user's profile page.
+
+        Returns dict with:
+        - film_count: int (total films logged)
+        - has_ratings: bool (whether they show rating distribution)
+        - recent_activity: bool (whether recent diary entries visible)
+
+        Returns None if profile doesn't exist or can't be accessed.
+        This is much cheaper than a full scrape (1 request vs 10+).
+        """
+        tree = self._get(f"{self.BASE}/{username}/")
+        if not tree:
+            return None
+
+        # Extract film count from stats
+        film_count = 0
+        stats_link = tree.css_first("a[href*='/films/']")
+        if stats_link:
+            # Text like "1,234 films" or "42 films"
+            text = stats_link.text(strip=True)
+            if "film" in text.lower():
+                try:
+                    # Extract just the number part
+                    count_str = text.split()[0].replace(",", "")
+                    film_count = int(count_str)
+                except (ValueError, IndexError):
+                    pass
+
+        # Check if they have a rating distribution (indicates they rate films)
+        has_ratings = tree.css_first("div.ratings-histogram-chart") is not None
+
+        # Check for recent activity (diary entries on profile)
+        recent_activity = len(tree.css("li.poster-container")) > 0
+
+        return {
+            'film_count': film_count,
+            'has_ratings': has_ratings,
+            'recent_activity': recent_activity
+        }
     
     def scrape_favorites(self, username: str) -> list[str]:
         """Scrape user's favorite films (4-film profile showcase)."""
