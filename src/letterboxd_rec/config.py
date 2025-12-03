@@ -15,6 +15,11 @@ DEFAULT_SCRAPER_DELAY = float(os.environ.get("LETTERBOXD_SCRAPER_DELAY", "1.0"))
 DEFAULT_ASYNC_DELAY = float(os.environ.get("LETTERBOXD_ASYNC_DELAY", "0.2"))
 DEFAULT_MAX_CONCURRENT = int(os.environ.get("LETTERBOXD_MAX_CONCURRENT", "5"))
 
+# Scraper Limits
+SCRAPER_MAX_CAST = 10  # Cast members to scrape per film (more than we score, for future use)
+HTTP_TIMEOUT = 30.0  # HTTP request timeout in seconds
+MAX_CONSECUTIVE_EXISTING = 20  # For incremental scraping early termination
+
 # Retry and Rate Limiting
 MAX_HTTP_RETRIES = 3
 MAX_429_RETRY_SECONDS = 300  # Maximum total time to wait for 429 responses
@@ -121,3 +126,12 @@ CONFIDENCE_MIN_SAMPLES = {
 # IDF (Inverse Document Frequency) weighting for rarity
 USE_IDF_WEIGHTING = True  # Enable IDF weighting for attributes
 IDF_DISTINCTIVE_THRESHOLD = 2.0  # IDF above this is "distinctive taste"
+
+# Profile Schema Versioning
+# Increment this when:
+# - UserProfile fields are added/removed
+# - Weight constants change (WEIGHT_*, WEIGHTS)
+# - Normalization exponents change (NORM_EXPONENT_*)
+# - List multipliers change (LIST_MULTIPLIER_*)
+# - Confidence min samples change (CONFIDENCE_MIN_SAMPLES)
+PROFILE_SCHEMA_VERSION = 1

@@ -7,6 +7,14 @@ from selectolax.parser import HTMLParser
 from dataclasses import dataclass
 from tqdm import tqdm
 import asyncio
+from .config import (
+    SCRAPER_MAX_CAST,
+    HTTP_TIMEOUT,
+    MAX_CONSECUTIVE_EXISTING,
+    MAX_HTTP_RETRIES,
+    MAX_429_RETRY_SECONDS,
+    DEFAULT_RETRY_AFTER,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -110,7 +118,7 @@ def parse_film_page(tree: HTMLParser, slug: str) -> FilmMetadata:
     genres = list(dict.fromkeys([a.text(strip=True).lower() for a in tree.css("a[href*='/films/genre/']") if a.text(strip=True)]))
 
     # Cast (top billed)
-    cast = list(dict.fromkeys([a.text(strip=True) for a in tree.css("a[href*='/actor/']")[:10] if a.text(strip=True)]))
+    cast = list(dict.fromkeys([a.text(strip=True) for a in tree.css("a[href*='/actor/']")[:SCRAPER_MAX_CAST] if a.text(strip=True)]))
 
     # Themes/tags
     themes = list(dict.fromkeys([a.text(strip=True) for a in tree.css("a[href*='/films/theme/'], a[href*='/films/mini-theme/']") if a.text(strip=True)]))
@@ -170,16 +178,15 @@ class LetterboxdScraper:
         self.client = httpx.Client(
             headers={"User-Agent": "Mozilla/5.0 (compatible; film-rec/0.1)"},
             follow_redirects=True,
-            timeout=30.0
+            timeout=HTTP_TIMEOUT
         )
         self.delay = delay
-    
-    def _get(self, url: str, max_retries: int = 3) -> HTMLParser | None:
+
+    def _get(self, url: str, max_retries: int = MAX_HTTP_RETRIES) -> HTMLParser | None:
         time.sleep(self.delay)
-        
+
         retries = 0
         total_429_wait_time = 0
-        MAX_429_WAIT_TIME = 300  # Maximum 5 minutes total waiting for 429s
         
         while retries < max_retries:
             try:
@@ -188,10 +195,10 @@ class LetterboxdScraper:
                     return None
                 
                 if resp.status_code == 429:
-                    retry_after = int(resp.headers.get("Retry-After", 60))
-                    
+                    retry_after = int(resp.headers.get("Retry-After", DEFAULT_RETRY_AFTER))
+
                     # Check if we've waited too long for 429s
-                    if total_429_wait_time + retry_after > MAX_429_WAIT_TIME:
+                    if total_429_wait_time + retry_after > MAX_429_RETRY_SECONDS:
                         logger.error(f"Max 429 wait time exceeded for {url} (waited {total_429_wait_time}s, would need {retry_after}s more)")
                         return None
                     
@@ -239,7 +246,6 @@ class LetterboxdScraper:
         logger.info(f"Scraping {username}'s films...")
         page = 1
         consecutive_existing = 0  # Track consecutive existing films for early termination
-        MAX_CONSECUTIVE_EXISTING = 20  # Stop if we see 20 consecutive existing films
 
         while True:
             tree = self._get(f"{self.BASE}/{username}/films/page/{page}/")
@@ -721,8 +727,6 @@ class AsyncLetterboxdScraper:
     """Async scraper for parallel metadata fetching with coordinated rate limiting."""
 
     BASE = "https://letterboxd.com"
-    DEFAULT_RETRY_AFTER = 60
-    MAX_RETRIES = 3
 
     def __init__(self, delay: float = 0.2, max_concurrent: int = 5):
         self.delay = delay
@@ -737,7 +741,7 @@ class AsyncLetterboxdScraper:
         self.client = httpx.AsyncClient(
             headers={"User-Agent": "Mozilla/5.0 (compatible; letterboxd-rec/1.0)"},
             follow_redirects=True,
-            timeout=30.0
+            timeout=HTTP_TIMEOUT
         )
         return self
     
@@ -763,7 +767,7 @@ class AsyncLetterboxdScraper:
         async with httpx.AsyncClient(
             headers={"User-Agent": "Mozilla/5.0 (compatible; letterboxd-rec/1.0)"},
             follow_redirects=True,
-            timeout=30.0
+            timeout=HTTP_TIMEOUT
         ) as temp_client:
             return await self._scrape_batch_with_client(temp_client, slugs)
     
@@ -817,7 +821,7 @@ class AsyncLetterboxdScraper:
         async with self.semaphore:
             await asyncio.sleep(self.delay)
 
-            for attempt in range(self.MAX_RETRIES):
+            for attempt in range(MAX_HTTP_RETRIES):
                 # Wait if globally rate limited by another task
                 await self._rate_limit_event.wait()
 
@@ -829,8 +833,8 @@ class AsyncLetterboxdScraper:
                         return None
 
                     if resp.status_code == 429:
-                        retry_after = int(resp.headers.get("Retry-After", self.DEFAULT_RETRY_AFTER))
-                        logger.warning(f"Rate limited on {slug}, pausing ALL tasks for {retry_after}s (attempt {attempt + 1}/{self.MAX_RETRIES})")
+                        retry_after = int(resp.headers.get("Retry-After", DEFAULT_RETRY_AFTER))
+                        logger.warning(f"Rate limited on {slug}, pausing ALL tasks for {retry_after}s (attempt {attempt + 1}/{MAX_HTTP_RETRIES})")
 
                         # Pause all concurrent tasks
                         self._rate_limit_event.clear()
@@ -845,7 +849,7 @@ class AsyncLetterboxdScraper:
 
                 except httpx.TimeoutException:
                     wait_time = 2 ** attempt
-                    logger.warning(f"Timeout on {slug}, retrying in {wait_time}s (attempt {attempt + 1}/{self.MAX_RETRIES})")
+                    logger.warning(f"Timeout on {slug}, retrying in {wait_time}s (attempt {attempt + 1}/{MAX_HTTP_RETRIES})")
                     await asyncio.sleep(wait_time)
 
                 except httpx.HTTPStatusError as e:

@@ -8,7 +8,7 @@ from .database import (
     init_db, get_db, load_json, load_user_lists, parse_timestamp_naive,
     get_discovery_source, update_discovery_source, add_pending_users,
     get_pending_users, remove_pending_user, get_pending_queue_stats,
-    compute_and_store_idf
+    compute_and_store_idf, populate_normalized_tables_batch
 )
 from .scraper import LetterboxdScraper
 from .recommender import MetadataRecommender, CollaborativeRecommender, Recommendation
@@ -149,7 +149,7 @@ def _scrape_film_metadata(scraper: 'LetterboxdScraper', slugs: list[str], max_pe
     if metadata_list:
         with get_db() as conn:
             conn.executemany("""
-                INSERT OR REPLACE INTO films 
+                INSERT OR REPLACE INTO films
                 (slug, title, year, directors, genres, cast, themes, runtime, avg_rating, rating_count,
                  countries, languages, writers, cinematographers, composers)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -162,12 +162,10 @@ def _scrape_film_metadata(scraper: 'LetterboxdScraper', slugs: list[str], max_pe
                 json.dumps(m.writers), json.dumps(m.cinematographers),
                 json.dumps(m.composers)
             ) for m in metadata_list])
-            
-            # Populate normalized tables for fast queries
-            from .database import populate_normalized_tables
-            for m in metadata_list:
-                populate_normalized_tables(conn, m)
-        
+
+            # Populate normalized tables for fast queries (batch operation)
+            populate_normalized_tables_batch(conn, metadata_list)
+
         logger.info(f"Saved {len(metadata_list)} films")
 
 

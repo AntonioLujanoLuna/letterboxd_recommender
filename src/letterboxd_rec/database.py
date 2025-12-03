@@ -79,7 +79,8 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS user_profiles (
                 username TEXT PRIMARY KEY,
                 profile_data TEXT,  -- JSON blob of profile stats
-                updated_at TEXT
+                updated_at TEXT,
+                schema_version INTEGER DEFAULT 0
             );
             
             -- Normalized tables for better querying
@@ -148,6 +149,7 @@ def init_db() -> None:
 
         # Migration: Add new columns to existing films table if they don't exist
         _migrate_films_table(conn)
+        _migrate_user_profiles_table(conn)
 
 
 def _migrate_films_table(conn):
@@ -155,7 +157,7 @@ def _migrate_films_table(conn):
     cursor = conn.cursor()
     cursor.execute("PRAGMA table_info(films)")
     existing_columns = {row[1] for row in cursor.fetchall()}
-    
+
     new_columns = {
         'countries': 'TEXT',
         'languages': 'TEXT',
@@ -163,7 +165,7 @@ def _migrate_films_table(conn):
         'cinematographers': 'TEXT',
         'composers': 'TEXT'
     }
-    
+
     for col_name, col_type in new_columns.items():
         if col_name not in existing_columns:
             try:
@@ -173,40 +175,117 @@ def _migrate_films_table(conn):
                 logger.warning(f"Could not add column '{col_name}': {e}")
 
 
+def _migrate_user_profiles_table(conn):
+    """Add schema_version column to user_profiles table if it doesn't exist."""
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA table_info(user_profiles)")
+    existing_columns = {row[1] for row in cursor.fetchall()}
+
+    if 'schema_version' not in existing_columns:
+        try:
+            conn.execute("ALTER TABLE user_profiles ADD COLUMN schema_version INTEGER DEFAULT 0")
+            logger.info("Added column 'schema_version' to user_profiles table")
+        except sqlite3.Error as e:
+            logger.warning(f"Could not add column 'schema_version': {e}")
+
+
 def populate_normalized_tables(conn, film_metadata):
     """
-    Populate normalized tables from film metadata.
-    
+    Populate normalized tables from film metadata for a single film.
+
+    Note: For batch operations with multiple films, prefer populate_normalized_tables_batch
+    for better performance.
+
     Args:
         conn: Database connection
         film_metadata: FilmMetadata object or dict with slug and attribute lists
     """
     slug = film_metadata.slug if hasattr(film_metadata, 'slug') else film_metadata['slug']
-    
+
     # Clear existing entries for this film
     conn.execute("DELETE FROM film_directors WHERE film_slug = ?", (slug,))
     conn.execute("DELETE FROM film_genres WHERE film_slug = ?", (slug,))
     conn.execute("DELETE FROM film_cast WHERE film_slug = ?", (slug,))
     conn.execute("DELETE FROM film_themes WHERE film_slug = ?", (slug,))
-    
+
     # Get attributes (handle both dataclass and dict)
     directors = film_metadata.directors if hasattr(film_metadata, 'directors') else load_json(film_metadata.get('directors', []))
     genres = film_metadata.genres if hasattr(film_metadata, 'genres') else load_json(film_metadata.get('genres', []))
     cast = film_metadata.cast if hasattr(film_metadata, 'cast') else load_json(film_metadata.get('cast', []))
     themes = film_metadata.themes if hasattr(film_metadata, 'themes') else load_json(film_metadata.get('themes', []))
-    
+
     # Insert into normalized tables
     for director in directors:
         conn.execute("INSERT OR IGNORE INTO film_directors (film_slug, director) VALUES (?, ?)", (slug, director))
-    
+
     for genre in genres:
         conn.execute("INSERT OR IGNORE INTO film_genres (film_slug, genre) VALUES (?, ?)", (slug, genre))
-    
+
     for actor in cast:
         conn.execute("INSERT OR IGNORE INTO film_cast (film_slug, actor) VALUES (?, ?)", (slug, actor))
-    
+
     for theme in themes:
         conn.execute("INSERT OR IGNORE INTO film_themes (film_slug, theme) VALUES (?, ?)", (slug, theme))
+
+
+def populate_normalized_tables_batch(conn, film_metadata_list: list) -> None:
+    """
+    Populate normalized tables for multiple films efficiently using batch operations.
+
+    Performs bulk DELETEs and INSERTs to minimize database round-trips.
+    Handles SQLite's parameter limit (999) by chunking large batches.
+
+    Args:
+        conn: Database connection (caller manages transaction)
+        film_metadata_list: List of FilmMetadata objects or dicts
+    """
+    if not film_metadata_list:
+        return
+
+    # Collect all slugs for batch DELETE
+    slugs = []
+    for fm in film_metadata_list:
+        slug = fm.slug if hasattr(fm, 'slug') else fm['slug']
+        slugs.append(slug)
+
+    # Batch DELETE using IN clause (SQLite supports up to 999 parameters, chunk if needed)
+    CHUNK_SIZE = 900  # Leave room for safety
+    for i in range(0, len(slugs), CHUNK_SIZE):
+        chunk = slugs[i:i + CHUNK_SIZE]
+        placeholders = ','.join('?' * len(chunk))
+        conn.execute(f"DELETE FROM film_directors WHERE film_slug IN ({placeholders})", chunk)
+        conn.execute(f"DELETE FROM film_genres WHERE film_slug IN ({placeholders})", chunk)
+        conn.execute(f"DELETE FROM film_cast WHERE film_slug IN ({placeholders})", chunk)
+        conn.execute(f"DELETE FROM film_themes WHERE film_slug IN ({placeholders})", chunk)
+
+    # Collect all inserts
+    director_rows = []
+    genre_rows = []
+    cast_rows = []
+    theme_rows = []
+
+    for fm in film_metadata_list:
+        slug = fm.slug if hasattr(fm, 'slug') else fm['slug']
+
+        directors = fm.directors if hasattr(fm, 'directors') else load_json(fm.get('directors', []))
+        genres = fm.genres if hasattr(fm, 'genres') else load_json(fm.get('genres', []))
+        cast = fm.cast if hasattr(fm, 'cast') else load_json(fm.get('cast', []))
+        themes = fm.themes if hasattr(fm, 'themes') else load_json(fm.get('themes', []))
+
+        director_rows.extend((slug, d) for d in directors)
+        genre_rows.extend((slug, g) for g in genres)
+        cast_rows.extend((slug, a) for a in cast)
+        theme_rows.extend((slug, t) for t in themes)
+
+    # Batch INSERT
+    if director_rows:
+        conn.executemany("INSERT OR IGNORE INTO film_directors (film_slug, director) VALUES (?, ?)", director_rows)
+    if genre_rows:
+        conn.executemany("INSERT OR IGNORE INTO film_genres (film_slug, genre) VALUES (?, ?)", genre_rows)
+    if cast_rows:
+        conn.executemany("INSERT OR IGNORE INTO film_cast (film_slug, actor) VALUES (?, ?)", cast_rows)
+    if theme_rows:
+        conn.executemany("INSERT OR IGNORE INTO film_themes (film_slug, theme) VALUES (?, ?)", theme_rows)
 
 
 def cleanup_connection_pool() -> None:
@@ -308,19 +387,28 @@ def load_cached_profile(username: str, max_age_days: int = 7) -> dict | None:
     Load cached user profile if it exists and is recent enough.
 
     Cache is invalidated if:
+    - Profile schema version doesn't match current version
     - Profile is older than max_age_days
     - User's lists have been updated more recently than the profile
     - User's films have been updated more recently than the profile
     """
+    from .config import PROFILE_SCHEMA_VERSION
+
     with get_db(exclude_commit=True) as conn:
         cursor = conn.execute("""
-            SELECT profile_data, updated_at
+            SELECT profile_data, updated_at, schema_version
             FROM user_profiles
             WHERE username = ?
         """, (username,))
         row = cursor.fetchone()
 
         if not row:
+            return None
+
+        # Check schema version FIRST before any other validation
+        cached_version = row['schema_version'] if 'schema_version' in row.keys() else 0
+        if cached_version != PROFILE_SCHEMA_VERSION:
+            logger.debug(f"Profile cache invalidated for {username} - schema version mismatch ({cached_version} != {PROFILE_SCHEMA_VERSION})")
             return None
 
         # Use helper to ensure naive datetime for consistent comparisons
@@ -363,13 +451,32 @@ def load_cached_profile(username: str, max_age_days: int = 7) -> dict | None:
 
 
 def save_user_profile(username: str, profile_data: dict) -> None:
-    """Save user profile to cache with naive datetime timestamp."""
+    """Save user profile to cache with naive datetime timestamp and schema version."""
+    from .config import PROFILE_SCHEMA_VERSION
+
     with get_db() as conn:
         # Always use naive datetime for consistency
         conn.execute("""
-            INSERT OR REPLACE INTO user_profiles (username, profile_data, updated_at)
-            VALUES (?, ?, ?)
-        """, (username, json.dumps(profile_data), datetime.now().isoformat()))
+            INSERT OR REPLACE INTO user_profiles (username, profile_data, updated_at, schema_version)
+            VALUES (?, ?, ?, ?)
+        """, (username, json.dumps(profile_data), datetime.now().isoformat(), PROFILE_SCHEMA_VERSION))
+
+
+def purge_stale_profile_caches() -> int:
+    """
+    Delete all cached profiles with outdated schema versions.
+
+    Returns:
+        Count of profiles deleted
+    """
+    from .config import PROFILE_SCHEMA_VERSION
+
+    with get_db() as conn:
+        cursor = conn.execute("""
+            DELETE FROM user_profiles
+            WHERE schema_version IS NULL OR schema_version != ?
+        """, (PROFILE_SCHEMA_VERSION,))
+        return cursor.rowcount
 
 
 def get_discovery_source(source_type: str, source_id: str) -> dict | None:
