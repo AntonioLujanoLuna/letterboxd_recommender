@@ -521,7 +521,7 @@ class MetadataRecommender:
         matched_pairs = []
         for i, g1 in enumerate(film_genres):
             for g2 in film_genres[i+1:]:
-                pair = tuple(sorted([g1, g2]))
+                pair = "|".join(sorted([g1, g2]))
                 if pair in profile.genre_pairs:
                     pair_value = profile.genre_pairs[pair]
                     # Apply negative penalty multiplier for negative pair preferences

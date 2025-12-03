@@ -57,7 +57,7 @@ class UserProfile:
     composer_counts: dict[str, int] = field(default_factory=dict)
 
     # Genre co-occurrence preferences (e.g., horror+comedy vs separate)
-    genre_pairs: dict[tuple[str, str], float] = field(default_factory=dict)
+    genre_pairs: dict[str, float] = field(default_factory=dict)
 
 
 def _normalize_scores(scores: dict, counts: dict, exponent: float = NORM_EXPONENT_DEFAULT) -> dict:
@@ -249,7 +249,7 @@ def build_profile(
         # Generate all pairs (sorted to ensure consistent keys)
         for i, g1 in enumerate(film_genres):
             for g2 in film_genres[i+1:]:
-                pair = tuple(sorted([g1, g2]))
+                pair = "|".join(sorted([g1, g2]))
                 genre_pair_scores[pair] += weight
                 genre_pair_counts[pair] += 1
 
