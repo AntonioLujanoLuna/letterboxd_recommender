@@ -26,6 +26,8 @@ from .config import (
     NEGATIVE_THRESHOLD_CINE,
     NEGATIVE_THRESHOLD_COMPOSER,
     CONFIDENCE_MIN_SAMPLES,
+    USE_IDF_WEIGHTING,
+    IDF_DISTINCTIVE_THRESHOLD,
 )
 
 logger = logging.getLogger(__name__)
@@ -70,8 +72,23 @@ class MetadataRecommender:
 
     COUNTRY_SECONDARY_WEIGHT = 0.3
 
-    def __init__(self, all_films: list[dict]):
+    def __init__(self, all_films: list[dict], use_idf: bool = USE_IDF_WEIGHTING):
         self.films = {f['slug']: f for f in all_films}
+        self.use_idf = use_idf
+
+        # Load IDF scores if enabled
+        if self.use_idf:
+            from .database import load_idf
+            try:
+                self.idf = load_idf()
+                if not self.idf:
+                    logger.warning("IDF table is empty. Run 'python main.py rebuild-idf' to compute IDF scores.")
+                    self.idf = {}
+            except Exception as e:
+                logger.warning(f"Failed to load IDF scores: {e}. Continuing without IDF weighting.")
+                self.idf = {}
+        else:
+            self.idf = {}
     
     def recommend(
         self,
@@ -269,27 +286,62 @@ class MetadataRecommender:
         reasons = []
         warnings = []
 
-        # Genre match (with negative penalties)
+        # Genre match (with negative penalties, confidence weighting, and IDF)
         film_genres = load_json(film.get('genres'))
         genre_score = 0
         matched_genres = []
+        distinctive_genres = []
         for g in film_genres:
             if g in profile.genres:
                 g_score = profile.genres[g]
+                count = profile.genre_counts.get(g, 1)
+                confidence = _confidence_weight(count, CONFIDENCE_MIN_SAMPLES['genre'])
+
+                # Apply IDF weighting (rarity bonus)
+                idf_weight = self.idf.get('genre', {}).get(g, 1.0) if self.use_idf else 1.0
+
                 if g_score < 0:
                     # Amplify negative penalties
-                    genre_score += g_score * NEGATIVE_PENALTY_MULTIPLIER
+                    genre_score += g_score * NEGATIVE_PENALTY_MULTIPLIER * confidence * idf_weight
                     if g_score < NEGATIVE_THRESHOLD_GENRE:
                         warnings.append(f"⚠️ Genre: {g} (disliked)")
                 else:
-                    genre_score += g_score
+                    genre_score += g_score * confidence * idf_weight
                     if g_score > MATCH_THRESHOLD_GENRE:
                         matched_genres.append(g)
+                        # Flag distinctive (rare) genres
+                        if self.use_idf and idf_weight > IDF_DISTINCTIVE_THRESHOLD:
+                            distinctive_genres.append(g)
+
         score += genre_score * WEIGHTS['genre']
-        if matched_genres:
+        if distinctive_genres:
+            reasons.append(f"Genre: {distinctive_genres[0]} (distinctive taste)")
+        elif matched_genres:
             reasons.append(f"Genre: {', '.join(matched_genres[:2])}")
 
-        # Director match (strong signal with negative penalties and confidence weighting)
+        # Genre pair matching (co-occurrence preferences)
+        pair_score = 0.0
+        matched_pairs = []
+        for i, g1 in enumerate(film_genres):
+            for g2 in film_genres[i+1:]:
+                pair = tuple(sorted([g1, g2]))
+                if pair in profile.genre_pairs:
+                    pair_value = profile.genre_pairs[pair]
+                    # Apply negative penalty multiplier for negative pair preferences
+                    if pair_value < 0:
+                        pair_score += pair_value * NEGATIVE_PENALTY_MULTIPLIER
+                        if pair_value < -0.5:  # Threshold for reporting negative pairs
+                            warnings.append(f"⚠️ Genre combo: {g1}+{g2} (disliked)")
+                    else:
+                        pair_score += pair_value
+                        if pair_value > 0.5:  # Threshold for reporting positive pairs
+                            matched_pairs.append(f"{g1}+{g2}")
+
+        score += pair_score * WEIGHTS.get('genre_pair', 0.6)
+        if matched_pairs:
+            reasons.append(f"Genre combo: {matched_pairs[0]}")
+
+        # Director match (strong signal with negative penalties, confidence weighting, and IDF)
         film_directors = load_json(film.get('directors'))
         for d in film_directors:
             if d in profile.directors:
@@ -297,16 +349,21 @@ class MetadataRecommender:
                 count = profile.director_counts.get(d, 1)
                 confidence = _confidence_weight(count, CONFIDENCE_MIN_SAMPLES['director'])
 
+                # Apply IDF weighting
+                idf_weight = self.idf.get('director', {}).get(d, 1.0) if self.use_idf else 1.0
+
                 if dir_score < 0:
                     # Amplify negative penalties
-                    score += dir_score * WEIGHTS['director'] * NEGATIVE_PENALTY_MULTIPLIER * confidence
+                    score += dir_score * WEIGHTS['director'] * NEGATIVE_PENALTY_MULTIPLIER * confidence * idf_weight
                     if dir_score < NEGATIVE_THRESHOLD_DIRECTOR:
                         warnings.append(f"⚠️ Director: {d} (disliked)")
                 else:
-                    score += dir_score * WEIGHTS['director'] * confidence
+                    score += dir_score * WEIGHTS['director'] * confidence * idf_weight
                     if dir_score > MATCH_THRESHOLD_DIRECTOR:
                         if confidence < 0.7:
                             reasons.append(f"Director: {d} (based on {count} film{'s' if count > 1 else ''})")
+                        elif self.use_idf and idf_weight > IDF_DISTINCTIVE_THRESHOLD:
+                            reasons.append(f"Director: {d} (distinctive)")
                         else:
                             reasons.append(f"Director: {d}")
 
@@ -331,11 +388,14 @@ class MetadataRecommender:
         if matched_actors:
             reasons.append(f"Cast: {', '.join(matched_actors[:2])}")
 
-        # Theme match
+        # Theme match (with confidence weighting)
         film_themes = load_json(film.get('themes', []))
         for t in film_themes:
             if t in profile.themes:
-                score += profile.themes[t] * WEIGHTS['theme']
+                t_score = profile.themes[t]
+                count = profile.theme_counts.get(t, 1)
+                confidence = _confidence_weight(count, CONFIDENCE_MIN_SAMPLES['theme'])
+                score += t_score * WEIGHTS['theme'] * confidence
 
         # Decade match
         year = film.get('year')
@@ -344,23 +404,32 @@ class MetadataRecommender:
             if decade in profile.decades:
                 score += profile.decades[decade] * WEIGHTS['decade']
 
-        # Phase 1: Country match
+        # Country match (with confidence weighting)
         film_countries = load_json(film.get('countries', []))
         for i, country in enumerate(film_countries):
             if country in profile.countries:
+                country_score = profile.countries[country]
+                count = profile.country_counts.get(country, 1)
+                confidence = _confidence_weight(count, CONFIDENCE_MIN_SAMPLES['country'])
+
                 # Primary country gets full weight, secondary reduced
                 country_weight = WEIGHTS['country'] if i == 0 else WEIGHTS['country'] * self.COUNTRY_SECONDARY_WEIGHT
-                score += profile.countries[country] * country_weight
-                if i == 0 and profile.countries[country] > 0.5:
+                score += country_score * country_weight * confidence
+                if i == 0 and country_score > 0.5:
                     reasons.append(f"Country: {country}")
 
-        # Phase 1: Language match
+        # Language match (with confidence weighting)
         film_languages = load_json(film.get('languages', []))
         matched_languages = []
         for lang in film_languages:
-            if lang in profile.languages and profile.languages[lang] > MATCH_THRESHOLD_LANGUAGE:
-                score += profile.languages[lang] * WEIGHTS['language']
-                matched_languages.append(lang)
+            if lang in profile.languages:
+                lang_score = profile.languages[lang]
+                count = profile.language_counts.get(lang, 1)
+                confidence = _confidence_weight(count, CONFIDENCE_MIN_SAMPLES['language'])
+
+                if lang_score > MATCH_THRESHOLD_LANGUAGE:
+                    score += lang_score * WEIGHTS['language'] * confidence
+                    matched_languages.append(lang)
         if matched_languages:
             reasons.append(f"Language: {matched_languages[0]}")
 
@@ -382,33 +451,39 @@ class MetadataRecommender:
                     if writer_score > MATCH_THRESHOLD_WRITER:
                         reasons.append(f"Writer: {w}")
 
-        # Cinematographer match (with negative penalties)
+        # Cinematographer match (with negative penalties and confidence weighting)
         film_cinematographers = load_json(film.get('cinematographers', []))
         for c in film_cinematographers:
             if c in profile.cinematographers:
                 cine_score = profile.cinematographers[c]
+                count = profile.cinematographer_counts.get(c, 1)
+                confidence = _confidence_weight(count, CONFIDENCE_MIN_SAMPLES['cinematographer'])
+
                 if cine_score < 0:
                     # Amplify negative penalties
-                    score += cine_score * WEIGHTS['cinematographer'] * NEGATIVE_PENALTY_MULTIPLIER
+                    score += cine_score * WEIGHTS['cinematographer'] * NEGATIVE_PENALTY_MULTIPLIER * confidence
                     if cine_score < NEGATIVE_THRESHOLD_CINE:
                         warnings.append(f"⚠️ Cinematographer: {c} (disliked)")
                 else:
-                    score += cine_score * WEIGHTS['cinematographer']
+                    score += cine_score * WEIGHTS['cinematographer'] * confidence
                     if cine_score > MATCH_THRESHOLD_CINE:
                         reasons.append(f"Cinematography: {c}")
 
-        # Composer match (with negative penalties)
+        # Composer match (with negative penalties and confidence weighting)
         film_composers = load_json(film.get('composers', []))
         for comp in film_composers:
             if comp in profile.composers:
                 comp_score = profile.composers[comp]
+                count = profile.composer_counts.get(comp, 1)
+                confidence = _confidence_weight(count, CONFIDENCE_MIN_SAMPLES['composer'])
+
                 if comp_score < 0:
                     # Amplify negative penalties
-                    score += comp_score * WEIGHTS['composer'] * NEGATIVE_PENALTY_MULTIPLIER
+                    score += comp_score * WEIGHTS['composer'] * NEGATIVE_PENALTY_MULTIPLIER * confidence
                     if comp_score < NEGATIVE_THRESHOLD_COMPOSER:
                         warnings.append(f"⚠️ Composer: {comp} (disliked)")
                 else:
-                    score += comp_score * WEIGHTS['composer']
+                    score += comp_score * WEIGHTS['composer'] * confidence
                     if comp_score > MATCH_THRESHOLD_COMPOSER:
                         reasons.append(f"Composer: {comp}")
 

@@ -7,7 +7,8 @@ from datetime import datetime, timedelta
 from .database import (
     init_db, get_db, load_json, load_user_lists, parse_timestamp_naive,
     get_discovery_source, update_discovery_source, add_pending_users,
-    get_pending_users, remove_pending_user, get_pending_queue_stats
+    get_pending_users, remove_pending_user, get_pending_queue_stats,
+    compute_and_store_idf
 )
 from .scraper import LetterboxdScraper
 from .recommender import MetadataRecommender, CollaborativeRecommender, Recommendation
@@ -978,6 +979,30 @@ def cmd_gaps(args: argparse.Namespace) -> None:
             print(f"  - {r.title} ({r.year}) [{r.score:.1f}]")
 
 
+def cmd_rebuild_idf(args: argparse.Namespace) -> None:
+    """Rebuild IDF (Inverse Document Frequency) scores for all attributes."""
+    init_db()
+
+    print("Computing IDF scores for all attributes...")
+    print("This may take a while depending on database size...")
+
+    results = compute_and_store_idf()
+
+    if not results:
+        print("\nNo films found in database. IDF table is empty.")
+        print("Run 'python main.py scrape <username>' to add films first.")
+        return
+
+    print("\nIDF computation complete!")
+    print("\nAttribute counts:")
+    for attr_type, count in sorted(results.items()):
+        print(f"  {attr_type}: {count} unique values")
+
+    total = sum(results.values())
+    print(f"\nTotal: {total} attribute values indexed")
+    print("\nIDF scores will now be used to prioritize rare/distinctive preferences in recommendations.")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Letterboxd Recommender")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
@@ -1073,7 +1098,11 @@ def main():
     gaps_parser.add_argument("--min-year", type=int, help="Minimum release year")
     gaps_parser.add_argument("--max-year", type=int, help="Maximum release year")
     gaps_parser.set_defaults(func=cmd_gaps)
-    
+
+    # Rebuild-IDF command
+    rebuild_idf_parser = subparsers.add_parser("rebuild-idf", help="Rebuild IDF scores for attribute rarity weighting")
+    rebuild_idf_parser.set_defaults(func=cmd_rebuild_idf)
+
     args = parser.parse_args()
     
     # Configure logging based on verbosity

@@ -73,6 +73,7 @@ WEIGHTS = {
     'writer': 2.0,
     'cinematographer': 1.0,
     'composer': 0.8,
+    'genre_pair': 0.6,  # Genre co-occurrence (supplementary signal)
 }
 
 # Match Thresholds
@@ -116,3 +117,7 @@ CONFIDENCE_MIN_SAMPLES = {
     'cinematographer': 2,  # Cinematographers are rare
     'composer': 2,     # Composers are rare
 }
+
+# IDF (Inverse Document Frequency) weighting for rarity
+USE_IDF_WEIGHTING = True  # Enable IDF weighting for attributes
+IDF_DISTINCTIVE_THRESHOLD = 2.0  # IDF above this is "distinctive taste"

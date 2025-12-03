@@ -133,8 +133,19 @@ def init_db() -> None:
             );
 
             CREATE INDEX IF NOT EXISTS idx_pending_priority ON pending_users(priority DESC, discovered_at ASC);
+
+            -- IDF (Inverse Document Frequency) table for rarity weighting
+            CREATE TABLE IF NOT EXISTS attribute_idf (
+                attribute_type TEXT NOT NULL,
+                attribute_value TEXT NOT NULL,
+                doc_count INTEGER NOT NULL,
+                idf_score REAL NOT NULL,
+                PRIMARY KEY (attribute_type, attribute_value)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_idf_type ON attribute_idf(attribute_type);
         """)
-        
+
         # Migration: Add new columns to existing films table if they don't exist
         _migrate_films_table(conn)
 
@@ -487,3 +498,156 @@ def get_pending_queue_stats() -> dict:
             'avg_priority': row['avg_priority'],
             'breakdown': breakdown
         }
+
+
+def compute_and_store_idf() -> dict[str, int]:
+    """
+    Compute and store IDF (Inverse Document Frequency) for all attribute values.
+
+    IDF measures how distinctive an attribute value is across the film corpus.
+    Formula: IDF(value) = log(N / (1 + doc_count))
+    where N = total films, doc_count = films with this value
+
+    Returns dict with counts of attributes processed per type.
+    """
+    import math
+
+    with get_db() as conn:
+        # Get total film count
+        cursor = conn.execute("SELECT COUNT(*) as total FROM films")
+        N = cursor.fetchone()['total']
+
+        if N == 0:
+            return {}
+
+        logger = logging.getLogger(__name__)
+        logger.info(f"Computing IDF for {N} films...")
+
+        results = {}
+
+        # Process genres
+        cursor = conn.execute("""
+            SELECT genre as value, COUNT(*) as doc_count
+            FROM film_genres
+            GROUP BY genre
+        """)
+        genre_data = [(r['value'], r['doc_count']) for r in cursor.fetchall()]
+        conn.executemany("""
+            INSERT OR REPLACE INTO attribute_idf (attribute_type, attribute_value, doc_count, idf_score)
+            VALUES ('genre', ?, ?, ?)
+        """, [(value, count, math.log(N / (1 + count))) for value, count in genre_data])
+        results['genre'] = len(genre_data)
+
+        # Process directors
+        cursor = conn.execute("""
+            SELECT director as value, COUNT(*) as doc_count
+            FROM film_directors
+            GROUP BY director
+        """)
+        director_data = [(r['value'], r['doc_count']) for r in cursor.fetchall()]
+        conn.executemany("""
+            INSERT OR REPLACE INTO attribute_idf (attribute_type, attribute_value, doc_count, idf_score)
+            VALUES ('director', ?, ?, ?)
+        """, [(value, count, math.log(N / (1 + count))) for value, count in director_data])
+        results['director'] = len(director_data)
+
+        # Process actors
+        cursor = conn.execute("""
+            SELECT actor as value, COUNT(*) as doc_count
+            FROM film_cast
+            GROUP BY actor
+        """)
+        actor_data = [(r['value'], r['doc_count']) for r in cursor.fetchall()]
+        conn.executemany("""
+            INSERT OR REPLACE INTO attribute_idf (attribute_type, attribute_value, doc_count, idf_score)
+            VALUES ('actor', ?, ?, ?)
+        """, [(value, count, math.log(N / (1 + count))) for value, count in actor_data])
+        results['actor'] = len(actor_data)
+
+        # Process themes
+        cursor = conn.execute("""
+            SELECT theme as value, COUNT(*) as doc_count
+            FROM film_themes
+            GROUP BY theme
+        """)
+        theme_data = [(r['value'], r['doc_count']) for r in cursor.fetchall()]
+        conn.executemany("""
+            INSERT OR REPLACE INTO attribute_idf (attribute_type, attribute_value, doc_count, idf_score)
+            VALUES ('theme', ?, ?, ?)
+        """, [(value, count, math.log(N / (1 + count))) for value, count in theme_data])
+        results['theme'] = len(theme_data)
+
+        # Process countries
+        cursor = conn.execute("""
+            SELECT DISTINCT value
+            FROM (
+                SELECT json_each.value as value
+                FROM films, json_each(films.countries)
+            )
+        """)
+        country_values = [r['value'] for r in cursor.fetchall()]
+        country_data = []
+        for country in country_values:
+            cursor = conn.execute("""
+                SELECT COUNT(*) as doc_count
+                FROM films
+                WHERE json_extract(countries, '$') LIKE ?
+            """, (f'%{country}%',))
+            doc_count = cursor.fetchone()['doc_count']
+            country_data.append((country, doc_count))
+
+        conn.executemany("""
+            INSERT OR REPLACE INTO attribute_idf (attribute_type, attribute_value, doc_count, idf_score)
+            VALUES ('country', ?, ?, ?)
+        """, [(value, count, math.log(N / (1 + count))) for value, count in country_data])
+        results['country'] = len(country_data)
+
+        # Process languages
+        cursor = conn.execute("""
+            SELECT DISTINCT value
+            FROM (
+                SELECT json_each.value as value
+                FROM films, json_each(films.languages)
+            )
+        """)
+        language_values = [r['value'] for r in cursor.fetchall()]
+        language_data = []
+        for lang in language_values:
+            cursor = conn.execute("""
+                SELECT COUNT(*) as doc_count
+                FROM films
+                WHERE json_extract(languages, '$') LIKE ?
+            """, (f'%{lang}%',))
+            doc_count = cursor.fetchone()['doc_count']
+            language_data.append((lang, doc_count))
+
+        conn.executemany("""
+            INSERT OR REPLACE INTO attribute_idf (attribute_type, attribute_value, doc_count, idf_score)
+            VALUES ('language', ?, ?, ?)
+        """, [(value, count, math.log(N / (1 + count))) for value, count in language_data])
+        results['language'] = len(language_data)
+
+        logger.info(f"IDF computation complete: {results}")
+        return results
+
+
+def load_idf() -> dict[str, dict[str, float]]:
+    """
+    Load all IDF scores from database.
+
+    Returns nested dict: {"genre": {"drama": 0.5, ...}, "director": {...}, ...}
+    """
+    with get_db(exclude_commit=True) as conn:
+        cursor = conn.execute("""
+            SELECT attribute_type, attribute_value, idf_score
+            FROM attribute_idf
+        """)
+
+        idf = {}
+        for row in cursor.fetchall():
+            attr_type = row['attribute_type']
+            if attr_type not in idf:
+                idf[attr_type] = {}
+            idf[attr_type][row['attribute_value']] = row['idf_score']
+
+        return idf
