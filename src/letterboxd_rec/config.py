@@ -73,6 +73,7 @@ WEIGHTS = {
     'writer': 2.0,
     'cinematographer': 1.0,
     'composer': 0.8,
+    'genre_pair': 0.6,  # Genre co-occurrence (supplementary signal)
 }
 
 # Match Thresholds
@@ -92,3 +93,31 @@ RATING_DIFF_MED = 0.5
 SIMILAR_DIRECTOR_BONUS = 5.0
 SIMILAR_CAST_SCORE = 0.5
 SIMILAR_DECADE_SCORE = 0.5
+
+# Negative Penalty Configuration
+NEGATIVE_PENALTY_MULTIPLIER = 1.5  # Amplify negative matches
+
+# Negative thresholds (when to surface negative matches in warnings)
+NEGATIVE_THRESHOLD_DIRECTOR = -0.8
+NEGATIVE_THRESHOLD_GENRE = -0.3
+NEGATIVE_THRESHOLD_ACTOR = -0.3
+NEGATIVE_THRESHOLD_WRITER = -0.8
+NEGATIVE_THRESHOLD_CINE = -0.6
+NEGATIVE_THRESHOLD_COMPOSER = -0.6
+
+# Confidence weighting based on sample size
+CONFIDENCE_MIN_SAMPLES = {
+    'director': 3,     # Directors need fewer samples (distinctive signal)
+    'genre': 5,        # Genres are common, need more observations
+    'actor': 4,        # Actors somewhere in between
+    'theme': 5,        # Themes need decent sample
+    'country': 5,      # Countries need decent sample
+    'language': 5,     # Languages need decent sample
+    'writer': 2,       # Writers are rare, accept fewer samples
+    'cinematographer': 2,  # Cinematographers are rare
+    'composer': 2,     # Composers are rare
+}
+
+# IDF (Inverse Document Frequency) weighting for rarity
+USE_IDF_WEIGHTING = True  # Enable IDF weighting for attributes
+IDF_DISTINCTIVE_THRESHOLD = 2.0  # IDF above this is "distinctive taste"

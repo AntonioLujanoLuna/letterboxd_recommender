@@ -113,8 +113,39 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_fg_genre ON film_genres(genre);
             CREATE INDEX IF NOT EXISTS idx_fc_actor ON film_cast(actor);
             CREATE INDEX IF NOT EXISTS idx_ft_theme ON film_themes(theme);
+
+            -- Discovery source caching tables
+            CREATE TABLE IF NOT EXISTS discovery_sources (
+                source_type TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                last_page_scraped INTEGER DEFAULT 0,
+                total_users_found INTEGER DEFAULT 0,
+                scraped_at TEXT,
+                PRIMARY KEY (source_type, source_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS pending_users (
+                username TEXT PRIMARY KEY,
+                discovered_from_type TEXT NOT NULL,
+                discovered_from_id TEXT NOT NULL,
+                discovered_at TEXT NOT NULL,
+                priority INTEGER DEFAULT 50
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_pending_priority ON pending_users(priority DESC, discovered_at ASC);
+
+            -- IDF (Inverse Document Frequency) table for rarity weighting
+            CREATE TABLE IF NOT EXISTS attribute_idf (
+                attribute_type TEXT NOT NULL,
+                attribute_value TEXT NOT NULL,
+                doc_count INTEGER NOT NULL,
+                idf_score REAL NOT NULL,
+                PRIMARY KEY (attribute_type, attribute_value)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_idf_type ON attribute_idf(attribute_type);
         """)
-        
+
         # Migration: Add new columns to existing films table if they don't exist
         _migrate_films_table(conn)
 
@@ -339,3 +370,284 @@ def save_user_profile(username: str, profile_data: dict) -> None:
             INSERT OR REPLACE INTO user_profiles (username, profile_data, updated_at)
             VALUES (?, ?, ?)
         """, (username, json.dumps(profile_data), datetime.now().isoformat()))
+
+
+def get_discovery_source(source_type: str, source_id: str) -> dict | None:
+    """
+    Get cached discovery source information.
+
+    Returns dict with last_page_scraped, total_users_found, and scraped_at,
+    or None if source not found.
+    """
+    with get_db(exclude_commit=True) as conn:
+        cursor = conn.execute("""
+            SELECT last_page_scraped, total_users_found, scraped_at
+            FROM discovery_sources
+            WHERE source_type = ? AND source_id = ?
+        """, (source_type, source_id))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+
+def update_discovery_source(
+    source_type: str,
+    source_id: str,
+    last_page: int,
+    total_users: int
+) -> None:
+    """Update discovery source cache with new page and user count."""
+    with get_db() as conn:
+        conn.execute("""
+            INSERT OR REPLACE INTO discovery_sources
+            (source_type, source_id, last_page_scraped, total_users_found, scraped_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (source_type, source_id, last_page, total_users, datetime.now().isoformat()))
+
+
+def add_pending_users(
+    usernames: list[str],
+    source_type: str,
+    source_id: str,
+    priority: int = 50
+) -> int:
+    """
+    Add discovered usernames to pending_users queue.
+
+    Returns count of newly added users (ignores duplicates and existing users).
+    """
+    with get_db() as conn:
+        # Get existing users in user_films and pending_users
+        existing_scraped = {
+            r['username'] for r in conn.execute(
+                "SELECT DISTINCT username FROM user_films"
+            )
+        }
+        existing_pending = {
+            r['username'] for r in conn.execute(
+                "SELECT username FROM pending_users"
+            )
+        }
+
+        # Filter to truly new users
+        new_users = [
+            u for u in usernames
+            if u not in existing_scraped and u not in existing_pending
+        ]
+
+        if not new_users:
+            return 0
+
+        # Insert new pending users
+        timestamp = datetime.now().isoformat()
+        conn.executemany("""
+            INSERT OR IGNORE INTO pending_users
+            (username, discovered_from_type, discovered_from_id, discovered_at, priority)
+            VALUES (?, ?, ?, ?, ?)
+        """, [(u, source_type, source_id, timestamp, priority) for u in new_users])
+
+        return len(new_users)
+
+
+def get_pending_users(limit: int = 50) -> list[dict]:
+    """
+    Get pending users from queue, ordered by priority (desc) then discovery time (asc).
+
+    Returns list of dicts with username, discovered_from_type, discovered_from_id,
+    discovered_at, and priority.
+    """
+    with get_db(exclude_commit=True) as conn:
+        cursor = conn.execute("""
+            SELECT username, discovered_from_type, discovered_from_id, discovered_at, priority
+            FROM pending_users
+            ORDER BY priority DESC, discovered_at ASC
+            LIMIT ?
+        """, (limit,))
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def remove_pending_user(username: str) -> None:
+    """Remove a user from pending_users queue after successful scrape."""
+    with get_db() as conn:
+        conn.execute("DELETE FROM pending_users WHERE username = ?", (username,))
+
+
+def get_pending_queue_stats() -> dict:
+    """Get statistics about the pending users queue."""
+    with get_db(exclude_commit=True) as conn:
+        cursor = conn.execute("""
+            SELECT
+                COUNT(*) as total,
+                COUNT(DISTINCT discovered_from_type) as source_types,
+                AVG(priority) as avg_priority
+            FROM pending_users
+        """)
+        row = cursor.fetchone()
+
+        # Get breakdown by source type
+        breakdown_cursor = conn.execute("""
+            SELECT discovered_from_type, COUNT(*) as count
+            FROM pending_users
+            GROUP BY discovered_from_type
+            ORDER BY count DESC
+        """)
+        breakdown = {r['discovered_from_type']: r['count'] for r in breakdown_cursor.fetchall()}
+
+        return {
+            'total': row['total'],
+            'source_types': row['source_types'],
+            'avg_priority': row['avg_priority'],
+            'breakdown': breakdown
+        }
+
+
+def compute_and_store_idf() -> dict[str, int]:
+    """
+    Compute and store IDF (Inverse Document Frequency) for all attribute values.
+
+    IDF measures how distinctive an attribute value is across the film corpus.
+    Formula: IDF(value) = log(N / (1 + doc_count))
+    where N = total films, doc_count = films with this value
+
+    Returns dict with counts of attributes processed per type.
+    """
+    import math
+
+    with get_db() as conn:
+        # Get total film count
+        cursor = conn.execute("SELECT COUNT(*) as total FROM films")
+        N = cursor.fetchone()['total']
+
+        if N == 0:
+            return {}
+
+        logger = logging.getLogger(__name__)
+        logger.info(f"Computing IDF for {N} films...")
+
+        results = {}
+
+        # Process genres
+        cursor = conn.execute("""
+            SELECT genre as value, COUNT(*) as doc_count
+            FROM film_genres
+            GROUP BY genre
+        """)
+        genre_data = [(r['value'], r['doc_count']) for r in cursor.fetchall()]
+        conn.executemany("""
+            INSERT OR REPLACE INTO attribute_idf (attribute_type, attribute_value, doc_count, idf_score)
+            VALUES ('genre', ?, ?, ?)
+        """, [(value, count, math.log(N / (1 + count))) for value, count in genre_data])
+        results['genre'] = len(genre_data)
+
+        # Process directors
+        cursor = conn.execute("""
+            SELECT director as value, COUNT(*) as doc_count
+            FROM film_directors
+            GROUP BY director
+        """)
+        director_data = [(r['value'], r['doc_count']) for r in cursor.fetchall()]
+        conn.executemany("""
+            INSERT OR REPLACE INTO attribute_idf (attribute_type, attribute_value, doc_count, idf_score)
+            VALUES ('director', ?, ?, ?)
+        """, [(value, count, math.log(N / (1 + count))) for value, count in director_data])
+        results['director'] = len(director_data)
+
+        # Process actors
+        cursor = conn.execute("""
+            SELECT actor as value, COUNT(*) as doc_count
+            FROM film_cast
+            GROUP BY actor
+        """)
+        actor_data = [(r['value'], r['doc_count']) for r in cursor.fetchall()]
+        conn.executemany("""
+            INSERT OR REPLACE INTO attribute_idf (attribute_type, attribute_value, doc_count, idf_score)
+            VALUES ('actor', ?, ?, ?)
+        """, [(value, count, math.log(N / (1 + count))) for value, count in actor_data])
+        results['actor'] = len(actor_data)
+
+        # Process themes
+        cursor = conn.execute("""
+            SELECT theme as value, COUNT(*) as doc_count
+            FROM film_themes
+            GROUP BY theme
+        """)
+        theme_data = [(r['value'], r['doc_count']) for r in cursor.fetchall()]
+        conn.executemany("""
+            INSERT OR REPLACE INTO attribute_idf (attribute_type, attribute_value, doc_count, idf_score)
+            VALUES ('theme', ?, ?, ?)
+        """, [(value, count, math.log(N / (1 + count))) for value, count in theme_data])
+        results['theme'] = len(theme_data)
+
+        # Process countries
+        cursor = conn.execute("""
+            SELECT DISTINCT value
+            FROM (
+                SELECT json_each.value as value
+                FROM films, json_each(films.countries)
+            )
+        """)
+        country_values = [r['value'] for r in cursor.fetchall()]
+        country_data = []
+        for country in country_values:
+            cursor = conn.execute("""
+                SELECT COUNT(*) as doc_count
+                FROM films
+                WHERE json_extract(countries, '$') LIKE ?
+            """, (f'%{country}%',))
+            doc_count = cursor.fetchone()['doc_count']
+            country_data.append((country, doc_count))
+
+        conn.executemany("""
+            INSERT OR REPLACE INTO attribute_idf (attribute_type, attribute_value, doc_count, idf_score)
+            VALUES ('country', ?, ?, ?)
+        """, [(value, count, math.log(N / (1 + count))) for value, count in country_data])
+        results['country'] = len(country_data)
+
+        # Process languages
+        cursor = conn.execute("""
+            SELECT DISTINCT value
+            FROM (
+                SELECT json_each.value as value
+                FROM films, json_each(films.languages)
+            )
+        """)
+        language_values = [r['value'] for r in cursor.fetchall()]
+        language_data = []
+        for lang in language_values:
+            cursor = conn.execute("""
+                SELECT COUNT(*) as doc_count
+                FROM films
+                WHERE json_extract(languages, '$') LIKE ?
+            """, (f'%{lang}%',))
+            doc_count = cursor.fetchone()['doc_count']
+            language_data.append((lang, doc_count))
+
+        conn.executemany("""
+            INSERT OR REPLACE INTO attribute_idf (attribute_type, attribute_value, doc_count, idf_score)
+            VALUES ('language', ?, ?, ?)
+        """, [(value, count, math.log(N / (1 + count))) for value, count in language_data])
+        results['language'] = len(language_data)
+
+        logger.info(f"IDF computation complete: {results}")
+        return results
+
+
+def load_idf() -> dict[str, dict[str, float]]:
+    """
+    Load all IDF scores from database.
+
+    Returns nested dict: {"genre": {"drama": 0.5, ...}, "director": {...}, ...}
+    """
+    with get_db(exclude_commit=True) as conn:
+        cursor = conn.execute("""
+            SELECT attribute_type, attribute_value, idf_score
+            FROM attribute_idf
+        """)
+
+        idf = {}
+        for row in cursor.fetchall():
+            attr_type = row['attribute_type']
+            if attr_type not in idf:
+                idf[attr_type] = {}
+            idf[attr_type][row['attribute_value']] = row['idf_score']
+
+        return idf

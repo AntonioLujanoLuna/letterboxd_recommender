@@ -33,7 +33,7 @@ class UserProfile:
     n_rated: int = 0
     n_liked: int = 0
     avg_liked_rating: float | None = None
-    
+
     genres: dict[str, float] = field(default_factory=dict)
     directors: dict[str, float] = field(default_factory=dict)
     actors: dict[str, float] = field(default_factory=dict)
@@ -44,6 +44,20 @@ class UserProfile:
     writers: dict[str, float] = field(default_factory=dict)
     cinematographers: dict[str, float] = field(default_factory=dict)
     composers: dict[str, float] = field(default_factory=dict)
+
+    # Observation counts for confidence weighting
+    genre_counts: dict[str, int] = field(default_factory=dict)
+    director_counts: dict[str, int] = field(default_factory=dict)
+    actor_counts: dict[str, int] = field(default_factory=dict)
+    theme_counts: dict[str, int] = field(default_factory=dict)
+    country_counts: dict[str, int] = field(default_factory=dict)
+    language_counts: dict[str, int] = field(default_factory=dict)
+    writer_counts: dict[str, int] = field(default_factory=dict)
+    cinematographer_counts: dict[str, int] = field(default_factory=dict)
+    composer_counts: dict[str, int] = field(default_factory=dict)
+
+    # Genre co-occurrence preferences (e.g., horror+comedy vs separate)
+    genre_pairs: dict[tuple[str, str], float] = field(default_factory=dict)
 
 
 def _normalize_scores(scores: dict, counts: dict, exponent: float = NORM_EXPONENT_DEFAULT) -> dict:
@@ -200,7 +214,52 @@ def build_profile(
     profile.writers = _normalize_scores(scores['writer'], counts['writer'])
     profile.cinematographers = _normalize_scores(scores['cinematographer'], counts['cinematographer'])
     profile.composers = _normalize_scores(scores['composer'], counts['composer'])
-    
+
+    # Store observation counts for confidence weighting
+    profile.genre_counts = dict(counts['genre'])
+    profile.director_counts = dict(counts['director'])
+    profile.actor_counts = dict(counts['actor'])
+    profile.theme_counts = dict(counts['theme'])
+    profile.country_counts = dict(counts['country'])
+    profile.language_counts = dict(counts['language'])
+    profile.writer_counts = dict(counts['writer'])
+    profile.cinematographer_counts = dict(counts['cinematographer'])
+    profile.composer_counts = dict(counts['composer'])
+
+    # Build genre-pair preferences (co-occurrence modeling)
+    genre_pair_scores = defaultdict(float)
+    genre_pair_counts = defaultdict(int)
+
+    for uf in user_films:
+        slug = uf['slug']
+        meta = film_metadata.get(slug)
+        if not meta:
+            continue
+
+        weight = _compute_weight(uf)
+        if weight == 0:
+            continue
+
+        # Apply list multiplier
+        if slug in list_weights:
+            weight *= list_weights[slug]
+
+        film_genres = load_json(meta.get('genres', []))
+
+        # Generate all pairs (sorted to ensure consistent keys)
+        for i, g1 in enumerate(film_genres):
+            for g2 in film_genres[i+1:]:
+                pair = tuple(sorted([g1, g2]))
+                genre_pair_scores[pair] += weight
+                genre_pair_counts[pair] += 1
+
+    # Normalize pairs (require at least 2 observations)
+    profile.genre_pairs = {
+        pair: score / (count ** 0.5)
+        for pair, score in genre_pair_scores.items()
+        if (count := genre_pair_counts[pair]) >= 2
+    }
+
     # Aggregate counts
     profile.n_films = len(user_films)
     profile.n_rated = len(rated_films)
