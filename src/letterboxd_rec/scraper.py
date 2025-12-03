@@ -563,24 +563,28 @@ class LetterboxdScraper:
             return None
 
         # Extract film count from stats
+        # The film count is in a span child element: <a class="thousands"><span>2,479</span><span>Films</span></a>
         film_count = 0
-        stats_link = tree.css_first("a[href*='/films/']")
+        stats_link = tree.css_first("a.thousands[href$='/films/']")
         if stats_link:
-            # Text like "1,234 films" or "42 films"
-            text = stats_link.text(strip=True)
-            if "film" in text.lower():
+            # Get the first span which contains the number
+            count_span = stats_link.css_first("span")
+            if count_span:
                 try:
-                    # Extract just the number part
-                    count_str = text.split()[0].replace(",", "")
+                    # Extract the count, removing commas
+                    count_str = count_span.text(strip=True).replace(",", "")
                     film_count = int(count_str)
                 except (ValueError, IndexError):
                     pass
 
+
         # Check if they have a rating distribution (indicates they rate films)
-        has_ratings = tree.css_first("div.ratings-histogram-chart") is not None
+        # Look for rating band links like "/films/ratings/rated/1/" etc.
+        has_ratings = tree.css_first("a[href*='/films/ratings/rated/']") is not None
 
         # Check for recent activity (diary entries on profile)
-        recent_activity = len(tree.css("li.poster-container")) > 0
+        # Look for film links under the diary section like "/username/film/slug/"
+        recent_activity = len(tree.css(f"a[href^='/{username}/film/']")) > 0
 
         return {
             'film_count': film_count,
