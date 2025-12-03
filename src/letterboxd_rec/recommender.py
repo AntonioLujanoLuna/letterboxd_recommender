@@ -1,5 +1,6 @@
 import logging
 from dataclasses import dataclass
+from typing import Optional
 from .profile import UserProfile, build_profile
 from .database import load_json
 from .config import (
@@ -33,6 +34,23 @@ from .config import (
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class AttributeConfig:
+    """Configuration for scoring a film attribute."""
+    name: str                          # e.g., "genre", "director"
+    film_field: str                    # JSON field in film dict, e.g., "genres"
+    profile_attr: str                  # attribute name on UserProfile, e.g., "genres"
+    counts_attr: str                   # counts attribute, e.g., "genre_counts"
+    weight: float                      # from WEIGHTS config
+    match_threshold: float             # minimum score to report as reason
+    negative_threshold: float          # threshold to report as warning (set to 0 to disable)
+    max_items: Optional[int]           # limit items considered (e.g., 5 for cast)
+    idf_type: Optional[str]            # key in IDF dict, or None to skip IDF
+    reason_template: str               # e.g., "Genre: {}" or "Director: {}"
+    warning_template: str              # e.g., "⚠️ Genre: {} (disliked)"
+    distinctive_reason_template: str   # e.g., "Genre: {} (distinctive taste)"
+
+
 def _confidence_weight(count: int, min_for_full_confidence: int = 5) -> float:
     """
     Returns weight between 0.0 and 1.0 based on sample size.
@@ -49,6 +67,123 @@ def _confidence_weight(count: int, min_for_full_confidence: int = 5) -> float:
     if count >= min_for_full_confidence:
         return 1.0
     return (count / min_for_full_confidence) ** 0.5
+
+
+# Attribute configurations for metadata scoring
+ATTRIBUTE_CONFIGS = [
+    AttributeConfig(
+        name='genre',
+        film_field='genres',
+        profile_attr='genres',
+        counts_attr='genre_counts',
+        weight=WEIGHTS['genre'],
+        match_threshold=MATCH_THRESHOLD_GENRE,
+        negative_threshold=NEGATIVE_THRESHOLD_GENRE,
+        max_items=None,
+        idf_type='genre',
+        reason_template='Genre: {}',
+        warning_template='⚠️ Genre: {} (disliked)',
+        distinctive_reason_template='Genre: {} (distinctive taste)'
+    ),
+    AttributeConfig(
+        name='director',
+        film_field='directors',
+        profile_attr='directors',
+        counts_attr='director_counts',
+        weight=WEIGHTS['director'],
+        match_threshold=MATCH_THRESHOLD_DIRECTOR,
+        negative_threshold=NEGATIVE_THRESHOLD_DIRECTOR,
+        max_items=None,
+        idf_type='director',
+        reason_template='Director: {}',
+        warning_template='⚠️ Director: {} (disliked)',
+        distinctive_reason_template='Director: {} (distinctive)'
+    ),
+    AttributeConfig(
+        name='actor',
+        film_field='cast',
+        profile_attr='actors',
+        counts_attr='actor_counts',
+        weight=WEIGHTS['actor'],
+        match_threshold=MATCH_THRESHOLD_ACTOR,
+        negative_threshold=NEGATIVE_THRESHOLD_ACTOR,
+        max_items=5,
+        idf_type=None,  # Actors don't use IDF currently
+        reason_template='Cast: {}',
+        warning_template='⚠️ Actor: {} (disliked)',
+        distinctive_reason_template='Cast: {}'
+    ),
+    AttributeConfig(
+        name='theme',
+        film_field='themes',
+        profile_attr='themes',
+        counts_attr='theme_counts',
+        weight=WEIGHTS['theme'],
+        match_threshold=0.0,  # Themes don't generate reasons currently
+        negative_threshold=0.0,
+        max_items=None,
+        idf_type=None,
+        reason_template='Theme: {}',
+        warning_template='⚠️ Theme: {} (disliked)',
+        distinctive_reason_template='Theme: {}'
+    ),
+    AttributeConfig(
+        name='language',
+        film_field='languages',
+        profile_attr='languages',
+        counts_attr='language_counts',
+        weight=WEIGHTS['language'],
+        match_threshold=MATCH_THRESHOLD_LANGUAGE,
+        negative_threshold=0.0,  # Languages don't have negative thresholds currently
+        max_items=None,
+        idf_type=None,
+        reason_template='Language: {}',
+        warning_template='⚠️ Language: {} (disliked)',
+        distinctive_reason_template='Language: {}'
+    ),
+    AttributeConfig(
+        name='writer',
+        film_field='writers',
+        profile_attr='writers',
+        counts_attr='writer_counts',
+        weight=WEIGHTS['writer'],
+        match_threshold=MATCH_THRESHOLD_WRITER,
+        negative_threshold=NEGATIVE_THRESHOLD_WRITER,
+        max_items=None,
+        idf_type=None,
+        reason_template='Writer: {}',
+        warning_template='⚠️ Writer: {} (disliked)',
+        distinctive_reason_template='Writer: {}'
+    ),
+    AttributeConfig(
+        name='cinematographer',
+        film_field='cinematographers',
+        profile_attr='cinematographers',
+        counts_attr='cinematographer_counts',
+        weight=WEIGHTS['cinematographer'],
+        match_threshold=MATCH_THRESHOLD_CINE,
+        negative_threshold=NEGATIVE_THRESHOLD_CINE,
+        max_items=None,
+        idf_type=None,
+        reason_template='Cinematography: {}',
+        warning_template='⚠️ Cinematographer: {} (disliked)',
+        distinctive_reason_template='Cinematography: {}'
+    ),
+    AttributeConfig(
+        name='composer',
+        film_field='composers',
+        profile_attr='composers',
+        counts_attr='composer_counts',
+        weight=WEIGHTS['composer'],
+        match_threshold=MATCH_THRESHOLD_COMPOSER,
+        negative_threshold=NEGATIVE_THRESHOLD_COMPOSER,
+        max_items=None,
+        idf_type=None,
+        reason_template='Composer: {}',
+        warning_template='⚠️ Composer: {} (disliked)',
+        distinctive_reason_template='Composer: {}'
+    ),
+]
 
 
 @dataclass
@@ -89,7 +224,81 @@ class MetadataRecommender:
                 self.idf = {}
         else:
             self.idf = {}
-    
+
+    def _score_attribute(
+        self,
+        film: dict,
+        profile: UserProfile,
+        config: AttributeConfig
+    ) -> tuple[float, list[str], list[str]]:
+        """
+        Generic attribute scoring method.
+
+        Returns:
+            (score, reasons, warnings) tuple
+        """
+        # Load film attribute values
+        film_values = load_json(film.get(config.film_field, []))
+
+        # Apply max_items limit if specified
+        if config.max_items is not None:
+            film_values = film_values[:config.max_items]
+
+        # Get profile scores and counts
+        profile_scores = getattr(profile, config.profile_attr)
+        profile_counts = getattr(profile, config.counts_attr)
+
+        total_score = 0.0
+        matched_items = []
+        distinctive_items = []
+        warnings = []
+
+        for value in film_values:
+            if value not in profile_scores:
+                continue
+
+            value_score = profile_scores[value]
+            count = profile_counts.get(value, 1)
+
+            # Apply confidence weighting
+            confidence = _confidence_weight(count, CONFIDENCE_MIN_SAMPLES.get(config.name, 5))
+
+            # Apply IDF weighting if enabled and configured
+            idf_weight = 1.0
+            if self.use_idf and config.idf_type and config.idf_type in self.idf:
+                idf_weight = self.idf[config.idf_type].get(value, 1.0)
+
+            # Handle negative scores with amplified penalty
+            if value_score < 0:
+                total_score += value_score * NEGATIVE_PENALTY_MULTIPLIER * confidence * idf_weight
+                if config.negative_threshold != 0.0 and value_score < config.negative_threshold:
+                    warnings.append(config.warning_template.format(value))
+            else:
+                total_score += value_score * confidence * idf_weight
+
+                # Track positive matches for reasons
+                if value_score > config.match_threshold:
+                    # Check if distinctive (high IDF)
+                    if self.use_idf and config.idf_type and idf_weight > IDF_DISTINCTIVE_THRESHOLD:
+                        distinctive_items.append(value)
+                    else:
+                        matched_items.append(value)
+
+        # Build reasons list
+        reasons = []
+        if distinctive_items:
+            reasons.append(config.distinctive_reason_template.format(distinctive_items[0]))
+        elif matched_items:
+            # For most attributes, show first match or first two
+            if config.name == 'actor':
+                reasons.append(config.reason_template.format(', '.join(matched_items[:2])))
+            elif config.name == 'genre':
+                reasons.append(config.reason_template.format(', '.join(matched_items[:2])))
+            else:
+                reasons.append(config.reason_template.format(matched_items[0]))
+
+        return total_score * config.weight, reasons, warnings
+
     def recommend(
         self,
         user_films: list[dict],
@@ -279,47 +488,35 @@ class MetadataRecommender:
     
     def _score_film(self, film: dict, profile: UserProfile) -> tuple[float, list[str], list[str]]:
         """
-        Score a film against user profile.
+        Score a film against user profile using configuration-driven attribute scoring.
         Returns (score, list of reasons, list of warnings).
         """
         score = 0.0
         reasons = []
         warnings = []
 
-        # Genre match (with negative penalties, confidence weighting, and IDF)
-        film_genres = load_json(film.get('genres'))
-        genre_score = 0
-        matched_genres = []
-        distinctive_genres = []
-        for g in film_genres:
-            if g in profile.genres:
-                g_score = profile.genres[g]
-                count = profile.genre_counts.get(g, 1)
-                confidence = _confidence_weight(count, CONFIDENCE_MIN_SAMPLES['genre'])
+        # Score all configured attributes using generic method
+        for config in ATTRIBUTE_CONFIGS:
+            attr_score, attr_reasons, attr_warnings = self._score_attribute(film, profile, config)
+            score += attr_score
+            reasons.extend(attr_reasons)
+            warnings.extend(attr_warnings)
 
-                # Apply IDF weighting (rarity bonus)
-                idf_weight = self.idf.get('genre', {}).get(g, 1.0) if self.use_idf else 1.0
-
-                if g_score < 0:
-                    # Amplify negative penalties
-                    genre_score += g_score * NEGATIVE_PENALTY_MULTIPLIER * confidence * idf_weight
-                    if g_score < NEGATIVE_THRESHOLD_GENRE:
-                        warnings.append(f"⚠️ Genre: {g} (disliked)")
-                else:
-                    genre_score += g_score * confidence * idf_weight
-                    if g_score > MATCH_THRESHOLD_GENRE:
-                        matched_genres.append(g)
-                        # Flag distinctive (rare) genres
-                        if self.use_idf and idf_weight > IDF_DISTINCTIVE_THRESHOLD:
-                            distinctive_genres.append(g)
-
-        score += genre_score * WEIGHTS['genre']
-        if distinctive_genres:
-            reasons.append(f"Genre: {distinctive_genres[0]} (distinctive taste)")
-        elif matched_genres:
-            reasons.append(f"Genre: {', '.join(matched_genres[:2])}")
+        # Special case: Directors with low confidence get annotated reasons
+        film_directors = load_json(film.get('directors'))
+        for d in film_directors:
+            if d in profile.directors and profile.directors[d] > MATCH_THRESHOLD_DIRECTOR:
+                count = profile.director_counts.get(d, 1)
+                confidence = _confidence_weight(count, CONFIDENCE_MIN_SAMPLES['director'])
+                if confidence < 0.7:
+                    # Replace generic director reason with annotated version
+                    for i, reason in enumerate(reasons):
+                        if reason.startswith(f"Director: {d}"):
+                            reasons[i] = f"Director: {d} (based on {count} film{'s' if count > 1 else ''})"
+                            break
 
         # Genre pair matching (co-occurrence preferences)
+        film_genres = load_json(film.get('genres'))
         pair_score = 0.0
         matched_pairs = []
         for i, g1 in enumerate(film_genres):
@@ -341,62 +538,6 @@ class MetadataRecommender:
         if matched_pairs:
             reasons.append(f"Genre combo: {matched_pairs[0]}")
 
-        # Director match (strong signal with negative penalties, confidence weighting, and IDF)
-        film_directors = load_json(film.get('directors'))
-        for d in film_directors:
-            if d in profile.directors:
-                dir_score = profile.directors[d]
-                count = profile.director_counts.get(d, 1)
-                confidence = _confidence_weight(count, CONFIDENCE_MIN_SAMPLES['director'])
-
-                # Apply IDF weighting
-                idf_weight = self.idf.get('director', {}).get(d, 1.0) if self.use_idf else 1.0
-
-                if dir_score < 0:
-                    # Amplify negative penalties
-                    score += dir_score * WEIGHTS['director'] * NEGATIVE_PENALTY_MULTIPLIER * confidence * idf_weight
-                    if dir_score < NEGATIVE_THRESHOLD_DIRECTOR:
-                        warnings.append(f"⚠️ Director: {d} (disliked)")
-                else:
-                    score += dir_score * WEIGHTS['director'] * confidence * idf_weight
-                    if dir_score > MATCH_THRESHOLD_DIRECTOR:
-                        if confidence < 0.7:
-                            reasons.append(f"Director: {d} (based on {count} film{'s' if count > 1 else ''})")
-                        elif self.use_idf and idf_weight > IDF_DISTINCTIVE_THRESHOLD:
-                            reasons.append(f"Director: {d} (distinctive)")
-                        else:
-                            reasons.append(f"Director: {d}")
-
-        # Actor match (with negative penalties and confidence weighting)
-        film_cast = load_json(film.get('cast', []))[:5]
-        matched_actors = []
-        for a in film_cast:
-            if a in profile.actors:
-                a_score = profile.actors[a]
-                count = profile.actor_counts.get(a, 1)
-                confidence = _confidence_weight(count, CONFIDENCE_MIN_SAMPLES['actor'])
-
-                if a_score < 0:
-                    # Amplify negative penalties
-                    score += a_score * WEIGHTS['actor'] * NEGATIVE_PENALTY_MULTIPLIER * confidence
-                    if a_score < NEGATIVE_THRESHOLD_ACTOR:
-                        warnings.append(f"⚠️ Actor: {a} (disliked)")
-                else:
-                    score += a_score * WEIGHTS['actor'] * confidence
-                    if a_score > MATCH_THRESHOLD_ACTOR:
-                        matched_actors.append(a)
-        if matched_actors:
-            reasons.append(f"Cast: {', '.join(matched_actors[:2])}")
-
-        # Theme match (with confidence weighting)
-        film_themes = load_json(film.get('themes', []))
-        for t in film_themes:
-            if t in profile.themes:
-                t_score = profile.themes[t]
-                count = profile.theme_counts.get(t, 1)
-                confidence = _confidence_weight(count, CONFIDENCE_MIN_SAMPLES['theme'])
-                score += t_score * WEIGHTS['theme'] * confidence
-
         # Decade match
         year = film.get('year')
         if year:
@@ -404,7 +545,7 @@ class MetadataRecommender:
             if decade in profile.decades:
                 score += profile.decades[decade] * WEIGHTS['decade']
 
-        # Country match (with confidence weighting)
+        # Country match (with primary/secondary weighting)
         film_countries = load_json(film.get('countries', []))
         for i, country in enumerate(film_countries):
             if country in profile.countries:
@@ -417,75 +558,6 @@ class MetadataRecommender:
                 score += country_score * country_weight * confidence
                 if i == 0 and country_score > 0.5:
                     reasons.append(f"Country: {country}")
-
-        # Language match (with confidence weighting)
-        film_languages = load_json(film.get('languages', []))
-        matched_languages = []
-        for lang in film_languages:
-            if lang in profile.languages:
-                lang_score = profile.languages[lang]
-                count = profile.language_counts.get(lang, 1)
-                confidence = _confidence_weight(count, CONFIDENCE_MIN_SAMPLES['language'])
-
-                if lang_score > MATCH_THRESHOLD_LANGUAGE:
-                    score += lang_score * WEIGHTS['language'] * confidence
-                    matched_languages.append(lang)
-        if matched_languages:
-            reasons.append(f"Language: {matched_languages[0]}")
-
-        # Writer match (with negative penalties and confidence weighting)
-        film_writers = load_json(film.get('writers', []))
-        for w in film_writers:
-            if w in profile.writers:
-                writer_score = profile.writers[w]
-                count = profile.writer_counts.get(w, 1)
-                confidence = _confidence_weight(count, CONFIDENCE_MIN_SAMPLES['writer'])
-
-                if writer_score < 0:
-                    # Amplify negative penalties
-                    score += writer_score * WEIGHTS['writer'] * NEGATIVE_PENALTY_MULTIPLIER * confidence
-                    if writer_score < NEGATIVE_THRESHOLD_WRITER:
-                        warnings.append(f"⚠️ Writer: {w} (disliked)")
-                else:
-                    score += writer_score * WEIGHTS['writer'] * confidence
-                    if writer_score > MATCH_THRESHOLD_WRITER:
-                        reasons.append(f"Writer: {w}")
-
-        # Cinematographer match (with negative penalties and confidence weighting)
-        film_cinematographers = load_json(film.get('cinematographers', []))
-        for c in film_cinematographers:
-            if c in profile.cinematographers:
-                cine_score = profile.cinematographers[c]
-                count = profile.cinematographer_counts.get(c, 1)
-                confidence = _confidence_weight(count, CONFIDENCE_MIN_SAMPLES['cinematographer'])
-
-                if cine_score < 0:
-                    # Amplify negative penalties
-                    score += cine_score * WEIGHTS['cinematographer'] * NEGATIVE_PENALTY_MULTIPLIER * confidence
-                    if cine_score < NEGATIVE_THRESHOLD_CINE:
-                        warnings.append(f"⚠️ Cinematographer: {c} (disliked)")
-                else:
-                    score += cine_score * WEIGHTS['cinematographer'] * confidence
-                    if cine_score > MATCH_THRESHOLD_CINE:
-                        reasons.append(f"Cinematography: {c}")
-
-        # Composer match (with negative penalties and confidence weighting)
-        film_composers = load_json(film.get('composers', []))
-        for comp in film_composers:
-            if comp in profile.composers:
-                comp_score = profile.composers[comp]
-                count = profile.composer_counts.get(comp, 1)
-                confidence = _confidence_weight(count, CONFIDENCE_MIN_SAMPLES['composer'])
-
-                if comp_score < 0:
-                    # Amplify negative penalties
-                    score += comp_score * WEIGHTS['composer'] * NEGATIVE_PENALTY_MULTIPLIER * confidence
-                    if comp_score < NEGATIVE_THRESHOLD_COMPOSER:
-                        warnings.append(f"⚠️ Composer: {comp} (disliked)")
-                else:
-                    score += comp_score * WEIGHTS['composer'] * confidence
-                    if comp_score > MATCH_THRESHOLD_COMPOSER:
-                        reasons.append(f"Composer: {comp}")
 
         # Community rating bonus
         # Favor films rated similarly to user's liked films
@@ -821,9 +893,9 @@ class CollaborativeRecommender:
         
         return results
     
-    def _find_neighbors(self, username: str, target_films: list[dict], k: int = 10, max_users_to_compare: int = 10000) -> list[tuple[str, float]]:
+    def _find_neighbors(self, username: str, target_films: list[dict], k: int = 10) -> list[tuple[str, float]]:
         """
-        Find k most similar users based on rating overlap using vectorized sparse matrix operations.
+        Find k most similar users based on rating overlap using sparse-only operations.
         Uses mean-centered ratings to account for different rating scales (Pearson correlation).
         Returns list of (username, similarity_score) tuples.
 
@@ -831,10 +903,9 @@ class CollaborativeRecommender:
             username: Target username
             target_films: Target user's film interactions
             k: Number of neighbors to return
-            max_users_to_compare: Maximum number of users to compare (for large datasets) - ignored when using sparse matrix
         """
         import numpy as np
-        from sklearn.metrics.pairwise import cosine_similarity
+        from scipy.sparse import csr_matrix
 
         if username not in self._user_index or self._user_matrix is None:
             return []
@@ -849,45 +920,90 @@ class CollaborativeRecommender:
         if len(target_nonzero) == 0:
             return []
 
-        # Mean-center all users' ratings for Pearson correlation
-        # Convert to dense for efficient row-wise operations (still faster than looping)
-        all_ratings = self._user_matrix.toarray()
+        # Compute user means using sparse operations
+        # mean = sum / count where count is number of non-zeros
+        n_users = self._user_matrix.shape[0]
+        row_sums = np.array(self._user_matrix.sum(axis=1)).flatten()
+        row_counts = np.array(self._user_matrix.getnnz(axis=1))
+        row_means = np.divide(row_sums, row_counts, where=row_counts > 0, out=np.zeros_like(row_sums))
 
-        # Compute masks and means for all users at once
-        masks = all_ratings > 0
-        row_means = np.sum(all_ratings * masks, axis=1) / np.maximum(masks.sum(axis=1), 1)
+        # Create binary masks for computing common film counts
+        # Convert to boolean CSR for efficient boolean operations
+        user_masks = (self._user_matrix > 0).astype(bool)
+        target_mask = user_masks[target_idx]
 
-        # Mean-center all ratings
-        centered_ratings = all_ratings.copy()
-        for i in range(len(centered_ratings)):
-            centered_ratings[i, masks[i]] -= row_means[i]
+        # Compute common film counts efficiently using sparse dot product
+        # This is much faster than element-wise multiplication for large sparse matrices
+        common_counts = np.array(user_masks.dot(target_mask.T).todense()).flatten()
 
-        # Compute number of common rated films between target and all other users
-        target_mask = masks[target_idx]
-        common_counts = (masks & target_mask).sum(axis=1)
+        # Filter to users with at least 5 common films (excluding target)
+        min_common = 5
+        valid_mask = (common_counts >= min_common) & (np.arange(n_users) != target_idx)
 
-        # Filter users with at least 5 common films
-        valid_users_mask = (common_counts >= 5) & (np.arange(len(all_ratings)) != target_idx)
-
-        if not valid_users_mask.any():
+        if not valid_mask.any():
             return []
 
-        # Use cosine similarity on centered ratings (equivalent to Pearson correlation)
-        # Only compute for valid users
-        target_centered = centered_ratings[target_idx:target_idx+1]  # Keep 2D shape
-        valid_centered = centered_ratings[valid_users_mask]
+        # Get valid user indices
+        valid_indices = np.where(valid_mask)[0]
 
-        # Cosine similarity on mean-centered ratings = Pearson correlation
-        similarities = cosine_similarity(target_centered, valid_centered).flatten()
+        # Compute Pearson correlation for valid users using sparse operations
+        # pearson(u, v) = sum((r_ui - μ_u) * (r_vi - μ_v)) / (σ_u * σ_v * n_common)
+        # We can compute this efficiently in sparse form
+
+        target_mean = row_means[target_idx]
+        target_data = target_row.data
+        target_cols = target_row.indices
+
+        # Build centered target vector (only non-zero entries)
+        target_centered_data = target_data - target_mean
+
+        similarities = []
+        for user_idx in valid_indices:
+            user_row = self._user_matrix[user_idx]
+            user_mean = row_means[user_idx]
+
+            # Find common films (intersection of non-zero indices)
+            user_cols = set(user_row.indices)
+            target_cols_set = set(target_cols)
+            common_films = user_cols & target_cols_set
+
+            if len(common_films) < min_common:
+                similarities.append(0.0)
+                continue
+
+            # Compute centered dot product on common films
+            common_list = list(common_films)
+
+            # Get values for common films
+            target_vals = np.array([target_row[0, col] for col in common_list])
+            user_vals = np.array([user_row[0, col] for col in common_list])
+
+            # Center the values
+            target_centered = target_vals - target_mean
+            user_centered = user_vals - user_mean
+
+            # Compute Pearson correlation
+            numerator = np.dot(target_centered, user_centered)
+            target_std = np.sqrt(np.sum(target_centered ** 2))
+            user_std = np.sqrt(np.sum(user_centered ** 2))
+
+            if target_std > 0 and user_std > 0:
+                pearson = numerator / (target_std * user_std)
+            else:
+                pearson = 0.0
+
+            similarities.append(pearson)
+
+        similarities = np.array(similarities)
 
         # Apply significance weighting - more common films = more reliable
-        valid_common_counts = common_counts[valid_users_mask]
+        valid_common_counts = common_counts[valid_indices]
         confidence = np.minimum(valid_common_counts / 20.0, 1.0)  # Full confidence at 20+ common films
         weighted_similarities = similarities * confidence
 
         # Build result list with usernames
         usernames = list(self._user_index.keys())
-        valid_usernames = [usernames[i] for i in np.where(valid_users_mask)[0]]
+        valid_usernames = [usernames[i] for i in valid_indices]
 
         # Combine usernames and scores, sort by score
         results = list(zip(valid_usernames, weighted_similarities))
