@@ -193,11 +193,7 @@ class Recommendation:
     year: int | None
     score: float
     reasons: list[str]
-    warnings: list[str] = None  # Negative matches to surface
-
-    def __post_init__(self):
-        if self.warnings is None:
-            self.warnings = []
+    warnings: list[str] = field(default_factory=list)
 
 class MetadataRecommender:
     """
@@ -878,22 +874,22 @@ class CollaborativeRecommender:
         for neighbor_user, similarity in neighbors:
             neighbor_films = self.all_user_films[neighbor_user]
             
-            for film in neighbor_films:
-                slug = film['slug']
+            for interaction in neighbor_films:
+                slug = interaction['slug']
                 if slug in seen:
                     continue
                 
                 # Apply filters if metadata available
                 if self.films and slug in self.films:
-                    film = self.films[slug]
-                    year = film.get('year')
+                    film_meta = self.films[slug]
+                    year = film_meta.get('year')
                     if min_year and year and year < min_year:
                         continue
                     if max_year and year and year > max_year:
                         continue
 
                     # Apply genre filters (genres are stored lowercase)
-                    film_genres = load_json(film.get('genres'))
+                    film_genres = load_json(film_meta.get('genres'))
                     if genres:
                         genres_lower = [g.lower() for g in genres]
                         if not any(g in film_genres for g in genres_lower):
@@ -903,8 +899,8 @@ class CollaborativeRecommender:
                         if any(g in film_genres for g in exclude_genres_lower):
                             continue
                 
-                rating = film.get('rating')
-                liked = film.get('liked', False)
+                rating = interaction.get('rating')  # Use original variable
+                liked = interaction.get('liked', False)
                 
                 # Score based on rating or like
                 if rating and rating >= 3.5:
