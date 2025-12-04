@@ -714,7 +714,7 @@ class MetadataRecommender:
                 f"Consider increasing --max-per-director or disabling --diversity for more results."
             )
             logger.warning(warning_msg)
-            print(f"\n⚠️  {warning_msg}")
+            logger.warning(f"\n⚠️  {warning_msg}")
 
         return results
 
@@ -862,7 +862,7 @@ class CollaborativeRecommender:
         neighbors = self._find_neighbors(username, target_films)
         
         if len(neighbors) < min_neighbors:
-            print(f"Warning: Only found {len(neighbors)} neighbors (min: {min_neighbors})")
+            logger.warning(f"Warning: Only found {len(neighbors)} neighbors (min: {min_neighbors})")
         
         # Get films seen by target
         seen = {f['slug'] for f in target_films}

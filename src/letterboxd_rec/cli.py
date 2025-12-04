@@ -199,10 +199,10 @@ def cmd_scrape(args: argparse.Namespace) -> None:
                     age_days = (datetime.now() - last_scrape).days
 
                     if age_days < args.refresh:
-                        print(f"  Skipping {username} (last scraped {age_days} days ago, refresh threshold: {args.refresh} days)")
+                        logger.info(f"  Skipping {username} (last scraped {age_days} days ago, refresh threshold: {args.refresh} days)")
                         return
                     else:
-                        print(f"  Refreshing {username} (last scraped {age_days} days ago)")
+                        logger.info(f"  Refreshing {username} (last scraped {age_days} days ago)")
 
         # Check for incremental mode
         incremental = getattr(args, 'incremental', False)
@@ -234,17 +234,17 @@ def cmd_scrape(args: argparse.Namespace) -> None:
         new_slugs = [i.film_slug for i in interactions if i.film_slug not in existing]
         
         # Scrape and batch insert film metadata
-        print("\nFetching film metadata...")
+        logger.info("\nFetching film metadata...")
         _scrape_film_metadata(scraper, new_slugs)
         
         # Scrape user lists if enabled
         if args.include_lists:
-            print(f"\nScraping {username}'s lists...")
+            logger.info(f"\nScraping {username}'s lists...")
 
             # Get profile favorites (4-film showcase)
             favorites = scraper.scrape_favorites(username)
             if favorites:
-                print(f"  Found {len(favorites)} profile favorites")
+                logger.info(f"  Found {len(favorites)} profile favorites")
                 with get_db() as conn:
                     for slug in favorites:
                         conn.execute("""
@@ -268,11 +268,11 @@ def cmd_scrape(args: argparse.Namespace) -> None:
                 # Detect favorites
                 is_favorites = "favorite" in list_name.lower() or list_slug == "favorites"
 
-                print(f"  Scraping list: {list_name}...")
+                logger.info(f"  Scraping list: {list_name}...")
                 films = scraper.scrape_list_films(username, list_slug)
                 
                 if not films:
-                    print(f"    (empty list)")
+                    logger.info(f"    (empty list)")
                     continue
                 
                 # Save to database
@@ -288,9 +288,9 @@ def cmd_scrape(args: argparse.Namespace) -> None:
                             film['film_slug'], datetime.now().isoformat()
                         ))
                 
-                print(f"    {len(films)} films")
+                logger.info(f"    {len(films)} films")
 
-        print(f"\nDone! {len(interactions)} films for {username}")
+        logger.info(f"\nDone! {len(interactions)} films for {username}")
         
     finally:
         scraper.close()
@@ -309,44 +309,44 @@ def cmd_discover(args: argparse.Namespace) -> None:
         if continue_mode:
             # Drain pending queue only
             queue_stats = get_pending_queue_stats()
-            print(f"\nPending queue stats:")
-            print(f"  Total pending users: {queue_stats['total']}")
+            logger.info(f"\nPending queue stats:")
+            logger.info(f"  Total pending users: {queue_stats['total']}")
             if queue_stats['breakdown']:
-                print(f"  By source type:")
+                logger.info(f"  By source type:")
                 for source_type, count in queue_stats['breakdown'].items():
-                    print(f"    {source_type}: {count}")
+                    logger.info(f"    {source_type}: {count}")
 
             if queue_stats['total'] == 0:
-                print("\nNo pending users to scrape!")
+                logger.info("\nNo pending users to scrape!")
                 return
 
             pending = get_pending_users(limit=args.limit)
             usernames_to_scrape = [p['username'] for p in pending]
-            print(f"\nProcessing {len(usernames_to_scrape)} users from pending queue...")
+            logger.info(f"\nProcessing {len(usernames_to_scrape)} users from pending queue...")
 
         else:
             # Normal discovery mode with caching
             source = args.source
 
             if not source:
-                print("Error: source is required unless using --continue")
+                logger.error("Error: source is required unless using --continue")
                 return
 
             # Determine source_id based on source type
             if source in ('following', 'followers'):
                 if not args.username:
-                    print(f"--username is required for '{source}' source")
+                    logger.error(f"--username is required for '{source}' source")
                     return
                 source_id = _validate_username(args.username)
             elif source in ('film', 'film_reviews'):
                 if not args.film_slug:
-                    print(f"--film-slug is required for '{source}' source")
+                    logger.error(f"--film-slug is required for '{source}' source")
                     return
                 source_id = _validate_slug(args.film_slug)
             elif source == 'popular':
                 source_id = 'members'  # Popular members endpoint
             else:
-                print(f"Unknown source: {source}")
+                logger.error(f"Unknown source: {source}")
                 return
 
             # Check for cached discovery source
@@ -360,12 +360,12 @@ def cmd_discover(args: argparse.Namespace) -> None:
                 if age_days < source_refresh_days:
                     # Resume from last page
                     start_page = cached_source['last_page_scraped'] + 1
-                    print(f"Resuming {source}:{source_id} from page {start_page} (last scraped {age_days} days ago)")
+                    logger.info(f"Resuming {source}:{source_id} from page {start_page} (last scraped {age_days} days ago)")
                 else:
-                    print(f"Re-crawling {source}:{source_id} from page 1 (stale: {age_days} days > {source_refresh_days} days)")
+                    logger.info(f"Re-crawling {source}:{source_id} from page 1 (stale: {age_days} days > {source_refresh_days} days)")
 
             # Discover users
-            print(f"Discovering users from {source}:{source_id}...")
+            logger.info(f"Discovering users from {source}:{source_id}...")
             all_discovered = []
             page = start_page
             priority = DISCOVERY_PRIORITY_MAP.get(source, 50)
@@ -431,13 +431,13 @@ def cmd_discover(args: argparse.Namespace) -> None:
                 all_discovered.extend(filtered_usernames)
                 page += 1
 
-                print(f"  Page {page-1}: found {len(usernames)} users, {len(filtered_usernames)} passed filters (total: {len(all_discovered)})")
+                logger.info(f"  Page {page-1}: found {len(usernames)} users, {len(filtered_usernames)} passed filters (total: {len(all_discovered)})")
 
-            print(f"\nActivity filtering: {activity_checked} checked, {filtered_count} filtered out, {len(all_discovered)} passed")
+            logger.info(f"\nActivity filtering: {activity_checked} checked, {filtered_count} filtered out, {len(all_discovered)} passed")
 
             # Add discovered users to pending queue
             new_pending = add_pending_users(all_discovered, source, source_id, priority)
-            print(f"Added {new_pending} new users to pending queue")
+            logger.info(f"Added {new_pending} new users to pending queue")
 
             # Update discovery source cache
             update_discovery_source(source, source_id, page - 1, len(all_discovered))
@@ -447,19 +447,19 @@ def cmd_discover(args: argparse.Namespace) -> None:
             usernames_to_scrape = [p['username'] for p in pending]
 
             if not usernames_to_scrape:
-                print("\nNo new users to scrape from pending queue!")
+                logger.info("\nNo new users to scrape from pending queue!")
                 return
 
-            print(f"\nScraping {len(usernames_to_scrape)} users from pending queue...")
+            logger.info(f"\nScraping {len(usernames_to_scrape)} users from pending queue...")
 
         # Check for dry-run mode
         dry_run = getattr(args, 'dry_run', False)
 
         if dry_run:
-            print(f"\n[DRY RUN] Would scrape {len(usernames_to_scrape)} users:")
+            logger.info(f"\n[DRY RUN] Would scrape {len(usernames_to_scrape)} users:")
             for i, username in enumerate(usernames_to_scrape, 1):
-                print(f"  {i}. {username}")
-            print(f"\nTo actually scrape these users, run without --dry-run flag")
+                logger.info(f"  {i}. {username}")
+            logger.info(f"\nTo actually scrape these users, run without --dry-run flag")
             return
 
         # Scrape each user
@@ -499,13 +499,13 @@ def cmd_discover(args: argparse.Namespace) -> None:
             except Exception as e:
                 logger.error(f"Error scraping {username}: {e}")
 
-        print(f"\nDone! Scraped {len(usernames_to_scrape)} users.")
+        logger.info(f"\nDone! Scraped {len(usernames_to_scrape)} users.")
 
         # Show remaining pending queue stats
         queue_stats = get_pending_queue_stats()
         if queue_stats['total'] > 0:
-            print(f"\nRemaining in pending queue: {queue_stats['total']} users")
-            print("Run with --continue to scrape more from the queue")
+            logger.info(f"\nRemaining in pending queue: {queue_stats['total']} users")
+            logger.info("Run with --continue to scrape more from the queue")
 
     finally:
         scraper.close()
@@ -532,7 +532,7 @@ def cmd_recommend(args: argparse.Namespace) -> None:
             """, (username,))]
 
         if not user_films:
-            print(f"No data for '{username}'. Run: python main.py scrape {username}")
+            logger.error(f"No data for '{username}'. Run: python main.py scrape {username}")
             return
 
         # Load film metadata with SQL-side filtering for better performance
@@ -677,7 +677,7 @@ def cmd_recommend(args: argparse.Namespace) -> None:
                 user_lists=user_lists
             )
     
-    # Format and print results
+    # Format results
     output_format = getattr(args, 'format', 'text')
     if output_format == 'json':
         output = []
@@ -698,23 +698,23 @@ def cmd_recommend(args: argparse.Namespace) -> None:
                 "avg_rating": film.get('avg_rating'),
                 "rating_count": film.get('rating_count')
             })
-        print(json.dumps(output, indent=2))
+        logger.info(json.dumps(output, indent=2))
     elif output_format == 'csv':
-        print("Title,Year,URL,Score,Reasons")
+        logger.info("Title,Year,URL,Score,Reasons")
         for r in recs:
             reasons = "; ".join(r.reasons).replace('"', '""')
-            print(f'"{r.title}",{r.year},https://letterboxd.com/film/{r.slug}/,{r.score:.2f},"{reasons}"')
+            logger.info(f'"{r.title}",{r.year},https://letterboxd.com/film/{r.slug}/,{r.score:.2f},"{reasons}"')
     elif output_format == 'markdown':
-        print(f"\n# Top {len(recs)} recommendations for {username} ({strategy})\n")
+        logger.info(f"\n# Top {len(recs)} recommendations for {username} ({strategy})\n")
         for i, r in enumerate(recs, 1):
-            print(f"## {i}. [{r.title} ({r.year})](https://letterboxd.com/film/{r.slug}/)")
-            print(f"**Score**: {r.score:.1f}  ")
-            print(f"**Why**: {', '.join(r.reasons)}\n")
+            logger.info(f"## {i}. [{r.title} ({r.year})](https://letterboxd.com/film/{r.slug}/)")
+            logger.info(f"**Score**: {r.score:.1f}  ")
+            logger.info(f"**Why**: {', '.join(r.reasons)}\n")
     else:
-        print(f"\nTop {len(recs)} recommendations for {username} ({strategy}):")
+        logger.info(f"\nTop {len(recs)} recommendations for {username} ({strategy}):")
         for i, r in enumerate(recs, 1):
-            print(f"{i}. {r.title} ({r.year}) - Score: {r.score:.1f}")
-            print(f"   Why: {', '.join(r.reasons)}")
+            logger.info(f"{i}. {r.title} ({r.year}) - Score: {r.score:.1f}")
+            logger.info(f"   Why: {', '.join(r.reasons)}")
 
 
 def cmd_stats(args: argparse.Namespace) -> None:
@@ -725,11 +725,11 @@ def cmd_stats(args: argparse.Namespace) -> None:
         interaction_count = conn.execute("SELECT COUNT(*) FROM user_films").fetchone()[0]
         rated_count = conn.execute("SELECT COUNT(*) FROM user_films WHERE rating IS NOT NULL").fetchone()[0]
         
-        print(f"\nDatabase Statistics:")
-        print(f"  Users: {user_count}")
-        print(f"  Films: {film_count}")
-        print(f"  Total interactions: {interaction_count}")
-        print(f"  Rated interactions: {rated_count}")
+        logger.info(f"\nDatabase Statistics:")
+        logger.info(f"  Users: {user_count}")
+        logger.info(f"  Films: {film_count}")
+        logger.info(f"  Total interactions: {interaction_count}")
+        logger.info(f"  Rated interactions: {rated_count}")
         
         if user_count > 0:
             top_users = conn.execute("""
@@ -740,9 +740,9 @@ def cmd_stats(args: argparse.Namespace) -> None:
                 LIMIT 5
             """).fetchall()
             
-            print(f"\nTop users by film count:")
+            logger.info(f"\nTop users by film count:")
             for user, count in top_users:
-                print(f"  {user}: {count} films")
+                logger.info(f"  {user}: {count} films")
         
         verbose = getattr(args, 'verbose', False)
         if verbose:
@@ -753,7 +753,7 @@ def cmd_stats(args: argparse.Namespace) -> None:
                 WHERE f.slug IS NULL
             """).fetchone()[0]
             
-            print(f"\n  Films without metadata: {missing_metadata}")
+            logger.info(f"\n  Films without metadata: {missing_metadata}")
             
             oldest = conn.execute("""
                 SELECT username, MIN(scraped_at) as oldest_scrape
@@ -764,9 +764,9 @@ def cmd_stats(args: argparse.Namespace) -> None:
             """).fetchall()
             
             if oldest:
-                print(f"\nOldest scraped users:")
+                logger.info(f"\nOldest scraped users:")
                 for user, scrape_time in oldest:
-                    print(f"  {user}: {scrape_time}")
+                    logger.info(f"  {user}: {scrape_time}")
             
             film_genres = conn.execute("SELECT genres FROM films WHERE genres IS NOT NULL").fetchall()
             from collections import Counter
@@ -777,9 +777,9 @@ def cmd_stats(args: argparse.Namespace) -> None:
                     genre_counts[g] += 1
             
             if genre_counts:
-                print(f"\nTop genres in database:")
+                logger.info(f"\nTop genres in database:")
                 for genre, count in genre_counts.most_common(10):
-                    print(f"  {genre}: {count} films")
+                    logger.info(f"  {genre}: {count} films")
 
 
 def cmd_export(args: argparse.Namespace) -> None:
@@ -797,7 +797,7 @@ def cmd_export(args: argparse.Namespace) -> None:
     with open(args.file, 'w') as f:
         json.dump(data, f, indent=2)
     
-    print(f"Exported {len(user_films)} user interactions and {len(films)} films to {args.file}")
+    logger.info(f"Exported {len(user_films)} user interactions and {len(films)} films to {args.file}")
 
 
 def cmd_import(args: argparse.Namespace) -> None:
@@ -823,7 +823,7 @@ def cmd_import(args: argparse.Namespace) -> None:
                     film.get('countries'), film.get('languages'),
                     film.get('writers'), film.get('cinematographers'), film.get('composers')
                 ))
-            print(f"Imported {len(data['films'])} films")
+            logger.info(f"Imported {len(data['films'])} films")
         
         if 'user_films' in data:
             for uf in data['user_films']:
@@ -836,9 +836,9 @@ def cmd_import(args: argparse.Namespace) -> None:
                     uf.get('watched'), uf.get('watchlisted'), uf.get('liked'),
                     uf.get('scraped_at')
                 ))
-            print(f"Imported {len(data['user_films'])} user interactions")
+            logger.info(f"Imported {len(data['user_films'])} user interactions")
     
-    print(f"Import completed from {args.file}")
+    logger.info(f"Import completed from {args.file}")
 
 
 def cmd_profile(args: argparse.Namespace) -> None:
@@ -854,38 +854,38 @@ def cmd_profile(args: argparse.Namespace) -> None:
         all_films = {r['slug']: dict(r) for r in conn.execute("SELECT * FROM films")}
     
     if not user_films:
-        print(f"No data for '{username}'. Run: python main.py scrape {username}")
+        logger.error(f"No data for '{username}'. Run: python main.py scrape {username}")
         return
 
     profile = build_profile(user_films, all_films, username=username)
 
-    print(f"\nProfile for {username}")
-    print(f"  Films: {profile.n_films} ({profile.n_rated} rated, {profile.n_liked} liked)")
+    logger.info(f"\nProfile for {username}")
+    logger.info(f"  Films: {profile.n_films} ({profile.n_rated} rated, {profile.n_liked} liked)")
     if profile.avg_liked_rating:
-        print(f"  Average rating: {profile.avg_liked_rating:.2f}★")
+        logger.info(f"  Average rating: {profile.avg_liked_rating:.2f}★")
     
     if profile.genres:
-        print("\nTop genres:")
+        logger.info("\nTop genres:")
         for g, score in sorted(profile.genres.items(), key=lambda x: -x[1])[:10]:
-            print(f"  {g}: {score:+.2f}")
+            logger.info(f"  {g}: {score:+.2f}")
     
     if profile.directors:
-        print("\nTop directors:")
+        logger.info("\nTop directors:")
         for d, score in sorted(profile.directors.items(), key=lambda x: -x[1])[:10]:
-            print(f"  {d}: {score:+.2f}")
+            logger.info(f"  {d}: {score:+.2f}")
     
     if profile.actors:
-        print("\nTop actors:")
+        logger.info("\nTop actors:")
         for a, score in sorted(profile.actors.items(), key=lambda x: -x[1])[:10]:
-            print(f"  {a}: {score:+.2f}")
+            logger.info(f"  {a}: {score:+.2f}")
     
     if profile.decades:
-        print("\nDecade preferences:")
+        logger.info("\nDecade preferences:")
         for dec in sorted(profile.decades.keys()):
             score = profile.decades[dec]
             bar_length = int(max(0, score * 2))
             bar = "█" * bar_length
-            print(f"  {dec}s: {bar} ({score:+.1f})")
+            logger.info(f"  {dec}s: {bar} ({score:+.1f})")
 
 
 def cmd_similar(args: argparse.Namespace) -> None:
@@ -897,20 +897,20 @@ def cmd_similar(args: argparse.Namespace) -> None:
         all_films = [dict(r) for r in conn.execute("SELECT * FROM films")]
     
     if not all_films:
-        print("No films in database. Run scrape first.")
+        logger.error("No films in database. Run scrape first.")
         return
     
     recommender = MetadataRecommender(all_films)
     recs = recommender.similar_to(slug, n=args.limit)
     
     if not recs:
-        print(f"No film found with slug '{args.slug}'")
+        logger.error(f"No film found with slug '{args.slug}'")
         return
     
-    print(f"\nFilms similar to {args.slug}:")
+    logger.info(f"\nFilms similar to {args.slug}:")
     for i, r in enumerate(recs, 1):
-        print(f"{i}. {r.title} ({r.year}) - Score: {r.score:.1f}")
-        print(f"   Why: {', '.join(r.reasons)}")
+        logger.info(f"{i}. {r.title} ({r.year}) - Score: {r.score:.1f}")
+        logger.info(f"   Why: {', '.join(r.reasons)}")
 
 
 def cmd_triage(args: argparse.Namespace) -> None:
@@ -932,20 +932,20 @@ def cmd_triage(args: argparse.Namespace) -> None:
         all_films = {r['slug']: dict(r) for r in conn.execute("SELECT * FROM films")}
     
     if not user_films:
-        print(f"No data for '{username}'. Run: python main.py scrape {username}")
+        logger.error(f"No data for '{username}'. Run: python main.py scrape {username}")
         return
 
     if not watchlist:
-        print(f"No watchlist data for '{username}'.")
+        logger.error(f"No watchlist data for '{username}'.")
         return
 
     recommender = MetadataRecommender(list(all_films.values()))
     recs = recommender.recommend_from_candidates(user_films, watchlist, n=args.limit)
 
-    print(f"\nWatchlist Triage for {username} (Top {len(recs)}):")
+    logger.info(f"\nWatchlist Triage for {username} (Top {len(recs)}):")
     for i, r in enumerate(recs, 1):
-        print(f"{i}. {r.title} ({r.year}) - Score: {r.score:.1f}")
-        print(f"   Why: {', '.join(r.reasons)}")
+        logger.info(f"{i}. {r.title} ({r.year}) - Score: {r.score:.1f}")
+        logger.info(f"   Why: {', '.join(r.reasons)}")
 
 
 def cmd_gaps(args: argparse.Namespace) -> None:
@@ -962,7 +962,7 @@ def cmd_gaps(args: argparse.Namespace) -> None:
         all_films = {r['slug']: dict(r) for r in conn.execute("SELECT * FROM films")}
     
     if not user_films:
-        print(f"No data for '{username}'. Run: python main.py scrape {username}")
+        logger.error(f"No data for '{username}'. Run: python main.py scrape {username}")
         return
 
     recommender = MetadataRecommender(list(all_films.values()))
@@ -975,38 +975,38 @@ def cmd_gaps(args: argparse.Namespace) -> None:
     )
 
     if not gaps:
-        print(f"No gaps found for {username}. Try lowering --min-score.")
+        logger.error(f"No gaps found for {username}. Try lowering --min-score.")
         return
 
-    print(f"\nFilmography Gaps for {username}:")
+    logger.info(f"\nFilmography Gaps for {username}:")
     for director, recs in sorted(gaps.items(), key=lambda x: -len(x[1])):
-        print(f"\n{director}:")
+        logger.info(f"\n{director}:")
         for r in recs:
-            print(f"  - {r.title} ({r.year}) [{r.score:.1f}]")
+            logger.info(f"  - {r.title} ({r.year}) [{r.score:.1f}]")
 
 
 def cmd_rebuild_idf(args: argparse.Namespace) -> None:
     """Rebuild IDF (Inverse Document Frequency) scores for all attributes."""
     init_db()
 
-    print("Computing IDF scores for all attributes...")
-    print("This may take a while depending on database size...")
+    logger.info("Computing IDF scores for all attributes...")
+    logger.info("This may take a while depending on database size...")
 
     results = compute_and_store_idf()
 
     if not results:
-        print("\nNo films found in database. IDF table is empty.")
-        print("Run 'python main.py scrape <username>' to add films first.")
+        logger.error("\nNo films found in database. IDF table is empty.")
+        logger.error("Run 'python main.py scrape <username>' to add films first.")
         return
 
-    print("\nIDF computation complete!")
-    print("\nAttribute counts:")
+    logger.info("\nIDF computation complete!")
+    logger.info("\nAttribute counts:")
     for attr_type, count in sorted(results.items()):
-        print(f"  {attr_type}: {count} unique values")
+        logger.info(f"  {attr_type}: {count} unique values")
 
     total = sum(results.values())
-    print(f"\nTotal: {total} attribute values indexed")
-    print("\nIDF scores will now be used to prioritize rare/distinctive preferences in recommendations.")
+    logger.info(f"\nTotal: {total} attribute values indexed")
+    logger.info("\nIDF scores will now be used to prioritize rare/distinctive preferences in recommendations.")
 
 
 def main():
