@@ -381,11 +381,21 @@ class MetadataRecommender:
         user_films: list[dict],
         candidates: list[str],
         n: int = 20,
+        profile: UserProfile | None = None,
     ) -> list[Recommendation]:
-        """Score and rank a specific list of films (e.g. watchlist)."""
-        # Build user profile
-        profile = build_profile(user_films, self.films)
-        
+        """
+        Score and rank a specific list of films (e.g. watchlist).
+
+        Args:
+            user_films: User's film interactions
+            candidates: List of film slugs to score
+            n: Number of recommendations to return
+            profile: Optional pre-built UserProfile to avoid rebuilding
+        """
+        # Build or use provided profile
+        if profile is None:
+            profile = build_profile(user_films, self.films)
+
         scored_candidates = []
         for slug in candidates:
             if slug not in self.films:
@@ -702,11 +712,13 @@ class MetadataRecommender:
 
         # Warn if diversity constraints prevented reaching requested count
         if len(results) < n:
-            logger.warning(
+            warning_msg = (
                 f"Diversity mode returned only {len(results)}/{n} results. "
                 f"Director constraint (max {max_per_director} per director) limited options. "
                 f"Consider increasing --max-per-director or disabling --diversity for more results."
             )
+            logger.warning(warning_msg)
+            print(f"\n⚠️  {warning_msg}")
 
         return results
 
@@ -953,9 +965,6 @@ class CollaborativeRecommender:
         target_mean = row_means[target_idx]
         target_data = target_row.data
         target_cols = target_row.indices
-
-        # Build centered target vector (only non-zero entries)
-        target_centered_data = target_data - target_mean
 
         similarities = []
         for user_idx in valid_indices:
