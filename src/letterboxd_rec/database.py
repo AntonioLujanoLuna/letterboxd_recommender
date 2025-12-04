@@ -2,6 +2,7 @@ import sqlite3
 import json
 import logging
 import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime
 from .config import DB_PATH
@@ -21,10 +22,169 @@ def parse_timestamp_naive(timestamp_str: str) -> datetime:
     # Always return naive datetime for consistency
     return dt.replace(tzinfo=None) if dt.tzinfo else dt
 
-# Connection pool singleton with bounded size
-_connection_pool_lock = threading.Lock()
-_connection_pool = {}
-_MAX_POOL_SIZE = 50  # Maximum number of cached connections
+
+class ConnectionPool:
+    """
+    Thread-safe SQLite connection pool with health checks and automatic cleanup.
+
+    Features:
+    - One connection per thread (SQLite threading requirement)
+    - Periodic health checks via SELECT 1
+    - Automatic cleanup of dead thread connections
+    - Explicit transaction nesting tracking
+    """
+
+    def __init__(self, db_path, max_size: int = 50, health_check_interval: int = 300):
+        self._db_path = db_path
+        self._max_size = max_size
+        self._health_check_interval = health_check_interval
+
+        self._lock = threading.Lock()
+        self._connections: dict[int, sqlite3.Connection] = {}
+        self._last_used: dict[int, float] = {}
+        self._last_health_check: dict[int, float] = {}
+        self._transaction_depth: dict[int, int] = {}  # Track nested transactions
+        self._last_cleanup = time.time()
+        self._cleanup_interval = 60  # Cleanup every 60 seconds max
+
+    def _create_connection(self) -> sqlite3.Connection:
+        """Create a new database connection with optimal settings."""
+        conn = sqlite3.connect(self._db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+
+        # Performance optimizations
+        conn.execute("PRAGMA busy_timeout = 5000")
+        conn.execute("PRAGMA journal_mode = WAL")  # Better concurrency
+        conn.execute("PRAGMA synchronous = NORMAL")  # Faster, still safe with WAL
+        conn.execute("PRAGMA cache_size = -64000")  # 64MB cache
+
+        return conn
+
+    def _health_check(self, conn: sqlite3.Connection) -> bool:
+        """Verify connection is still valid."""
+        try:
+            conn.execute("SELECT 1").fetchone()
+            return True
+        except sqlite3.Error:
+            return False
+
+    def _maybe_cleanup(self):
+        """Periodically cleanup dead thread connections."""
+        now = time.time()
+        if now - self._last_cleanup < self._cleanup_interval:
+            return
+
+        self._last_cleanup = now
+        alive_threads = {t.ident for t in threading.enumerate()}
+        dead_threads = set(self._connections.keys()) - alive_threads
+
+        for thread_id in dead_threads:
+            conn = self._connections.pop(thread_id, None)
+            self._last_used.pop(thread_id, None)
+            self._last_health_check.pop(thread_id, None)
+            self._transaction_depth.pop(thread_id, None)
+
+            if conn:
+                try:
+                    conn.close()
+                    logger.debug(f"Cleaned up connection for dead thread {thread_id}")
+                except Exception as e:
+                    logger.warning(f"Error closing connection for thread {thread_id}: {e}")
+
+        if dead_threads:
+            logger.info(f"Connection pool cleanup: removed {len(dead_threads)} dead connections, {len(self._connections)} remaining")
+
+    def get_connection(self) -> sqlite3.Connection:
+        """Get a connection for the current thread, creating if necessary."""
+        thread_id = threading.get_ident()
+        now = time.time()
+
+        with self._lock:
+            self._maybe_cleanup()
+
+            conn = self._connections.get(thread_id)
+
+            # Check if connection needs health check
+            if conn is not None:
+                last_check = self._last_health_check.get(thread_id, 0)
+                if now - last_check > self._health_check_interval:
+                    if not self._health_check(conn):
+                        logger.warning(f"Connection for thread {thread_id} failed health check, replacing")
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                        conn = None
+                    else:
+                        self._last_health_check[thread_id] = now
+
+            # Create new connection if needed
+            if conn is None:
+                if len(self._connections) >= self._max_size:
+                    # Force cleanup before creating new connection
+                    self._last_cleanup = 0
+                    self._maybe_cleanup()
+
+                    if len(self._connections) >= self._max_size:
+                        raise RuntimeError(
+                            f"Connection pool exhausted ({self._max_size} connections). "
+                            f"Possible connection leak or too many threads."
+                        )
+
+                conn = self._create_connection()
+                self._connections[thread_id] = conn
+                self._last_health_check[thread_id] = now
+                self._transaction_depth[thread_id] = 0
+                logger.debug(f"Created connection for thread {thread_id} (pool size: {len(self._connections)})")
+
+            self._last_used[thread_id] = now
+            return conn
+
+    def get_transaction_depth(self) -> int:
+        """Get current transaction nesting depth for this thread."""
+        return self._transaction_depth.get(threading.get_ident(), 0)
+
+    def increment_transaction_depth(self):
+        """Increment transaction depth (called on context entry)."""
+        thread_id = threading.get_ident()
+        with self._lock:
+            self._transaction_depth[thread_id] = self._transaction_depth.get(thread_id, 0) + 1
+
+    def decrement_transaction_depth(self):
+        """Decrement transaction depth (called on context exit)."""
+        thread_id = threading.get_ident()
+        with self._lock:
+            depth = self._transaction_depth.get(thread_id, 1)
+            self._transaction_depth[thread_id] = max(0, depth - 1)
+
+    def close_all(self):
+        """Close all connections (call on application shutdown)."""
+        with self._lock:
+            for thread_id, conn in list(self._connections.items()):
+                try:
+                    conn.close()
+                except Exception as e:
+                    logger.warning(f"Error closing connection for thread {thread_id}: {e}")
+
+            self._connections.clear()
+            self._last_used.clear()
+            self._last_health_check.clear()
+            self._transaction_depth.clear()
+            logger.info("Connection pool closed")
+
+    def stats(self) -> dict:
+        """Get pool statistics."""
+        with self._lock:
+            return {
+                'active_connections': len(self._connections),
+                'max_size': self._max_size,
+                'thread_ids': list(self._connections.keys()),
+            }
+
+
+# Global pool instance
+_pool: ConnectionPool | None = None
+_pool_lock = threading.Lock()
 
 
 def init_db() -> None:
@@ -285,96 +445,64 @@ def populate_normalized_tables_batch(conn, film_metadata_list: list) -> None:
         conn.executemany("INSERT OR IGNORE INTO film_themes (film_slug, theme) VALUES (?, ?)", theme_rows)
 
 
-def cleanup_connection_pool() -> None:
-    """
-    Remove connections for dead threads from the pool.
-    Should be called periodically in long-running processes.
-    """
-    with _connection_pool_lock:
-        alive_thread_ids = {t.ident for t in threading.enumerate()}
-        dead_thread_ids = set(_connection_pool.keys()) - alive_thread_ids
-
-        for thread_id in dead_thread_ids:
-            conn = _connection_pool.pop(thread_id)
-            try:
-                conn.close()
-                logger.debug(f"Cleaned up DB connection for dead thread {thread_id}")
-            except Exception as e:
-                logger.warning(f"Error closing connection for thread {thread_id}: {e}")
-
-
-def _get_thread_connection():
-    """
-    Get a connection for the current thread from the pool.
-    Each thread gets its own connection to avoid SQLite threading issues.
-    Enforces maximum pool size for resource management.
-    """
-    thread_id = threading.get_ident()
-
-    with _connection_pool_lock:
-        if thread_id not in _connection_pool:
-            # Check pool size before creating new connection
-            if len(_connection_pool) >= _MAX_POOL_SIZE:
-                logger.warning(
-                    f"Connection pool at maximum size ({_MAX_POOL_SIZE}). "
-                    f"Cleaning up dead threads before creating new connection."
-                )
-                # Force cleanup to make room
-                alive_thread_ids = {t.ident for t in threading.enumerate()}
-                dead_thread_ids = set(_connection_pool.keys()) - alive_thread_ids
-                for tid in dead_thread_ids:
-                    conn = _connection_pool.pop(tid)
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
-
-                # If still at capacity after cleanup, log error but create connection anyway
-                if len(_connection_pool) >= _MAX_POOL_SIZE:
-                    logger.error(
-                        f"Connection pool still at capacity after cleanup. "
-                        f"This may indicate a thread leak. Pool size: {len(_connection_pool)}"
-                    )
-
-            conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-            conn.row_factory = sqlite3.Row
-            # Set busy timeout to handle lock contention (5 seconds)
-            conn.execute("PRAGMA busy_timeout = 5000")
-            _connection_pool[thread_id] = conn
-            logger.debug(f"Created new DB connection for thread {thread_id} (pool size: {len(_connection_pool)})")
-
-        # Periodically cleanup dead thread connections (every 100th connection request)
-        # This is a lightweight heuristic to avoid accumulating stale connections
-        import random
-        if random.random() < 0.01:  # 1% chance to trigger cleanup
-            # Don't block the current request - just cleanup in background
-            try:
-                cleanup_connection_pool()
-            except Exception as e:
-                logger.debug(f"Background connection cleanup failed: {e}")
-
-        return _connection_pool[thread_id]
+def _get_pool() -> ConnectionPool:
+    """Get or create the global connection pool."""
+    global _pool
+    if _pool is None:
+        with _pool_lock:
+            if _pool is None:
+                DB_PATH.parent.mkdir(exist_ok=True, parents=True)
+                _pool = ConnectionPool(DB_PATH)
+    return _pool
 
 
 @contextmanager
-def get_db(exclude_commit: bool = False):
+def get_db(read_only: bool = False):
     """
-    Get database connection context manager with connection pooling.
-
-    Each thread gets its own persistent connection from the pool.
-    This reduces the overhead of creating new connections for every operation.
+    Get database connection with proper transaction handling.
 
     Args:
-        exclude_commit: If True, skip commit on exit (for read-only operations)
+        read_only: If True, skip commit on exit (optimization for read operations)
+
+    Handles nested calls correctly:
+    - Only the outermost context commits/rollbacks
+    - Inner contexts are no-ops for transaction control
     """
-    conn = _get_thread_connection()
+    pool = _get_pool()
+    conn = pool.get_connection()
+
+    is_outermost = pool.get_transaction_depth() == 0
+    pool.increment_transaction_depth()
+
     try:
         yield conn
-        if not exclude_commit:
+
+        # Only commit on outermost context exit
+        if is_outermost and not read_only:
             conn.commit()
+
     except Exception:
-        conn.rollback()
+        # Only rollback on outermost context
+        if is_outermost:
+            conn.rollback()
         raise
+
+    finally:
+        pool.decrement_transaction_depth()
+
+
+def close_pool():
+    """Close the connection pool. Call on application shutdown."""
+    global _pool
+    if _pool is not None:
+        _pool.close_all()
+        _pool = None
+
+
+def cleanup_connection_pool() -> None:
+    """Legacy function - cleanup is now automatic."""
+    pool = _get_pool()
+    pool._maybe_cleanup()
 
 
 def load_json(val):
@@ -392,7 +520,7 @@ def load_json(val):
 
 def load_user_lists(username: str) -> list[dict]:
     """Load all list entries for a user from database."""
-    with get_db(exclude_commit=True) as conn:
+    with get_db(read_only=True) as conn:
         cursor = conn.execute("""
             SELECT username, list_slug, list_name, is_ranked, is_favorites, position, film_slug
             FROM user_lists
@@ -415,7 +543,7 @@ def load_cached_profile(username: str, max_age_days: int = 7) -> dict | None:
     """
     from .config import PROFILE_SCHEMA_VERSION
 
-    with get_db(exclude_commit=True) as conn:
+    with get_db(read_only=True) as conn:
         cursor = conn.execute("""
             SELECT profile_data, updated_at, schema_version
             FROM user_profiles
@@ -507,7 +635,7 @@ def get_discovery_source(source_type: str, source_id: str) -> dict | None:
     Returns dict with last_page_scraped, total_users_found, and scraped_at,
     or None if source not found.
     """
-    with get_db(exclude_commit=True) as conn:
+    with get_db(read_only=True) as conn:
         cursor = conn.execute("""
             SELECT last_page_scraped, total_users_found, scraped_at
             FROM discovery_sources
@@ -583,7 +711,7 @@ def get_pending_users(limit: int = 50) -> list[dict]:
     Returns list of dicts with username, discovered_from_type, discovered_from_id,
     discovered_at, and priority.
     """
-    with get_db(exclude_commit=True) as conn:
+    with get_db(read_only=True) as conn:
         cursor = conn.execute("""
             SELECT username, discovered_from_type, discovered_from_id, discovered_at, priority
             FROM pending_users
@@ -601,7 +729,7 @@ def remove_pending_user(username: str) -> None:
 
 def get_pending_queue_stats() -> dict:
     """Get statistics about the pending users queue."""
-    with get_db(exclude_commit=True) as conn:
+    with get_db(read_only=True) as conn:
         cursor = conn.execute("""
             SELECT
                 COUNT(*) as total,
@@ -751,7 +879,7 @@ def load_idf() -> dict[str, dict[str, float]]:
 
     Returns nested dict: {"genre": {"drama": 0.5, ...}, "director": {...}, ...}
     """
-    with get_db(exclude_commit=True) as conn:
+    with get_db(read_only=True) as conn:
         cursor = conn.execute("""
             SELECT attribute_type, attribute_value, idf_score
             FROM attribute_idf

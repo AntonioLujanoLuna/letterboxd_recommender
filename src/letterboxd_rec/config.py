@@ -195,3 +195,9 @@ DISCOVERY_PRIORITY_MAP = {
     'popular': 70,        # Popular members
     'film': 50,           # Film fans (default)
 }
+
+# Temporal Decay Configuration
+# Weight recent interactions more heavily to account for evolving tastes
+TEMPORAL_DECAY_ENABLED = True
+TEMPORAL_DECAY_HALF_LIFE_DAYS = 365 * 2  # 2 years: weight halves every 2 years
+TEMPORAL_DECAY_MIN_WEIGHT = 0.1  # Floor to prevent old ratings from vanishing completely
