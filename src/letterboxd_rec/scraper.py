@@ -845,6 +845,10 @@ class AsyncLetterboxdScraper:
                         await asyncio.sleep(retry_after)
                         # Resume all tasks
                         self._rate_limit_event.set()
+                        # Add jitter to prevent thundering herd
+                        import random
+                        jitter = random.uniform(0, self.delay * 2)
+                        await asyncio.sleep(jitter)
                         continue
 
                     resp.raise_for_status()

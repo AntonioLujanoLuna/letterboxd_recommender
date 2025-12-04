@@ -5,15 +5,65 @@ This module centralizes all magic numbers and configurable parameters.
 Values can be overridden via environment variables or configuration files.
 """
 import os
+import logging
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+
+def _get_float_env(key: str, default: float, min_val: float = 0) -> float:
+    """
+    Safely parse float from environment variable with validation.
+
+    Args:
+        key: Environment variable name
+        default: Default value if not set or invalid
+        min_val: Minimum allowed value
+
+    Returns:
+        Validated float value
+    """
+    try:
+        val = float(os.environ.get(key, default))
+        if val < min_val:
+            logger.warning(f"{key}={val} is below minimum {min_val}, using {min_val}")
+            return min_val
+        return val
+    except ValueError:
+        logger.warning(f"Invalid {key}='{os.environ.get(key)}', using default {default}")
+        return default
+
+
+def _get_int_env(key: str, default: int, min_val: int = 1) -> int:
+    """
+    Safely parse integer from environment variable with validation.
+
+    Args:
+        key: Environment variable name
+        default: Default value if not set or invalid
+        min_val: Minimum allowed value
+
+    Returns:
+        Validated integer value
+    """
+    try:
+        val = int(os.environ.get(key, default))
+        if val < min_val:
+            logger.warning(f"{key}={val} is below minimum {min_val}, using {min_val}")
+            return min_val
+        return val
+    except ValueError:
+        logger.warning(f"Invalid {key}='{os.environ.get(key)}', using default {default}")
+        return default
+
 
 # Database Configuration
 DB_PATH = Path(os.environ.get("LETTERBOXD_DB", "data/letterboxd.db"))
 
 # Scraper Configuration
-DEFAULT_SCRAPER_DELAY = float(os.environ.get("LETTERBOXD_SCRAPER_DELAY", "1.0"))
-DEFAULT_ASYNC_DELAY = float(os.environ.get("LETTERBOXD_ASYNC_DELAY", "0.2"))
-DEFAULT_MAX_CONCURRENT = int(os.environ.get("LETTERBOXD_MAX_CONCURRENT", "5"))
+DEFAULT_SCRAPER_DELAY = _get_float_env("LETTERBOXD_SCRAPER_DELAY", 1.0, min_val=0.1)
+DEFAULT_ASYNC_DELAY = _get_float_env("LETTERBOXD_ASYNC_DELAY", 0.2, min_val=0.0)
+DEFAULT_MAX_CONCURRENT = _get_int_env("LETTERBOXD_MAX_CONCURRENT", 5, min_val=1)
 
 # Scraper Limits
 SCRAPER_MAX_CAST = 10  # Cast members to scrape per film (more than we score, for future use)
@@ -135,3 +185,13 @@ IDF_DISTINCTIVE_THRESHOLD = 2.0  # IDF above this is "distinctive taste"
 # - List multipliers change (LIST_MULTIPLIER_*)
 # - Confidence min samples change (CONFIDENCE_MIN_SAMPLES)
 PROFILE_SCHEMA_VERSION = 1
+
+# Discovery Priority Configuration
+# Priority scores for different user discovery sources
+DISCOVERY_PRIORITY_MAP = {
+    'film_reviews': 100,  # Engaged reviewers (highest quality)
+    'followers': 80,      # Social connections
+    'following': 80,      # Social connections
+    'popular': 70,        # Popular members
+    'film': 50,           # Film fans (default)
+}

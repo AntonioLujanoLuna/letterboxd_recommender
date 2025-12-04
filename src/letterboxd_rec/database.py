@@ -1,11 +1,10 @@
 import sqlite3
 import json
 import logging
-import os
 import threading
-from pathlib import Path
 from contextlib import contextmanager
 from datetime import datetime
+from .config import DB_PATH
 
 logger = logging.getLogger(__name__)
 
@@ -22,12 +21,10 @@ def parse_timestamp_naive(timestamp_str: str) -> datetime:
     # Always return naive datetime for consistency
     return dt.replace(tzinfo=None) if dt.tzinfo else dt
 
-# Adjust DB_PATH to be relative to the project root or a specific location
-DB_PATH = Path(os.environ.get("LETTERBOXD_DB", "data/letterboxd.db"))
-
-# Connection pool singleton
+# Connection pool singleton with bounded size
 _connection_pool_lock = threading.Lock()
 _connection_pool = {}
+_MAX_POOL_SIZE = 50  # Maximum number of cached connections
 
 
 def init_db() -> None:
@@ -310,17 +307,41 @@ def _get_thread_connection():
     """
     Get a connection for the current thread from the pool.
     Each thread gets its own connection to avoid SQLite threading issues.
+    Enforces maximum pool size for resource management.
     """
     thread_id = threading.get_ident()
 
     with _connection_pool_lock:
         if thread_id not in _connection_pool:
+            # Check pool size before creating new connection
+            if len(_connection_pool) >= _MAX_POOL_SIZE:
+                logger.warning(
+                    f"Connection pool at maximum size ({_MAX_POOL_SIZE}). "
+                    f"Cleaning up dead threads before creating new connection."
+                )
+                # Force cleanup to make room
+                alive_thread_ids = {t.ident for t in threading.enumerate()}
+                dead_thread_ids = set(_connection_pool.keys()) - alive_thread_ids
+                for tid in dead_thread_ids:
+                    conn = _connection_pool.pop(tid)
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+                # If still at capacity after cleanup, log error but create connection anyway
+                if len(_connection_pool) >= _MAX_POOL_SIZE:
+                    logger.error(
+                        f"Connection pool still at capacity after cleanup. "
+                        f"This may indicate a thread leak. Pool size: {len(_connection_pool)}"
+                    )
+
             conn = sqlite3.connect(DB_PATH, check_same_thread=False)
             conn.row_factory = sqlite3.Row
             # Set busy timeout to handle lock contention (5 seconds)
             conn.execute("PRAGMA busy_timeout = 5000")
             _connection_pool[thread_id] = conn
-            logger.debug(f"Created new DB connection for thread {thread_id}")
+            logger.debug(f"Created new DB connection for thread {thread_id} (pool size: {len(_connection_pool)})")
 
         # Periodically cleanup dead thread connections (every 100th connection request)
         # This is a lightweight heuristic to avoid accumulating stale connections
@@ -684,50 +705,36 @@ def compute_and_store_idf() -> dict[str, int]:
         """, [(value, count, math.log(N / (1 + count))) for value, count in theme_data])
         results['theme'] = len(theme_data)
 
-        # Process countries
+        # Process countries - single grouped query
         cursor = conn.execute("""
-            SELECT DISTINCT value
-            FROM (
-                SELECT json_each.value as value
+            WITH country_films AS (
+                SELECT json_each.value as country, slug
                 FROM films, json_each(films.countries)
+                WHERE countries IS NOT NULL
             )
+            SELECT country as value, COUNT(DISTINCT slug) as doc_count
+            FROM country_films
+            GROUP BY country
         """)
-        country_values = [r['value'] for r in cursor.fetchall()]
-        country_data = []
-        for country in country_values:
-            cursor = conn.execute("""
-                SELECT COUNT(*) as doc_count
-                FROM films
-                WHERE json_extract(countries, '$') LIKE ?
-            """, (f'%{country}%',))
-            doc_count = cursor.fetchone()['doc_count']
-            country_data.append((country, doc_count))
-
+        country_data = [(r['value'], r['doc_count']) for r in cursor.fetchall()]
         conn.executemany("""
             INSERT OR REPLACE INTO attribute_idf (attribute_type, attribute_value, doc_count, idf_score)
             VALUES ('country', ?, ?, ?)
         """, [(value, count, math.log(N / (1 + count))) for value, count in country_data])
         results['country'] = len(country_data)
 
-        # Process languages
+        # Process languages - single grouped query
         cursor = conn.execute("""
-            SELECT DISTINCT value
-            FROM (
-                SELECT json_each.value as value
+            WITH language_films AS (
+                SELECT json_each.value as language, slug
                 FROM films, json_each(films.languages)
+                WHERE languages IS NOT NULL
             )
+            SELECT language as value, COUNT(DISTINCT slug) as doc_count
+            FROM language_films
+            GROUP BY language
         """)
-        language_values = [r['value'] for r in cursor.fetchall()]
-        language_data = []
-        for lang in language_values:
-            cursor = conn.execute("""
-                SELECT COUNT(*) as doc_count
-                FROM films
-                WHERE json_extract(languages, '$') LIKE ?
-            """, (f'%{lang}%',))
-            doc_count = cursor.fetchone()['doc_count']
-            language_data.append((lang, doc_count))
-
+        language_data = [(r['value'], r['doc_count']) for r in cursor.fetchall()]
         conn.executemany("""
             INSERT OR REPLACE INTO attribute_idf (attribute_type, attribute_value, doc_count, idf_score)
             VALUES ('language', ?, ?, ?)

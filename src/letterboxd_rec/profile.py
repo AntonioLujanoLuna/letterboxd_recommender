@@ -134,75 +134,88 @@ def build_profile(
     
     counts = {k: defaultdict(int) for k in scores}
     rated_films = []
-    
+
+    # Genre pair tracking (combined with main loop for efficiency)
+    genre_pair_scores = defaultdict(float)
+    genre_pair_counts = defaultdict(int)
+
+    # Single iteration over user_films for all scoring
     for uf in user_films:
         slug = uf['slug']
         meta = film_metadata.get(slug)
         if not meta:
             continue
-        
+
         # Determine weight for this film
         weight = _compute_weight(uf)
-        
+
         # Apply list multiplier if film is in any lists
         if slug in list_weights:
             weight *= list_weights[slug]
-        
+
         if weight == 0:
             continue
-        
+
         # Extract and accumulate scores for each attribute type
+        film_genres = load_json(meta.get('genres'))
         _accumulate_list_scores(
-            load_json(meta.get('genres')), 
+            film_genres,
             weight, scores['genre'], counts['genre']
         )
         _accumulate_list_scores(
-            load_json(meta.get('directors')), 
+            load_json(meta.get('directors')),
             weight, scores['director'], counts['director']
         )
         _accumulate_list_scores(
-            load_json(meta.get('cast', []))[:MAX_CAST_CONSIDERED], 
+            load_json(meta.get('cast', []))[:MAX_CAST_CONSIDERED],
             weight * 0.7, scores['actor'], counts['actor']
         )
         _accumulate_list_scores(
-            load_json(meta.get('themes', []))[:MAX_THEMES_CONSIDERED], 
+            load_json(meta.get('themes', []))[:MAX_THEMES_CONSIDERED],
             weight * 0.5, scores['theme'], counts['theme']
         )
         _accumulate_list_scores(
-            load_json(meta.get('languages', [])), 
+            load_json(meta.get('languages', [])),
             weight, scores['language'], counts['language']
         )
         _accumulate_list_scores(
-            load_json(meta.get('writers', [])), 
+            load_json(meta.get('writers', [])),
             weight, scores['writer'], counts['writer']
         )
         _accumulate_list_scores(
-            load_json(meta.get('cinematographers', [])), 
+            load_json(meta.get('cinematographers', [])),
             weight, scores['cinematographer'], counts['cinematographer']
         )
         _accumulate_list_scores(
-            load_json(meta.get('composers', [])), 
+            load_json(meta.get('composers', [])),
             weight, scores['composer'], counts['composer']
         )
-        
+
         # Countries: primary gets full weight, secondary reduced
         countries = load_json(meta.get('countries', []))
         for i, country in enumerate(countries):
             country_weight = weight if i == 0 else weight * SECONDARY_COUNTRY_WEIGHT
             scores['country'][country] += country_weight
             counts['country'][country] += 1
-        
+
         # Decades
         year = meta.get('year')
         if year:
             decade = (year // 10) * 10
             scores['decade'][decade] += weight
             counts['decade'][decade] += 1
-        
+
+        # Genre pair preferences (co-occurrence modeling) - combined in same loop
+        for i, g1 in enumerate(film_genres):
+            for g2 in film_genres[i+1:]:
+                pair = "|".join(sorted([g1, g2]))
+                genre_pair_scores[pair] += weight
+                genre_pair_counts[pair] += 1
+
         # Track rated films for average
         if uf.get('rating'):
             rated_films.append(uf['rating'])
-    
+
     # Normalize all scores consistently
     profile.genres = _normalize_scores(scores['genre'], counts['genre'])
     profile.directors = _normalize_scores(scores['director'], counts['director'])
@@ -225,33 +238,6 @@ def build_profile(
     profile.writer_counts = dict(counts['writer'])
     profile.cinematographer_counts = dict(counts['cinematographer'])
     profile.composer_counts = dict(counts['composer'])
-
-    # Build genre-pair preferences (co-occurrence modeling)
-    genre_pair_scores = defaultdict(float)
-    genre_pair_counts = defaultdict(int)
-
-    for uf in user_films:
-        slug = uf['slug']
-        meta = film_metadata.get(slug)
-        if not meta:
-            continue
-
-        weight = _compute_weight(uf)
-        if weight == 0:
-            continue
-
-        # Apply list multiplier
-        if slug in list_weights:
-            weight *= list_weights[slug]
-
-        film_genres = load_json(meta.get('genres', []))
-
-        # Generate all pairs (sorted to ensure consistent keys)
-        for i, g1 in enumerate(film_genres):
-            for g2 in film_genres[i+1:]:
-                pair = "|".join(sorted([g1, g2]))
-                genre_pair_scores[pair] += weight
-                genre_pair_counts[pair] += 1
 
     # Normalize pairs (require at least 2 observations)
     profile.genre_pairs = {

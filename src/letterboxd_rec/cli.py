@@ -10,6 +10,7 @@ from .database import (
     get_pending_users, remove_pending_user, get_pending_queue_stats,
     compute_and_store_idf, populate_normalized_tables_batch
 )
+from .config import DISCOVERY_PRIORITY_MAP
 from .scraper import LetterboxdScraper
 from .recommender import MetadataRecommender, CollaborativeRecommender, Recommendation
 from .profile import build_profile
@@ -297,15 +298,6 @@ def cmd_discover(args: argparse.Namespace) -> None:
     scraper = LetterboxdScraper(delay=1.0)
 
     try:
-        # Priority mapping for different sources
-        PRIORITY_MAP = {
-            'film_reviews': 100,
-            'followers': 80,
-            'following': 80,
-            'popular': 70,
-            'film': 50,
-        }
-
         # Check if we're in continue mode (drain pending queue only)
         continue_mode = getattr(args, 'continue_mode', False)
         source_refresh_days = getattr(args, 'source_refresh_days', 7)
@@ -372,7 +364,7 @@ def cmd_discover(args: argparse.Namespace) -> None:
             print(f"Discovering users from {source}:{source_id}...")
             all_discovered = []
             page = start_page
-            priority = PRIORITY_MAP.get(source, 50)
+            priority = DISCOVERY_PRIORITY_MAP.get(source, 50)
             min_films = getattr(args, 'min_films', 50)
 
             # Calculate how many to discover (more than limit to account for duplicates)
