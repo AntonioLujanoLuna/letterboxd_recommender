@@ -295,6 +295,92 @@ class MetadataRecommender:
 
         return total_score * config.weight, reasons, warnings
 
+    def inject_serendipity(
+        self,
+        ranked_candidates: list[tuple[str, float, list[str], list[str]]],
+        profile: UserProfile,
+        n: int,
+        serendipity_factor: float = SERENDIPITY_FACTOR
+    ) -> list[tuple[str, float, list[str], list[str]]]:
+        """
+        Replace some top recommendations with high-quality surprises.
+        
+        Serendipitous picks are films that:
+        1. Score moderately (not hated, but not obvious picks)
+        2. Have high community ratings (quality floor)
+        3. Introduce underexplored attributes (genres, countries, decades user hasn't seen much of)
+        """
+        n_serendipitous = max(1, int(n * serendipity_factor))
+        n_core = n - n_serendipitous
+        
+        # Take top core recommendations
+        core_recs = ranked_candidates[:n_core]
+        core_slugs = {c[0] for c in core_recs}
+        
+        # Find serendipitous candidates from mid-tier
+        # (ranked 50-200, decent score but not obvious)
+        serendipity_pool = [
+            c for c in ranked_candidates[50:300]
+            if c[0] not in core_slugs
+        ]
+        
+        # Score for serendipity value
+        serendipity_scored = []
+        for slug, score, reasons, warnings in serendipity_pool:
+            film = self.films.get(slug)
+            if not film:
+                continue
+            
+            # Quality floor
+            avg_rating = film.get('avg_rating', 0)
+            if avg_rating < SERENDIPITY_MIN_RATING:
+                continue
+            
+            # Compute novelty: how different is this from user's typical viewing?
+            novelty = 0.0
+            
+            # Genre novelty
+            film_genres = set(load_json(film.get('genres')))
+            for genre in film_genres:
+                count = profile.genre_counts.get(genre, 0)
+                if count < 3:  # Underexplored genre
+                    novelty += 1.0
+                elif count < 10:
+                    novelty += 0.3
+            
+            # Country novelty
+            film_countries = load_json(film.get('countries', []))
+            for country in film_countries[:1]:  # Primary country
+                if profile.country_counts.get(country, 0) < 5:
+                    novelty += 1.5
+            
+            # Decade novelty
+            year = film.get('year')
+            if year:
+                decade = (year // 10) * 10
+                if profile.decades.get(decade, 0) < 0.5:
+                    novelty += 0.5
+            
+            # Prefer less popular (hidden gems)
+            rating_count = film.get('rating_count', 0)
+            if rating_count < SERENDIPITY_POPULARITY_CAP:
+                novelty += 0.5
+            
+            serendipity_scored.append((slug, score, reasons + ["🎲 Discovery pick"], warnings, novelty))
+        
+        # Select diverse serendipitous picks
+        serendipity_scored.sort(key=lambda x: -x[4])  # Sort by novelty
+        serendipity_picks = [(s[0], s[1], s[2], s[3]) for s in serendipity_scored[:n_serendipitous]]
+        
+        # Interleave serendipitous picks throughout results
+        result = list(core_recs)
+        for i, pick in enumerate(serendipity_picks):
+            # Insert at positions 5, 10, 15... to mix with core recommendations
+            insert_pos = min((i + 1) * 5, len(result))
+            result.insert(insert_pos, pick)
+        
+        return result[:n]
+
     def recommend(
         self,
         user_films: list[dict],
@@ -996,4 +1082,67 @@ class CollaborativeRecommender:
         # Build result list
         usernames = list(self._user_index.keys())
         return [(usernames[i], weighted[i]) for i in top_k]
+
+@dataclass
+class ExplainedRecommendation(Recommendation):
+    """Extended recommendation with interpretable explanations."""
+    contribution_breakdown: dict[str, float] = field(default_factory=dict)
+    counterfactuals: list[str] = field(default_factory=list)
+    confidence: float = 0.0
+
+    def explain_recommendation(
+        self,
+        film: dict,
+        profile: UserProfile,
+        seen_films: set[str]
+    ) -> ExplainedRecommendation:
+        """Generate detailed explanation for a single film recommendation."""
+        
+        score, reasons, warnings = self._score_film(film, profile)
+        
+        # Decompose score by attribute type
+        contributions = {}
+        for config in ATTRIBUTE_CONFIGS:
+            attr_score, _, _ = self._score_attribute(film, profile, config)
+            if abs(attr_score) > 0.01:
+                contributions[config.name] = round(attr_score, 2)
+        
+        # Add non-attribute contributions
+        # (decade, community rating, popularity - extract from _score_film logic)
+        
+        # Generate counterfactuals
+        counterfactuals = []
+        
+        # "If you hadn't liked X director..."
+        film_directors = load_json(film.get('directors'))
+        for director in film_directors:
+            if director in profile.directors and profile.directors[director] > 1.0:
+                hypothetical_score = score - (profile.directors[director] * WEIGHTS['director'])
+                if hypothetical_score < score * 0.5:
+                    counterfactuals.append(
+                        f"Without your {director} affinity, score would drop to {hypothetical_score:.1f}"
+                    )
+        
+        # "This ranks higher than X because..."
+        # Compare to a similar but lower-ranked film
+        
+        # Confidence based on profile observation counts
+        relevant_counts = []
+        for director in film_directors:
+            if director in profile.director_counts:
+                relevant_counts.append(profile.director_counts[director])
+        
+        confidence = min(1.0, sum(relevant_counts) / 10) if relevant_counts else 0.3
+        
+        return ExplainedRecommendation(
+            slug=film['slug'],
+            title=film.get('title', film['slug']),
+            year=film.get('year'),
+            score=score,
+            reasons=reasons[:3],
+            warnings=warnings[:2],
+            contribution_breakdown=contributions,
+            counterfactuals=counterfactuals[:2],
+            confidence=confidence
+        )
 
