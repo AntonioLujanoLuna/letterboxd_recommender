@@ -1,7 +1,9 @@
 import logging
+import math
 from collections import defaultdict
 from dataclasses import dataclass, field
-from .database import load_json
+from datetime import datetime
+from .database import load_json, parse_timestamp_naive
 from .config import (
     MAX_CAST_CONSIDERED,
     MAX_THEMES_CONSIDERED,
@@ -21,6 +23,9 @@ from .config import (
     LIST_MULTIPLIER_CURATED,
     NORM_EXPONENT_DEFAULT,
     NORM_EXPONENT_ACTORS,
+    TEMPORAL_DECAY_ENABLED,
+    TEMPORAL_DECAY_HALF_LIFE_DAYS,
+    TEMPORAL_DECAY_MIN_WEIGHT,
 )
 
 logger = logging.getLogger(__name__)
@@ -60,10 +65,52 @@ class UserProfile:
     genre_pairs: dict[str, float] = field(default_factory=dict)
 
 
+def _compute_temporal_weight(
+    scraped_at: str | None,
+    reference_time: datetime | None = None,
+    half_life_days: int = TEMPORAL_DECAY_HALF_LIFE_DAYS,
+    min_weight: float = TEMPORAL_DECAY_MIN_WEIGHT
+) -> float:
+    """
+    Compute temporal decay weight based on age.
+
+    Uses exponential decay: weight = 2^(-age / half_life)
+
+    Args:
+        scraped_at: ISO format timestamp string (when the interaction was recorded)
+        reference_time: Reference point for age calculation (default: now)
+        half_life_days: Days after which weight is halved
+        min_weight: Minimum weight floor
+
+    Returns:
+        Weight between min_weight and 1.0
+    """
+    if not scraped_at:
+        return 1.0  # No timestamp = assume recent
+
+    if reference_time is None:
+        reference_time = datetime.now()
+
+    try:
+        interaction_time = parse_timestamp_naive(scraped_at)
+        age_days = (reference_time - interaction_time).days
+
+        if age_days <= 0:
+            return 1.0
+
+        # Exponential decay
+        decay = math.pow(2, -age_days / half_life_days)
+
+        return max(decay, min_weight)
+
+    except (ValueError, TypeError):
+        return 1.0
+
+
 def _normalize_scores(scores: dict, counts: dict, exponent: float = NORM_EXPONENT_DEFAULT) -> dict:
     """
     Normalize accumulated scores by count with configurable exponent.
-    
+
     exponent=0.0: no normalization (raw scores)
     exponent=0.5: sqrt normalization (balance frequency and magnitude)
     exponent=1.0: full mean normalization
@@ -74,18 +121,29 @@ def _normalize_scores(scores: dict, counts: dict, exponent: float = NORM_EXPONEN
 
 
 def build_profile(
-    user_films: list[dict], 
+    user_films: list[dict],
     film_metadata: dict[str, dict],
     user_lists: list[dict] | None = None,
     username: str | None = None,
-    use_cache: bool = True
+    use_cache: bool = True,
+    use_temporal_decay: bool = TEMPORAL_DECAY_ENABLED,
+    reference_time: datetime | None = None
 ) -> UserProfile:
     """
     Build preference profile from user's film interactions and lists.
-    
+
     If username provided and use_cache=True, checks for cached profile first.
     Cache is invalidated after 7 days or when new films are scraped.
-    
+
+    Args:
+        user_films: List of user film interactions (with 'scraped_at' for temporal decay)
+        film_metadata: Dict mapping slug -> film metadata
+        user_lists: Optional list of user list entries
+        username: Optional username for caching
+        use_cache: Whether to use cached profiles
+        use_temporal_decay: Whether to apply temporal decay weighting
+        reference_time: Reference time for decay calculation (default: now)
+
     Weighting strategy:
     - Rating 4.5-5.0: +2.0 (loved it)
     - Rating 3.5-4.0: +1.0 (liked it)
@@ -95,13 +153,18 @@ def build_profile(
     - Liked (heart):  +1.5
     - Watched only:   +0.4 (mild positive)
     - Watchlisted:    +0.2 (interest signal)
-    
+
     List multipliers:
     - Favorites:      3.0x (strongest signal)
     - Ranked top 10:  2.0x
     - Ranked 11-30:   1.5x
     - Ranked 31+:     1.2x
     - Curated list:   1.3x
+
+    Temporal decay (if enabled):
+    - Recent interactions weighted more heavily
+    - Half-life of 2 years by default (configurable)
+    - Minimum weight of 0.1 prevents old favorites from vanishing
     """
     # Try to load from cache if username provided
     if username and use_cache:
@@ -114,10 +177,19 @@ def build_profile(
             return profile
     
     profile = UserProfile()
-    
+
     # Build list weight lookup
     list_weights = _build_list_weights(user_lists)
-    
+
+    # Precompute temporal weights if enabled
+    temporal_weights = {}
+    if use_temporal_decay:
+        ref_time = reference_time or datetime.now()
+        for uf in user_films:
+            slug = uf['slug']
+            scraped_at = uf.get('scraped_at')
+            temporal_weights[slug] = _compute_temporal_weight(scraped_at, ref_time)
+
     # Score accumulators
     scores = {
         'genre': defaultdict(float),
@@ -131,7 +203,7 @@ def build_profile(
         'cinematographer': defaultdict(float),
         'composer': defaultdict(float),
     }
-    
+
     counts = {k: defaultdict(int) for k in scores}
     rated_films = []
 
@@ -146,8 +218,15 @@ def build_profile(
         if not meta:
             continue
 
-        # Determine weight for this film
-        weight = _compute_weight(uf)
+        # Determine base weight for this film
+        base_weight = _compute_weight(uf)
+
+        # Apply temporal decay if enabled
+        if use_temporal_decay:
+            temporal_factor = temporal_weights.get(slug, 1.0)
+            weight = base_weight * temporal_factor
+        else:
+            weight = base_weight
 
         # Apply list multiplier if film is in any lists
         if slug in list_weights:
@@ -212,9 +291,12 @@ def build_profile(
                 genre_pair_scores[pair] += weight
                 genre_pair_counts[pair] += 1
 
-        # Track rated films for average
+        # Track rated films for average (with recency info)
         if uf.get('rating'):
-            rated_films.append(uf['rating'])
+            rated_films.append({
+                'rating': uf['rating'],
+                'temporal_weight': temporal_weights.get(slug, 1.0) if use_temporal_decay else 1.0
+            })
 
     # Normalize all scores consistently
     profile.genres = _normalize_scores(scores['genre'], counts['genre'])
@@ -250,7 +332,17 @@ def build_profile(
     profile.n_films = len(user_films)
     profile.n_rated = len(rated_films)
     profile.n_liked = sum(1 for f in user_films if f.get('liked'))
-    profile.avg_liked_rating = sum(rated_films) / len(rated_films) if rated_films else None
+
+    # Compute temporally-weighted average rating
+    if rated_films:
+        if use_temporal_decay:
+            weighted_sum = sum(rf['rating'] * rf['temporal_weight'] for rf in rated_films)
+            weight_sum = sum(rf['temporal_weight'] for rf in rated_films)
+            profile.avg_liked_rating = weighted_sum / weight_sum if weight_sum > 0 else None
+        else:
+            profile.avg_liked_rating = sum(rf['rating'] for rf in rated_films) / len(rated_films)
+    else:
+        profile.avg_liked_rating = None
     
     # Save to cache if username provided
     if username:

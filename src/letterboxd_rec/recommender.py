@@ -744,7 +744,11 @@ class CollaborativeRecommender:
         self._user_matrix = None
         self._user_index = None
         self._film_index = None
+        self._normalized_matrix = None  # Cached normalized matrix for fast similarity
+        self._overlap_matrix = None      # Cached binary overlap matrix
+
         self._build_sparse_matrix()
+        self._precompute_similarity_components()
 
     def _build_sparse_matrix(self):
         """
@@ -801,6 +805,45 @@ class CollaborativeRecommender:
             self._user_matrix = csr_matrix((n_users, n_films), dtype=np.float32)
 
         logger.debug(f"Built sparse user-item matrix: {n_users} users × {n_films} films, {len(ratings)} ratings")
+
+    def _precompute_similarity_components(self):
+        """
+        Precompute normalized matrix and overlap matrix for fast similarity computation.
+
+        This method performs the expensive mean-centering and normalization operations once,
+        dramatically speeding up similarity computations in _find_neighbors.
+        """
+        import numpy as np
+        from scipy.sparse import diags
+
+        if self._user_matrix is None or self._user_matrix.nnz == 0:
+            logger.debug("No ratings to precompute similarity components")
+            return
+
+        n_users = self._user_matrix.shape[0]
+
+        # Compute row means efficiently: sum / count
+        row_sums = np.array(self._user_matrix.sum(axis=1)).flatten()
+        row_nnz = np.array(self._user_matrix.getnnz(axis=1), dtype=np.float64)
+        row_nnz[row_nnz == 0] = 1  # Avoid division by zero
+        row_means = row_sums / row_nnz
+
+        # Mean-center the matrix: subtract row mean from each non-zero entry
+        centered = self._user_matrix.copy().tocsr()
+        for i in range(n_users):
+            start, end = centered.indptr[i], centered.indptr[i + 1]
+            centered.data[start:end] -= row_means[i]
+
+        # Normalize to unit length (for cosine similarity)
+        row_norms = np.sqrt(np.array(centered.power(2).sum(axis=1)).flatten())
+        row_norms[row_norms == 0] = 1  # Avoid division by zero
+        inv_norms = diags(1.0 / row_norms)
+        self._normalized_matrix = inv_norms @ centered
+
+        # Binary overlap matrix (which films each user has rated)
+        self._overlap_matrix = (self._user_matrix > 0).astype(np.float32)
+
+        logger.debug(f"Precomputed similarity components for {n_users} users")
 
     def recommend(
         self,
@@ -907,116 +950,54 @@ class CollaborativeRecommender:
     
     def _find_neighbors(self, username: str, target_films: list[dict], k: int = 10) -> list[tuple[str, float]]:
         """
-        Find k most similar users based on rating overlap using sparse-only operations.
-        Uses mean-centered ratings to account for different rating scales (Pearson correlation).
-        Returns list of (username, similarity_score) tuples.
+        Find k most similar users using precomputed matrices.
+
+        Uses adjusted cosine similarity (mean-centered ratings) which approximates
+        Pearson correlation but is much faster for sparse matrices thanks to precomputation.
 
         Args:
             username: Target username
-            target_films: Target user's film interactions
+            target_films: Target user's film interactions (unused, kept for API compatibility)
             k: Number of neighbors to return
+
+        Returns:
+            List of (username, similarity_score) tuples, sorted by score descending
         """
         import numpy as np
-        from scipy.sparse import csr_matrix
 
-        if username not in self._user_index or self._user_matrix is None:
+        if username not in self._user_index or self._normalized_matrix is None:
             return []
 
         target_idx = self._user_index[username]
+        n_users = self._normalized_matrix.shape[0]
 
-        # Get target user's ratings as sparse row
-        target_row = self._user_matrix[target_idx]
+        # Similarity = normalized_matrix @ target_row.T (single sparse matrix-vector multiply)
+        target_row = self._normalized_matrix[target_idx]
+        similarities = np.array(self._normalized_matrix @ target_row.T).flatten()
 
-        # Check if target has any ratings
-        target_nonzero = target_row.nonzero()[1]
-        if len(target_nonzero) == 0:
-            return []
+        # Overlap counts for confidence weighting
+        target_binary = self._overlap_matrix[target_idx]
+        overlaps = np.array(self._overlap_matrix @ target_binary.T).flatten()
 
-        # Compute user means using sparse operations
-        # mean = sum / count where count is number of non-zeros
-        n_users = self._user_matrix.shape[0]
-        row_sums = np.array(self._user_matrix.sum(axis=1)).flatten()
-        row_counts = np.array(self._user_matrix.getnnz(axis=1))
-        row_means = np.divide(row_sums, row_counts, where=row_counts > 0, out=np.zeros_like(row_sums))
+        # Filter and weight
+        min_overlap = 5
+        valid = (overlaps >= min_overlap) & (np.arange(n_users) != target_idx)
+        confidence = np.minimum(overlaps / 20.0, 1.0)  # Full confidence at 20+ common films
 
-        # Create binary masks for computing common film counts
-        # Convert to boolean CSR for efficient boolean operations
-        user_masks = (self._user_matrix > 0).astype(bool)
-        target_mask = user_masks[target_idx]
+        # Apply confidence weighting and filter invalid
+        weighted = np.where(valid, similarities * confidence, -np.inf)
 
-        # Compute common film counts efficiently using sparse dot product
-        # This is much faster than element-wise multiplication for large sparse matrices
-        common_counts = np.array(user_masks.dot(target_mask.T).todense()).flatten()
+        # Get top-k using partial sort (more efficient than full sort)
+        if k >= len(weighted):
+            top_k = np.argsort(weighted)[::-1]
+        else:
+            top_k = np.argpartition(weighted, -k)[-k:]
+            top_k = top_k[np.argsort(weighted[top_k])[::-1]]
 
-        # Filter to users with at least 5 common films (excluding target)
-        min_common = 5
-        valid_mask = (common_counts >= min_common) & (np.arange(n_users) != target_idx)
+        # Filter to positive similarities only
+        top_k = [i for i in top_k if weighted[i] > 0]
 
-        if not valid_mask.any():
-            return []
-
-        # Get valid user indices
-        valid_indices = np.where(valid_mask)[0]
-
-        # Compute Pearson correlation for valid users using sparse operations
-        # pearson(u, v) = sum((r_ui - μ_u) * (r_vi - μ_v)) / (σ_u * σ_v * n_common)
-        # We can compute this efficiently in sparse form
-
-        target_mean = row_means[target_idx]
-        target_data = target_row.data
-        target_cols = target_row.indices
-
-        similarities = []
-        for user_idx in valid_indices:
-            user_row = self._user_matrix[user_idx]
-            user_mean = row_means[user_idx]
-
-            # Find common films (intersection of non-zero indices)
-            user_cols = set(user_row.indices)
-            target_cols_set = set(target_cols)
-            common_films = user_cols & target_cols_set
-
-            if len(common_films) < min_common:
-                similarities.append(0.0)
-                continue
-
-            # Compute centered dot product on common films
-            common_list = list(common_films)
-
-            # Get values for common films
-            target_vals = np.array([target_row[0, col] for col in common_list])
-            user_vals = np.array([user_row[0, col] for col in common_list])
-
-            # Center the values
-            target_centered = target_vals - target_mean
-            user_centered = user_vals - user_mean
-
-            # Compute Pearson correlation
-            numerator = np.dot(target_centered, user_centered)
-            target_std = np.sqrt(np.sum(target_centered ** 2))
-            user_std = np.sqrt(np.sum(user_centered ** 2))
-
-            if target_std > 0 and user_std > 0:
-                pearson = numerator / (target_std * user_std)
-            else:
-                pearson = 0.0
-
-            similarities.append(pearson)
-
-        similarities = np.array(similarities)
-
-        # Apply significance weighting - more common films = more reliable
-        valid_common_counts = common_counts[valid_indices]
-        confidence = np.minimum(valid_common_counts / 20.0, 1.0)  # Full confidence at 20+ common films
-        weighted_similarities = similarities * confidence
-
-        # Build result list with usernames
+        # Build result list
         usernames = list(self._user_index.keys())
-        valid_usernames = [usernames[i] for i in valid_indices]
-
-        # Combine usernames and scores, sort by score
-        results = list(zip(valid_usernames, weighted_similarities))
-        results.sort(key=lambda x: x[1], reverse=True)
-
-        return results[:k]
+        return [(usernames[i], weighted[i]) for i in top_k]
 

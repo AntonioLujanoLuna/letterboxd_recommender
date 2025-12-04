@@ -1,6 +1,7 @@
 import argparse
 import json
 import logging
+import atexit
 from collections import defaultdict
 from datetime import datetime, timedelta
 
@@ -8,7 +9,7 @@ from .database import (
     init_db, get_db, load_json, load_user_lists, parse_timestamp_naive,
     get_discovery_source, update_discovery_source, add_pending_users,
     get_pending_users, remove_pending_user, get_pending_queue_stats,
-    compute_and_store_idf, populate_normalized_tables_batch
+    compute_and_store_idf, populate_normalized_tables_batch, close_pool
 )
 from .config import DISCOVERY_PRIORITY_MAP
 from .scraper import LetterboxdScraper
@@ -18,6 +19,9 @@ from tqdm import tqdm
 import asyncio
 
 logger = logging.getLogger(__name__)
+
+# Register cleanup on exit
+atexit.register(close_pool)
 
 
 def _validate_slug(slug: str) -> str:
@@ -521,9 +525,9 @@ def cmd_recommend(args: argparse.Namespace) -> None:
             all_user_films = _load_all_user_films(conn)
             user_films = all_user_films.get(username, [])
         else:
-            # Metadata-only: just load target user's films
+            # Metadata-only: just load target user's films (include scraped_at for temporal decay)
             user_films = [dict(r) for r in conn.execute("""
-                SELECT film_slug as slug, rating, watched, watchlisted, liked
+                SELECT film_slug as slug, rating, watched, watchlisted, liked, scraped_at
                 FROM user_films WHERE username = ?
             """, (username,))]
 
@@ -644,8 +648,20 @@ def cmd_recommend(args: argparse.Namespace) -> None:
             # Metadata-based (default)
             diversity = getattr(args, 'diversity', False)
             max_per_director = getattr(args, 'max_per_director', 2)
+            use_temporal_decay = not getattr(args, 'no_temporal_decay', False)
             # Load user lists for profile building
             user_lists = load_user_lists(username)
+
+            # Build profile with temporal decay support
+            from .profile import build_profile
+            profile = build_profile(
+                user_films,
+                all_films,
+                user_lists=user_lists,
+                username=username,
+                use_temporal_decay=use_temporal_decay
+            )
+
             recommender = MetadataRecommender(list(all_films.values()))
             recs = recommender.recommend(
                 user_films,
@@ -1045,6 +1061,8 @@ def main():
     rec_parser.add_argument("--min-rating", type=float, help="Minimum community rating (metadata only)")
     rec_parser.add_argument("--diversity", action="store_true", help="Enable diversity mode (metadata only)")
     rec_parser.add_argument("--max-per-director", type=int, default=2, help="Max films per director (diversity mode)")
+    rec_parser.add_argument("--no-temporal-decay", action="store_true",
+                            help="Disable temporal decay (treat old and new ratings equally)")
     rec_parser.add_argument("--format", choices=['text', 'json', 'markdown', 'csv'], default='text',
                             help="Output format")
     rec_parser.set_defaults(func=cmd_recommend)
