@@ -131,6 +131,11 @@ WEIGHTS = {
     'genre_pair': 0.6,  # Genre co-occurrence (supplementary signal)
 }
 
+# Serendipity Configuration
+SERENDIPITY_FACTOR = 0.15
+SERENDIPITY_MIN_RATING = 3.5
+SERENDIPITY_POPULARITY_CAP = 50000
+
 # Match Thresholds
 MATCH_THRESHOLD_GENRE = 0.5
 MATCH_THRESHOLD_ACTOR = 0.5

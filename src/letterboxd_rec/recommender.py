@@ -1,3 +1,4 @@
+from dataclasses import dataclass, field
 import logging
 from dataclasses import dataclass
 from typing import Optional
@@ -29,6 +30,9 @@ from .config import (
     CONFIDENCE_MIN_SAMPLES,
     USE_IDF_WEIGHTING,
     IDF_DISTINCTIVE_THRESHOLD,
+    SERENDIPITY_FACTOR,
+    SERENDIPITY_MIN_RATING,
+    SERENDIPITY_POPULARITY_CAP,
 )
 
 logger = logging.getLogger(__name__)
