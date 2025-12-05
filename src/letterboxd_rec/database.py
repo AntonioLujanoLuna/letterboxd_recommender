@@ -5,7 +5,7 @@ import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime
-from .config import DB_PATH
+from .config import DB_PATH, MIGRATIONS_PATH, MIGRATION_VERSION_TABLE
 
 logger = logging.getLogger(__name__)
 
@@ -190,6 +190,7 @@ _pool_lock = threading.Lock()
 def init_db() -> None:
     DB_PATH.parent.mkdir(exist_ok=True, parents=True)
     with get_db() as conn:
+        _ensure_migration_table(conn)
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS films (
                 slug TEXT PRIMARY KEY,
@@ -307,6 +308,10 @@ def init_db() -> None:
         # Migration: Add new columns to existing films table if they don't exist
         _migrate_films_table(conn)
         _migrate_user_profiles_table(conn)
+        _record_baseline_migration(conn)
+
+    # Apply any versioned migrations that are newer than baseline
+    run_versioned_migrations()
 
 
 def _migrate_films_table(conn):
@@ -344,6 +349,65 @@ def _migrate_user_profiles_table(conn):
             logger.info("Added column 'schema_version' to user_profiles table")
         except sqlite3.Error as e:
             logger.warning(f"Could not add column 'schema_version': {e}")
+
+
+def _ensure_migration_table(conn):
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS {MIGRATION_VERSION_TABLE} (
+            version TEXT PRIMARY KEY,
+            applied_at TEXT NOT NULL
+        )
+    """)
+
+
+def _record_baseline_migration(conn):
+    """Mark baseline schema as applied to align with versioned migrations."""
+    baseline = "0000_baseline"
+    cursor = conn.execute(
+        f"SELECT version FROM {MIGRATION_VERSION_TABLE} WHERE version = ?",
+        (baseline,)
+    )
+    if cursor.fetchone():
+        return
+    conn.execute(
+        f"INSERT INTO {MIGRATION_VERSION_TABLE} (version, applied_at) VALUES (?, ?)",
+        (baseline, datetime.now().isoformat())
+    )
+
+
+def run_versioned_migrations() -> int:
+    """
+    Apply versioned migrations found under MIGRATIONS_PATH/versions.
+    Files are applied in lexicographic order and tracked in MIGRATION_VERSION_TABLE.
+    """
+    versions_dir = MIGRATIONS_PATH / "versions"
+    if not versions_dir.exists():
+        return 0
+
+    applied = set()
+    with get_db(read_only=True) as conn:
+        _ensure_migration_table(conn)
+        rows = conn.execute(f"SELECT version FROM {MIGRATION_VERSION_TABLE}").fetchall()
+        applied = {r['version'] for r in rows}
+
+    migration_files = sorted(p for p in versions_dir.glob("*.sql"))
+    applied_count = 0
+
+    for path in migration_files:
+        version = path.stem
+        if version in applied:
+            continue
+        sql = path.read_text()
+        with get_db() as conn:
+            conn.executescript(sql)
+            conn.execute(
+                f"INSERT OR REPLACE INTO {MIGRATION_VERSION_TABLE} (version, applied_at) VALUES (?, ?)",
+                (version, datetime.now().isoformat())
+            )
+        applied_count += 1
+        logger.info(f"Applied migration {version}")
+
+    return applied_count
 
 
 def populate_normalized_tables(conn, film_metadata):
@@ -893,3 +957,23 @@ def load_idf() -> dict[str, dict[str, float]]:
             idf[attr_type][row['attribute_value']] = row['idf_score']
 
         return idf
+
+
+def run_maintenance(vacuum: bool = True, analyze: bool = True) -> None:
+    """
+    Run optional VACUUM/ANALYZE after bulk loads.
+    Uses a dedicated connection to avoid interfering with pooled transactions.
+    """
+    import sqlite3
+    if not vacuum and not analyze:
+        return
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        if vacuum:
+            conn.execute("VACUUM")
+        if analyze:
+            conn.execute("ANALYZE")
+        conn.commit()
+    finally:
+        conn.close()

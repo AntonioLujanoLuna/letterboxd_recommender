@@ -64,6 +64,12 @@ DB_PATH = Path(os.environ.get("LETTERBOXD_DB", "data/letterboxd.db"))
 DEFAULT_SCRAPER_DELAY = _get_float_env("LETTERBOXD_SCRAPER_DELAY", 1.0, min_val=0.1)
 DEFAULT_ASYNC_DELAY = _get_float_env("LETTERBOXD_ASYNC_DELAY", 0.2, min_val=0.0)
 DEFAULT_MAX_CONCURRENT = _get_int_env("LETTERBOXD_MAX_CONCURRENT", 5, min_val=1)
+SCRAPER_ADAPTIVE_DELAY_MIN = 0.1
+SCRAPER_ADAPTIVE_DELAY_MAX = 5.0
+SCRAPER_429_BACKOFF = 1.5
+SCRAPER_429_JITTER = 0.35
+SCRAPER_HTTP2 = os.environ.get("LETTERBOXD_HTTP2", "false").lower() in {"1", "true", "yes"}
+SCRAPER_PAGE_SIZE = 50  # number of entries we expect per paginated page (used for cursors)
 
 # Scraper Limits
 SCRAPER_MAX_CAST = 10  # Cast members to scrape per film (more than we score, for future use)
@@ -80,9 +86,19 @@ MIN_COMMON_FILMS = 5  # Minimum overlap for collaborative filtering
 DEFAULT_MIN_NEIGHBORS = 3
 DEFAULT_K_NEIGHBORS = 10
 DEFAULT_MAX_PER_DIRECTOR = 2
+COLLAB_SHRINKAGE = _get_int_env("LETTERBOXD_COLLAB_SHRINKAGE", 10, min_val=1)
+COLLAB_IMPLICIT_WEIGHTS = {
+    "liked": 1.2,
+    "watched": 0.4,
+    "watchlisted": 0.25,
+}
+COLLAB_POPULARITY_DEBIAS = _get_float_env("LETTERBOXD_COLLAB_POP_DEBIAS", 0.15, min_val=0.0)
 
 # Batch Processing
 DEFAULT_MAX_PER_BATCH = 100
+EXPORT_CHUNK_SIZE = 10_000
+IMPORT_CHUNK_SIZE = 10_000
+RUN_VACUUM_ANALYZE_DEFAULT = os.environ.get("LETTERBOXD_RUN_MAINTENANCE", "false").lower() in {"1", "true", "yes"}
 
 # Popularity Thresholds
 POPULARITY_HIGH_THRESHOLD = 10000
@@ -189,7 +205,7 @@ IDF_DISTINCTIVE_THRESHOLD = 2.0  # IDF above this is "distinctive taste"
 # - Normalization exponents change (NORM_EXPONENT_*)
 # - List multipliers change (LIST_MULTIPLIER_*)
 # - Confidence min samples change (CONFIDENCE_MIN_SAMPLES)
-PROFILE_SCHEMA_VERSION = 1
+PROFILE_SCHEMA_VERSION = 2
 
 # Discovery Priority Configuration
 # Priority scores for different user discovery sources
@@ -206,3 +222,28 @@ DISCOVERY_PRIORITY_MAP = {
 TEMPORAL_DECAY_ENABLED = True
 TEMPORAL_DECAY_HALF_LIFE_DAYS = 365 * 2  # 2 years: weight halves every 2 years
 TEMPORAL_DECAY_MIN_WEIGHT = 0.1  # Floor to prevent old ratings from vanishing completely
+
+# Serendipity and diversity knobs
+ATTRIBUTE_CAPS = {
+    'director': 3,
+    'genre': 4,
+    'actor': 3,
+}
+LONG_TAIL_RATING_COUNT = 5_000
+LONG_TAIL_BOOST = 0.4
+
+# TF-IDF embedding configuration (cold-start)
+TFIDF_FIELDS = ('genres', 'directors', 'cast', 'themes', 'countries', 'languages')
+TFIDF_MIN_DF = 2
+TFIDF_MAX_FEATURES = 20_000
+
+# Cache paths
+SVD_CACHE_PATH = Path("data/svd_model.npz")
+ITEM_SIM_CACHE_PATH = Path("data/item_similarity.npz")
+
+# Migrations
+MIGRATIONS_PATH = Path("src/letterboxd_rec/migrations")
+MIGRATION_VERSION_TABLE = "schema_migrations"
+
+# Housekeeping
+PENDING_STALE_DAYS = _get_int_env("LETTERBOXD_PENDING_STALE_DAYS", 30, min_val=1)

@@ -1,0 +1,4 @@
+#
+# Versioned migrations directory.
+# Add new SQL files like 0001_add_indexes.sql to evolve the schema.
+

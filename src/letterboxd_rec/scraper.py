@@ -14,6 +14,12 @@ from .config import (
     MAX_HTTP_RETRIES,
     MAX_429_RETRY_SECONDS,
     DEFAULT_RETRY_AFTER,
+    SCRAPER_HTTP2,
+    SCRAPER_ADAPTIVE_DELAY_MIN,
+    SCRAPER_ADAPTIVE_DELAY_MAX,
+    SCRAPER_429_BACKOFF,
+    SCRAPER_429_JITTER,
+    SCRAPER_PAGE_SIZE,
 )
 
 logger = logging.getLogger(__name__)
@@ -178,12 +184,14 @@ class LetterboxdScraper:
         self.client = httpx.Client(
             headers={"User-Agent": "Mozilla/5.0 (compatible; film-rec/0.1)"},
             follow_redirects=True,
-            timeout=HTTP_TIMEOUT
+            timeout=HTTP_TIMEOUT,
+            http2=SCRAPER_HTTP2,
         )
         self.delay = delay
+        self._current_delay = max(delay, SCRAPER_ADAPTIVE_DELAY_MIN)
 
     def _get(self, url: str, max_retries: int = MAX_HTTP_RETRIES) -> HTMLParser | None:
-        time.sleep(self.delay)
+        time.sleep(self._current_delay)
 
         retries = 0
         total_429_wait_time = 0
@@ -206,9 +214,23 @@ class LetterboxdScraper:
                     time.sleep(retry_after)
                     total_429_wait_time += retry_after
                     # Do not increment retries for 429, but track total wait time
+                    # Adaptive delay: bump future delay with jitter
+                    import random
+                    self._current_delay = min(
+                        SCRAPER_ADAPTIVE_DELAY_MAX,
+                        max(
+                            self._current_delay * SCRAPER_429_BACKOFF,
+                            self.delay
+                        ) * (1 + random.uniform(0, SCRAPER_429_JITTER))
+                    )
                     continue
                 
                 resp.raise_for_status()
+                # Successful request: gently decay delay back toward base
+                self._current_delay = max(
+                    SCRAPER_ADAPTIVE_DELAY_MIN,
+                    (self._current_delay * 0.8) + (self.delay * 0.2)
+                )
                 return HTMLParser(resp.text)
             except httpx.TimeoutException as e:
                 if retries < max_retries - 1:
@@ -257,6 +279,11 @@ class LetterboxdScraper:
                 break
 
             page_had_new_films = False
+            if len(items) < SCRAPER_PAGE_SIZE:
+                # Less than a full page usually means last page; enables tighter cursoring
+                stop_after_page = True
+            else:
+                stop_after_page = False
 
             for item in items:
                 react_comp = item.css_first("div.react-component")
@@ -298,6 +325,8 @@ class LetterboxdScraper:
             if stop_on_existing and not page_had_new_films and existing_slugs:
                 logger.info(f"  No new films found on page {page-1}, stopping early (incremental mode)")
                 break
+            if stop_after_page:
+                break
         
         # Get watchlist
         logger.info(f"Scraping {username}'s watchlist...")
@@ -311,6 +340,7 @@ class LetterboxdScraper:
             if not items:
                 break
             
+            stop_after_page = len(items) < SCRAPER_PAGE_SIZE
             for item in items:
                 react_comp = item.css_first("div.react-component")
                 if not react_comp:
@@ -326,6 +356,8 @@ class LetterboxdScraper:
                     films[slug] = FilmInteraction(slug, None, False, True, False)
             
             page += 1
+            if stop_after_page:
+                break
         
         n_rated = sum(1 for f in films.values() if f.rating)
         n_liked = sum(1 for f in films.values() if f.liked)
@@ -745,7 +777,8 @@ class AsyncLetterboxdScraper:
         self.client = httpx.AsyncClient(
             headers={"User-Agent": "Mozilla/5.0 (compatible; letterboxd-rec/1.0)"},
             follow_redirects=True,
-            timeout=HTTP_TIMEOUT
+            timeout=HTTP_TIMEOUT,
+            http2=SCRAPER_HTTP2,
         )
         return self
     
@@ -771,7 +804,8 @@ class AsyncLetterboxdScraper:
         async with httpx.AsyncClient(
             headers={"User-Agent": "Mozilla/5.0 (compatible; letterboxd-rec/1.0)"},
             follow_redirects=True,
-            timeout=HTTP_TIMEOUT
+            timeout=HTTP_TIMEOUT,
+            http2=SCRAPER_HTTP2,
         ) as temp_client:
             return await self._scrape_batch_with_client(temp_client, slugs)
     
@@ -830,7 +864,7 @@ class AsyncLetterboxdScraper:
                 await self._rate_limit_event.wait()
 
                 try:
-                    resp = await client.get(f"{self.BASE}/film/{slug}/")
+                resp = await client.get(f"{self.BASE}/film/{slug}/")
 
                     if resp.status_code == 404:
                         logger.debug(f"Film not found: {slug}")
@@ -849,6 +883,8 @@ class AsyncLetterboxdScraper:
                         import random
                         jitter = random.uniform(0, self.delay * 2)
                         await asyncio.sleep(jitter)
+                        # Adjust delay upwards for future calls
+                        self.delay = min(SCRAPER_ADAPTIVE_DELAY_MAX, self.delay * SCRAPER_429_BACKOFF)
                         continue
 
                     resp.raise_for_status()

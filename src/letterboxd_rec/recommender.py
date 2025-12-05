@@ -2,6 +2,9 @@ from dataclasses import dataclass, field
 import logging
 from dataclasses import dataclass
 from typing import Optional
+import math
+import json
+from pathlib import Path
 from .profile import UserProfile, build_profile
 from .database import load_json
 from .config import (
@@ -33,6 +36,16 @@ from .config import (
     SERENDIPITY_FACTOR,
     SERENDIPITY_MIN_RATING,
     SERENDIPITY_POPULARITY_CAP,
+    ATTRIBUTE_CAPS,
+    LONG_TAIL_BOOST,
+    LONG_TAIL_RATING_COUNT,
+    TFIDF_FIELDS,
+    TFIDF_MIN_DF,
+    TFIDF_MAX_FEATURES,
+    COLLAB_SHRINKAGE,
+    COLLAB_IMPLICIT_WEIGHTS,
+    COLLAB_POPULARITY_DEBIAS,
+    ITEM_SIM_CACHE_PATH,
 )
 
 logger = logging.getLogger(__name__)
@@ -72,6 +85,128 @@ def _confidence_weight(count: int, min_for_full_confidence: int = 5) -> float:
         return 1.0
     return (count / min_for_full_confidence) ** 0.5
 
+
+# Fields we repeatedly parse from JSON-encoded strings
+PARSED_FIELDS = (
+    'genres',
+    'directors',
+    'cast',
+    'themes',
+    'countries',
+    'languages',
+    'writers',
+    'cinematographers',
+    'composers',
+)
+
+
+class TfidfEmbedder:
+    """
+    Lightweight TF-IDF embedder for metadata-based cold-start similarity.
+
+    Keeps everything in simple Python dicts to avoid heavy dependencies.
+    """
+
+    def __init__(self, films: dict[str, dict]):
+        self.films = films
+        self.idf: dict[str, float] = {}
+        self.vectors: dict[str, dict[str, float]] = {}
+        self._build()
+
+    def _tokenize(self, film: dict) -> list[str]:
+        tokens = []
+        parsed = film.get('_parsed', {})
+        for field in TFIDF_FIELDS:
+            values = parsed.get(field)
+            if values is None:
+                values = load_json(film.get(field, []))
+            tokens.extend([str(v).lower() for v in (values or [])])
+        return tokens
+
+    def _build(self):
+        df_counts = {}
+        corpus = {}
+        for slug, film in self.films.items():
+            tokens = self._tokenize(film)
+            corpus[slug] = tokens
+            unique_tokens = set(tokens)
+            for tok in unique_tokens:
+                df_counts[tok] = df_counts.get(tok, 0) + 1
+
+        n_docs = max(1, len(corpus))
+        # Filter rare and extremely common tokens
+        for tok, df in df_counts.items():
+            if df < TFIDF_MIN_DF:
+                continue
+            idf = math.log((n_docs + 1) / (df + 1)) + 1
+            self.idf[tok] = idf
+
+        # Limit feature size by top IDF weights to avoid memory blow-up
+        if len(self.idf) > TFIDF_MAX_FEATURES:
+            # Keep top features
+            top_tokens = sorted(self.idf.items(), key=lambda x: -x[1])[:TFIDF_MAX_FEATURES]
+            self.idf = dict(top_tokens)
+
+        for slug, tokens in corpus.items():
+            tf = {}
+            for tok in tokens:
+                if tok not in self.idf:
+                    continue
+                tf[tok] = tf.get(tok, 0) + 1
+            if not tf:
+                continue
+            vec = {tok: (count / len(tokens)) * self.idf[tok] for tok, count in tf.items()}
+            norm = math.sqrt(sum(v * v for v in vec.values())) or 1.0
+            self.vectors[slug] = {tok: val / norm for tok, val in vec.items()}
+
+    def similarity(self, slug_a: str, slug_b: str) -> float:
+        va = self.vectors.get(slug_a)
+        vb = self.vectors.get(slug_b)
+        if not va or not vb:
+            return 0.0
+        # Cosine on sparse dicts
+        if len(va) > len(vb):
+            va, vb = vb, va
+        return sum(weight * vb.get(tok, 0.0) for tok, weight in va.items())
+
+    def rank_against(self, slug: str, candidates: list[str], top_k: int = 50) -> list[tuple[str, float]]:
+        scores = []
+        for other in candidates:
+            if other == slug:
+                continue
+            sim = self.similarity(slug, other)
+            if sim > 0:
+                scores.append((other, sim))
+        scores.sort(key=lambda x: -x[1])
+        return scores[:top_k]
+
+    def score_to_centroid(self, anchor_slugs: list[str], candidates: list[str], top_k: int = 50) -> list[tuple[str, float]]:
+        if not anchor_slugs:
+            return []
+        centroid = {}
+        for slug in anchor_slugs:
+            vec = self.vectors.get(slug)
+            if not vec:
+                continue
+            for tok, weight in vec.items():
+                centroid[tok] = centroid.get(tok, 0.0) + weight
+        if not centroid:
+            return []
+        norm = math.sqrt(sum(v * v for v in centroid.values())) or 1.0
+        centroid = {k: v / norm for k, v in centroid.items()}
+
+        scores = []
+        for slug in candidates:
+            vec = self.vectors.get(slug)
+            if not vec:
+                continue
+            if len(vec) > len(centroid):
+                vec, centroid = centroid, vec  # swap for faster loop
+            sim = sum(weight * centroid.get(tok, 0.0) for tok, weight in vec.items())
+            if sim > 0:
+                scores.append((slug, sim))
+        scores.sort(key=lambda x: -x[1])
+        return scores[:top_k]
 
 # Attribute configurations for metadata scoring
 ATTRIBUTE_CONFIGS = [
@@ -208,7 +343,14 @@ class MetadataRecommender:
     COUNTRY_SECONDARY_WEIGHT = 0.3
 
     def __init__(self, all_films: list[dict], use_idf: bool = USE_IDF_WEIGHTING):
+        # Pre-parse JSON fields once to avoid repeated load_json calls during scoring
         self.films = {f['slug']: f for f in all_films}
+        for film in self.films.values():
+            parsed = film.get('_parsed', {})
+            for field in PARSED_FIELDS:
+                if field not in parsed:
+                    parsed[field] = load_json(film.get(field, []))
+            film['_parsed'] = parsed
         self.use_idf = use_idf
 
         # Load IDF scores if enabled
@@ -224,6 +366,20 @@ class MetadataRecommender:
                 self.idf = {}
         else:
             self.idf = {}
+        self._tfidf: TfidfEmbedder | None = None
+
+    def _get_list(self, film: dict, field: str, limit: int | None = None) -> list:
+        """Return a parsed list for a film field (uses pre-parsed cache when available)."""
+        parsed = film.get('_parsed')
+        values = parsed.get(field) if parsed else None
+        if values is None:
+            values = load_json(film.get(field, []))
+        values = values or []
+        return values[:limit] if limit is not None else values
+
+    def _ensure_tfidf(self):
+        if self._tfidf is None:
+            self._tfidf = TfidfEmbedder(self.films)
 
     def _score_attribute(
         self,
@@ -237,8 +393,8 @@ class MetadataRecommender:
         Returns:
             (score, reasons, warnings) tuple
         """
-        # Load film attribute values
-        film_values = load_json(film.get(config.film_field, []))
+        # Load film attribute values (pre-parsed when available)
+        film_values = self._get_list(film, config.film_field)
 
         # Apply max_items limit if specified
         if config.max_items is not None:
@@ -283,6 +439,11 @@ class MetadataRecommender:
                         distinctive_items.append(value)
                     else:
                         matched_items.append(value)
+
+        # Soft cap to avoid any single attribute dominating
+        cap = ATTRIBUTE_CAPS.get(config.name)
+        if cap:
+            total_score = max(min(total_score, cap), -cap)
 
         # Build reasons list
         reasons = []
@@ -344,7 +505,7 @@ class MetadataRecommender:
             novelty = 0.0
             
             # Genre novelty
-            film_genres = set(load_json(film.get('genres')))
+            film_genres = set(self._get_list(film, 'genres'))
             for genre in film_genres:
                 count = profile.genre_counts.get(genre, 0)
                 if count < 3:  # Underexplored genre
@@ -353,7 +514,7 @@ class MetadataRecommender:
                     novelty += 0.3
             
             # Country novelty
-            film_countries = load_json(film.get('countries', []))
+            film_countries = self._get_list(film, 'countries')
             for country in film_countries[:1]:  # Primary country
                 if profile.country_counts.get(country, 0) < 5:
                     novelty += 1.5
@@ -420,7 +581,7 @@ class MetadataRecommender:
             if max_year and year and year > max_year:
                 continue
             
-            film_genres = load_json(film.get('genres'))
+            film_genres = self._get_list(film, 'genres')
             # Genres are now stored lowercase, so normalize user input for comparison
             if genres:
                 genres_lower = [g.lower() for g in genres]
@@ -481,6 +642,25 @@ class MetadataRecommender:
         # Build or use provided profile
         if profile is None:
             profile = build_profile(user_films, self.films)
+
+        # Cold-start fallback: use TF-IDF similarity when profile is too sparse
+        if profile.n_rated == 0 and profile.n_liked == 0:
+            self._ensure_tfidf()
+            anchor_slugs = [uf['slug'] for uf in user_films if uf.get('watched') or uf.get('watchlisted')]
+            tfidf_scores = self._tfidf.score_to_centroid(anchor_slugs, candidates, top_k=n) if self._tfidf else []
+            results = []
+            for slug, score in tfidf_scores:
+                film = self.films.get(slug)
+                if not film:
+                    continue
+                results.append(Recommendation(
+                    slug=slug,
+                    title=film.get('title', slug),
+                    year=film.get('year'),
+                    score=score,
+                    reasons=["Metadata similarity (cold-start)"]
+                ))
+            return results
 
         scored_candidates = []
         for slug in candidates:
@@ -545,7 +725,7 @@ class MetadataRecommender:
                 if max_year and year and year > max_year:
                     continue
 
-                film_directors = load_json(film.get('directors'))
+                film_directors = self._get_list(film, 'directors')
                 if director in film_directors:
                     director_films.append(film)
 
@@ -599,7 +779,7 @@ class MetadataRecommender:
             warnings.extend(attr_warnings)
 
         # Special case: Directors with low confidence get annotated reasons
-        film_directors = load_json(film.get('directors'))
+        film_directors = self._get_list(film, 'directors')
         for d in film_directors:
             if d in profile.directors and profile.directors[d] > MATCH_THRESHOLD_DIRECTOR:
                 count = profile.director_counts.get(d, 1)
@@ -612,7 +792,7 @@ class MetadataRecommender:
                             break
 
         # Genre pair matching (co-occurrence preferences)
-        film_genres = load_json(film.get('genres'))
+        film_genres = self._get_list(film, 'genres')
         pair_score = 0.0
         matched_pairs = []
         for i, g1 in enumerate(film_genres):
@@ -642,7 +822,7 @@ class MetadataRecommender:
                 score += profile.decades[decade] * WEIGHTS['decade']
 
         # Country match (with primary/secondary weighting)
-        film_countries = load_json(film.get('countries', []))
+        film_countries = self._get_list(film, 'countries')
         for i, country in enumerate(film_countries):
             if country in profile.countries:
                 country_score = profile.countries[country]
@@ -673,6 +853,9 @@ class MetadataRecommender:
             score += 0.3 * WEIGHTS['popularity']
         elif count > POPULARITY_MED_THRESHOLD:
             score += 0.1 * WEIGHTS['popularity']
+        elif count and count < LONG_TAIL_RATING_COUNT and score > 0:
+            score += LONG_TAIL_BOOST
+            reasons.append("Underseen gem")
 
         return score, reasons, warnings
     
@@ -682,12 +865,12 @@ class MetadataRecommender:
             return []
 
         target = self.films[slug]
-        target_genres = set(load_json(target.get('genres')))
-        target_directors = set(load_json(target.get('directors')))
-        target_cast = set(load_json(target.get('cast', []))[:5])
-        target_themes = set(load_json(target.get('themes', [])))
-        target_countries = set(load_json(target.get('countries', [])))
-        target_writers = set(load_json(target.get('writers', [])))
+        target_genres = set(self._get_list(target, 'genres'))
+        target_directors = set(self._get_list(target, 'directors'))
+        target_cast = set(self._get_list(target, 'cast')[:5])
+        target_themes = set(self._get_list(target, 'themes'))
+        target_countries = set(self._get_list(target, 'countries'))
+        target_writers = set(self._get_list(target, 'writers'))
 
         target_year = target.get('year')
         target_decade = (target_year // 10) * 10 if isinstance(target_year, int) and target_year > 0 else None
@@ -701,36 +884,36 @@ class MetadataRecommender:
             reasons = []
             
             # Genre overlap
-            film_genres = set(load_json(film.get('genres')))
+            film_genres = set(self._get_list(film, 'genres'))
             genre_overlap = target_genres & film_genres
             score += len(genre_overlap) * 1.0
             
             # Same director
-            film_directors = set(load_json(film.get('directors')))
+            film_directors = set(self._get_list(film, 'directors'))
             dir_overlap = target_directors & film_directors
             if dir_overlap:
                 score += SIMILAR_DIRECTOR_BONUS
                 reasons.append(f"Same director: {list(dir_overlap)[0]}")
 
             # Cast overlap
-            film_cast = set(load_json(film.get('cast', []))[:5])
+            film_cast = set(self._get_list(film, 'cast')[:5])
             cast_overlap = target_cast & film_cast
             score += len(cast_overlap) * SIMILAR_CAST_SCORE
             if cast_overlap:
                 reasons.append(f"Shared cast: {list(cast_overlap)[0]}")
 
             # Theme overlap
-            film_themes = set(load_json(film.get('themes', [])))
+            film_themes = set(self._get_list(film, 'themes'))
             theme_overlap = target_themes & film_themes
             score += len(theme_overlap) * 0.3
 
             # Country overlap
-            film_countries = set(load_json(film.get('countries', [])))
+            film_countries = set(self._get_list(film, 'countries'))
             if target_countries & film_countries:
                 score += 0.5
 
             # Writer overlap
-            film_writers = set(load_json(film.get('writers', [])))
+            film_writers = set(self._get_list(film, 'writers'))
             writer_overlap = target_writers & film_writers
             if writer_overlap:
                 score += 3.0
@@ -747,8 +930,7 @@ class MetadataRecommender:
                 candidates.append((other_slug, score, reasons))
         
         candidates.sort(key=lambda x: -x[1])
-        
-        return [
+        recs = [
             Recommendation(
                 slug=s, 
                 title=self.films[s].get('title', s),
@@ -758,6 +940,27 @@ class MetadataRecommender:
             )
             for s, sc, r in candidates[:n]
         ]
+
+        # Cold-start / sparse fallback using TF-IDF embeddings
+        if len(recs) < n:
+            self._ensure_tfidf()
+            if self._tfidf:
+                tfidf_ranked = self._tfidf.rank_against(slug, list(self.films.keys()), top_k=n)
+                for other_slug, score in tfidf_ranked:
+                    if other_slug == slug or any(r.slug == other_slug for r in recs):
+                        continue
+                    film = self.films[other_slug]
+                    recs.append(Recommendation(
+                        slug=other_slug,
+                        title=film.get('title', other_slug),
+                        year=film.get('year'),
+                        score=score,
+                        reasons=["TF-IDF metadata similarity"]
+                    ))
+                    if len(recs) >= n:
+                        break
+
+        return recs[:n]
     
     def _diversify(self, candidates: list[tuple[str, float, list[str], list[str]]], n: int, max_per_director: int = 2) -> list[Recommendation]:
         """Select top n while limiting per-director concentration."""
@@ -771,7 +974,7 @@ class MetadataRecommender:
             if not film:
                 continue
 
-            directors = load_json(film.get('directors'))
+            directors = self._get_list(film, 'directors')
 
             # Check if any director has hit the limit
             if any(director_counts[d] >= max_per_director for d in directors):
@@ -832,9 +1035,13 @@ class CollaborativeRecommender:
         self._film_index = None
         self._normalized_matrix = None  # Cached normalized matrix for fast similarity
         self._overlap_matrix = None      # Cached binary overlap matrix
+        self._item_similarities: dict[str, list[tuple[str, float]]] = {}
+        self._item_sim_top_k = 50
 
         self._build_sparse_matrix()
         self._precompute_similarity_components()
+        self._fingerprint = self._compute_fingerprint()
+        self._maybe_load_item_similarity_cache()
 
     def _build_sparse_matrix(self):
         """
@@ -931,6 +1138,100 @@ class CollaborativeRecommender:
 
         logger.debug(f"Precomputed similarity components for {n_users} users")
 
+    def _compute_fingerprint(self) -> dict:
+        n_users = len(self.all_user_films)
+        n_ratings = int(self._user_matrix.nnz) if self._user_matrix is not None else 0
+        n_items = len(self._film_index) if self._film_index else 0
+        return {
+            "n_users": n_users,
+            "n_items": n_items,
+            "n_ratings": n_ratings,
+        }
+
+    def _maybe_load_item_similarity_cache(self):
+        if not ITEM_SIM_CACHE_PATH.exists():
+            return
+        try:
+            payload = json.loads(ITEM_SIM_CACHE_PATH.read_text())
+            if payload.get("fingerprint") != self._fingerprint:
+                return
+            if payload.get("top_k") != self._item_sim_top_k:
+                return
+            data = payload.get("items", {})
+            self._item_similarities = {
+                slug: [(entry["slug"], entry["score"]) for entry in entries]
+                for slug, entries in data.items()
+            }
+            logger.info(f"Loaded item-item similarity cache ({len(self._item_similarities)} items)")
+        except Exception as e:
+            logger.warning(f"Failed to load item similarity cache: {e}")
+
+    def _save_item_similarity_cache(self):
+        try:
+            ITEM_SIM_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "fingerprint": self._fingerprint,
+                "top_k": self._item_sim_top_k,
+                "items": {
+                    slug: [{"slug": s, "score": float(sc)} for s, sc in sims]
+                    for slug, sims in self._item_similarities.items()
+                },
+            }
+            ITEM_SIM_CACHE_PATH.write_text(json.dumps(payload))
+            logger.info(f"Saved item similarity cache to {ITEM_SIM_CACHE_PATH}")
+        except Exception as e:
+            logger.warning(f"Could not save item similarity cache: {e}")
+
+    def _compute_item_similarities(self):
+        """Compute top-K item-item similarities using binary overlap matrix."""
+        import numpy as np
+        if self._overlap_matrix is None:
+            return
+        logger.info("Computing item-item similarity cache...")
+        # Item overlap (films x films)
+        overlap = self._overlap_matrix.T @ self._overlap_matrix
+        overlap = overlap.tocsr()
+        diag = np.array(overlap.diagonal()).flatten()
+        film_slugs = [None] * len(self._film_index)
+        for slug, idx in self._film_index.items():
+            film_slugs[idx] = slug
+
+        for i, slug in enumerate(film_slugs):
+            row_start = overlap.indptr[i]
+            row_end = overlap.indptr[i + 1]
+            indices = overlap.indices[row_start:row_end]
+            data = overlap.data[row_start:row_end]
+            sims = []
+            for idx, co_count in zip(indices, data):
+                if idx == i or co_count == 0:
+                    continue
+                denom = math.sqrt(diag[i] * diag[idx] + COLLAB_SHRINKAGE)
+                if denom == 0:
+                    continue
+                sims.append((film_slugs[idx], co_count / denom))
+            sims.sort(key=lambda x: -x[1])
+            if sims:
+                self._item_similarities[slug] = sims[: self._item_sim_top_k]
+
+        self._save_item_similarity_cache()
+
+    def _item_recommend_from_anchors(self, anchors: list[str], seen: set[str], top_k: int = 100) -> list[tuple[str, float, list[str]]]:
+        if not anchors:
+            return []
+        if not self._item_similarities:
+            self._compute_item_similarities()
+        scores = {}
+        reasons = {}
+        for anchor in anchors:
+            neighbors = self._item_similarities.get(anchor, [])
+            for slug, sim in neighbors:
+                if slug in seen:
+                    continue
+                scores[slug] = scores.get(slug, 0.0) + sim
+                reasons.setdefault(slug, []).append(f"Similar to {anchor}")
+        ranked = sorted(scores.items(), key=lambda x: -x[1])
+        return [(slug, score, reasons.get(slug, [])[:2]) for slug, score in ranked[:top_k]]
+
     def recommend(
         self,
         username: str,
@@ -991,14 +1292,32 @@ class CollaborativeRecommender:
                 
                 rating = interaction.get('rating')  # Use original variable
                 liked = interaction.get('liked', False)
+                watched = interaction.get('watched', False)
+                watchlisted = interaction.get('watchlisted', False)
                 
-                # Score based on rating or like
-                if rating and rating >= 3.5:
+                # Score based on rating or implicit feedback
+                if rating is not None:
                     score = (rating - 2.5) * similarity  # normalize around mid-point
-                elif liked:
-                    score = 1.0 * similarity
                 else:
-                    score = 0.1 * similarity  # just watched
+                    implicit = 0.0
+                    if liked:
+                        implicit += COLLAB_IMPLICIT_WEIGHTS["liked"]
+                    if watched:
+                        implicit += COLLAB_IMPLICIT_WEIGHTS["watched"]
+                    if watchlisted:
+                        implicit += COLLAB_IMPLICIT_WEIGHTS["watchlisted"]
+                    if implicit == 0:
+                        implicit = 0.05
+                    score = implicit * similarity
+
+                # Popularity debias: down-weight very popular films
+                if self.films and slug in self.films:
+                    rating_count = self.films[slug].get('rating_count') or 0
+                else:
+                    rating_count = 0
+                if rating_count:
+                    penalty = COLLAB_POPULARITY_DEBIAS * (math.log1p(rating_count) / math.log1p(100_000))
+                    score *= max(0.1, 1 - penalty)
                 
                 if slug not in film_scores:
                     film_scores[slug] = 0
@@ -1009,6 +1328,17 @@ class CollaborativeRecommender:
                 # Track who recommended it
                 if score > 0.5 and len(film_reasons[slug]) < 3:
                     film_reasons[slug].append(f"Liked by {neighbor_user}")
+
+        # Item-based fallback for sparse neighborhoods
+        if len(neighbors) < min_neighbors:
+            anchor_slugs = [
+                f['slug'] for f in target_films
+                if (f.get('rating') and f['rating'] >= 3.5) or f.get('liked')
+            ]
+            item_based = self._item_recommend_from_anchors(anchor_slugs, seen, top_k=n * 2)
+            for slug, score, reasons in item_based:
+                film_scores[slug] = film_scores.get(slug, 0.0) + score
+                film_reasons.setdefault(slug, []).extend(reasons)
         
         # Sort by score
         ranked = sorted(film_scores.items(), key=lambda x: -x[1])
@@ -1069,9 +1399,10 @@ class CollaborativeRecommender:
         min_overlap = 5
         valid = (overlaps >= min_overlap) & (np.arange(n_users) != target_idx)
         confidence = np.minimum(overlaps / 20.0, 1.0)  # Full confidence at 20+ common films
+        shrinkage = overlaps / (overlaps + COLLAB_SHRINKAGE)
 
         # Apply confidence weighting and filter invalid
-        weighted = np.where(valid, similarities * confidence, -np.inf)
+        weighted = np.where(valid, similarities * confidence * shrinkage, -np.inf)
 
         # Get top-k using partial sort (more efficient than full sort)
         if k >= len(weighted):
@@ -1099,7 +1430,7 @@ class ExplainedRecommendation(Recommendation):
         film: dict,
         profile: UserProfile,
         seen_films: set[str]
-    ) -> ExplainedRecommendation:
+    ) -> "ExplainedRecommendation":
         """Generate detailed explanation for a single film recommendation."""
         
         score, reasons, warnings = self._score_film(film, profile)

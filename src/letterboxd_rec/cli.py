@@ -2,6 +2,7 @@ import argparse
 import json
 import logging
 import atexit
+from pathlib import Path
 from collections import defaultdict
 from datetime import datetime, timedelta
 
@@ -9,9 +10,17 @@ from .database import (
     init_db, get_db, load_json, load_user_lists, parse_timestamp_naive,
     get_discovery_source, update_discovery_source, add_pending_users,
     get_pending_users, remove_pending_user, get_pending_queue_stats,
-    compute_and_store_idf, populate_normalized_tables_batch, close_pool
+    compute_and_store_idf, populate_normalized_tables_batch, close_pool, run_maintenance
 )
-from .config import DISCOVERY_PRIORITY_MAP
+from .config import (
+    DISCOVERY_PRIORITY_MAP,
+    SVD_CACHE_PATH,
+    RUN_VACUUM_ANALYZE_DEFAULT,
+    EXPORT_CHUNK_SIZE,
+    IMPORT_CHUNK_SIZE,
+    PENDING_STALE_DAYS,
+    DEFAULT_MAX_PER_BATCH,
+)
 from .scraper import LetterboxdScraper
 from .recommender import MetadataRecommender, CollaborativeRecommender, Recommendation
 from .matrix_factorization import SVDRecommender
@@ -508,6 +517,9 @@ def cmd_discover(args: argparse.Namespace) -> None:
             logger.info(f"\nRemaining in pending queue: {queue_stats['total']} users")
             logger.info("Run with --continue to scrape more from the queue")
 
+        if getattr(args, "maintenance", False):
+            run_maintenance(vacuum=True, analyze=True)
+
     finally:
         scraper.close()
 
@@ -557,6 +569,25 @@ def cmd_recommend(args: argparse.Namespace) -> None:
             # Get recommendations from both strategies
             meta_rec = MetadataRecommender(list(all_films.values()))
             collab_rec = CollaborativeRecommender(all_user_films, all_films)
+
+            rated_count = sum(1 for f in user_films if f.get('rating'))
+            meta_weight = args.hybrid_meta_weight
+            collab_weight = args.hybrid_collab_weight
+
+            if meta_weight is None and collab_weight is None:
+                # Heuristic: lean on metadata when user data or neighbors are sparse
+                if len(all_user_films) < 10 or rated_count < 20:
+                    meta_weight = 0.7
+                    collab_weight = 0.3
+                else:
+                    meta_weight = 0.6
+                    collab_weight = 0.4
+            else:
+                # If only one is provided, derive the other to preserve user intent
+                if meta_weight is None:
+                    meta_weight = max(0.0, 1.0 - collab_weight) if collab_weight is not None else 0.6
+                if collab_weight is None:
+                    collab_weight = max(0.0, 1.0 - meta_weight) if meta_weight is not None else 0.4
             
             meta_recs = meta_rec.recommend(
                 user_films,
@@ -577,62 +608,52 @@ def cmd_recommend(args: argparse.Namespace) -> None:
                 exclude_genres=args.exclude_genres
             )
             
-            # Merge using normalized scores to preserve score magnitude
-            # Normalize scores from each strategy to [0, 1] range for fair combination
-            scores = {}
-            reasons_map = {}
+            # Rank-based fusion (reciprocal-rank style) with director diversity cap
+            def _fuse(meta_results, collab_results, weight_meta: float = 0.6, weight_collab: float = 0.4):
+                fused_scores = {}
+                reasons_map = {}
 
-            # Normalize metadata scores
-            meta_scores = {r.slug: r.score for r in meta_recs}
-            if meta_scores:
-                max_meta_score = max(meta_scores.values())
-                min_meta_score = min(meta_scores.values())
-                score_range = max_meta_score - min_meta_score
+                for idx, r in enumerate(meta_results):
+                    fused_scores[r.slug] = fused_scores.get(r.slug, 0.0) + weight_meta / (idx + 1)
+                    reasons_map.setdefault(r.slug, []).extend(r.reasons)
 
-                for r in meta_recs:
-                    # Normalize to [0, 1] and weight by 0.5
-                    if score_range > 0:
-                        normalized = (r.score - min_meta_score) / score_range
-                    else:
-                        normalized = 1.0
-                    scores[r.slug] = normalized * 0.5
-                    if r.slug not in reasons_map:
-                        reasons_map[r.slug] = []
-                    reasons_map[r.slug].extend(r.reasons)
+                for idx, r in enumerate(collab_results):
+                    fused_scores[r.slug] = fused_scores.get(r.slug, 0.0) + weight_collab / (idx + 1)
+                    reasons_map.setdefault(r.slug, []).extend(r.reasons)
 
-            # Normalize collaborative scores
-            collab_scores = {r.slug: r.score for r in collab_recs}
-            if collab_scores:
-                max_collab_score = max(collab_scores.values())
-                min_collab_score = min(collab_scores.values())
-                score_range = max_collab_score - min_collab_score
+                return fused_scores, reasons_map
 
-                for r in collab_recs:
-                    # Normalize to [0, 1] and weight by 0.5
-                    if score_range > 0:
-                        normalized = (r.score - min_collab_score) / score_range
-                    else:
-                        normalized = 1.0
-                    scores[r.slug] = scores.get(r.slug, 0) + normalized * 0.5
-                    if r.slug not in reasons_map:
-                        reasons_map[r.slug] = []
-                    reasons_map[r.slug].extend(r.reasons)
-            
-            # Build final recommendations
-            merged = sorted(scores.items(), key=lambda x: -x[1])[:args.limit]
+            fused_scores, reasons_map = _fuse(meta_recs, collab_recs, weight_meta=meta_weight, weight_collab=collab_weight)
+            ranked = sorted(fused_scores.items(), key=lambda x: -x[1])
+
+            max_per_director = getattr(args, 'max_per_director', 2)
+            apply_diversity = bool(getattr(args, 'hybrid_diversity', False))
+            director_counts = defaultdict(int)
+
             recs = []
-            for slug, score in merged:
-                if slug in all_films:
-                    film = all_films[slug]
-                    # Deduplicate reasons while preserving order
-                    unique_reasons = list(dict.fromkeys(reasons_map.get(slug, [])))
-                    recs.append(Recommendation(
-                        slug=slug,
-                        title=film.get('title', slug),
-                        year=film.get('year'),
-                        score=score,
-                        reasons=unique_reasons[:3] # Top 3 combined reasons
-                    ))
+            for slug, score in ranked:
+                film = all_films.get(slug)
+                if not film:
+                    continue
+
+                directors = load_json(film.get('directors'))
+                if apply_diversity and max_per_director and directors:
+                    if any(director_counts[d] >= max_per_director for d in directors):
+                        continue
+
+                recs.append(Recommendation(
+                    slug=slug,
+                    title=film.get('title', slug),
+                    year=film.get('year'),
+                    score=score,
+                    reasons=list(dict.fromkeys(reasons_map.get(slug, [])))[:3]
+                ))
+
+                for d in directors:
+                    director_counts[d] += 1
+
+                if len(recs) >= args.limit:
+                    break
                     
         elif strategy == 'collaborative':
             # Collaborative: all_user_films already loaded above
@@ -664,10 +685,32 @@ def cmd_recommend(args: argparse.Namespace) -> None:
                 logger.warning(f"SVD works best with more data (have {n_users} users, {n_ratings} ratings). "
                             f"Consider using 'metadata' strategy or running 'discover' to add more users.")
             
-            # Fit SVD model
-            logger.info(f"Fitting SVD model on {n_users} users...")
-            svd = SVDRecommender(n_factors=min(50, n_users - 1))
-            svd.fit(all_user_films)
+            # Try loading cached SVD model first
+            cache_path = SVD_CACHE_PATH
+            n_factors = min(50, n_users - 1)
+            fingerprint = SVDRecommender.compute_fingerprint(all_user_films, hyperparams={"n_factors": n_factors})
+            svd = SVDRecommender.load(cache_path, expected_fingerprint=fingerprint)
+
+            if svd:
+                logger.info(f"Using cached SVD model ({n_users} users, {n_ratings} ratings).")
+            else:
+                logger.info(f"Fitting SVD model on {n_users} users...")
+                svd = SVDRecommender(n_factors=n_factors)
+                try:
+                    svd.fit(all_user_films)
+                except ValueError as e:
+                    logger.error(f"Unable to fit SVD model: {e}")
+                    logger.error("Try the 'metadata' strategy or add more rated films.")
+                    return
+
+                cache_metadata = {
+                    "fingerprint": fingerprint,
+                    "n_users": n_users,
+                    "n_items": len(svd.item_index) if svd.item_index else 0,
+                    "n_ratings": n_ratings,
+                    "hyperparams": {"n_factors": n_factors},
+                }
+                svd.save(cache_path, metadata=cache_metadata)
             
             # Get seen films for filtering
             seen_slugs = {f['slug'] for f in user_films}
@@ -855,20 +898,37 @@ def cmd_stats(args: argparse.Namespace) -> None:
 
 def cmd_export(args: argparse.Namespace) -> None:
     """Export database to JSON file."""
-    with get_db() as conn:
-        user_films = [dict(r) for r in conn.execute("SELECT * FROM user_films")]
-        films = [dict(r) for r in conn.execute("SELECT * FROM films")]
-    
-    data = {
-        "user_films": user_films,
-        "films": films,
-        "exported_at": datetime.now().isoformat()
-    }
-    
-    with open(args.file, 'w') as f:
-        json.dump(data, f, indent=2)
-    
-    logger.info(f"Exported {len(user_films)} user interactions and {len(films)} films to {args.file}")
+    def _stream_rows(conn, query: str):
+        cursor = conn.execute(query)
+        while True:
+            chunk = cursor.fetchmany(EXPORT_CHUNK_SIZE)
+            if not chunk:
+                break
+            for row in chunk:
+                yield dict(row)
+
+    with get_db(read_only=True) as conn, open(args.file, 'w') as f:
+        f.write('{"user_films":[')
+        first = True
+        uf_count = 0
+        for row in _stream_rows(conn, "SELECT * FROM user_films"):
+            if not first:
+                f.write(',')
+            json.dump(row, f)
+            first = False
+            uf_count += 1
+        f.write('],"films":[')
+        first = True
+        film_count = 0
+        for row in _stream_rows(conn, "SELECT * FROM films"):
+            if not first:
+                f.write(',')
+            json.dump(row, f)
+            first = False
+            film_count += 1
+        f.write('], "exported_at": "%s"}' % datetime.now().isoformat())
+
+    logger.info(f"Exported {uf_count} user interactions and {film_count} films to {args.file}")
 
 
 def cmd_import(args: argparse.Namespace) -> None:
@@ -878,37 +938,44 @@ def cmd_import(args: argparse.Namespace) -> None:
     
     init_db()
     
+    def _batched(items, size=IMPORT_CHUNK_SIZE):
+        for i in range(0, len(items), size):
+            yield items[i:i+size]
+
     with get_db() as conn:
         if 'films' in data:
-            for film in data['films']:
-                conn.execute("""
+            for chunk in _batched(data['films']):
+                conn.executemany("""
                     INSERT OR REPLACE INTO films
                     (slug, title, year, directors, genres, cast, themes, runtime, avg_rating, rating_count,
                      countries, languages, writers, cinematographers, composers)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
+                """, [(
                     film['slug'], film.get('title'), film.get('year'),
                     film.get('directors'), film.get('genres'),
                     film.get('cast'), film.get('themes'),
                     film.get('runtime'), film.get('avg_rating'), film.get('rating_count'),
                     film.get('countries'), film.get('languages'),
                     film.get('writers'), film.get('cinematographers'), film.get('composers')
-                ))
+                ) for film in chunk])
             logger.info(f"Imported {len(data['films'])} films")
         
         if 'user_films' in data:
-            for uf in data['user_films']:
-                conn.execute("""
+            for chunk in _batched(data['user_films']):
+                conn.executemany("""
                     INSERT OR REPLACE INTO user_films 
                     (username, film_slug, rating, watched, watchlisted, liked, scraped_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (
+                """, [(
                     uf['username'], uf['film_slug'], uf.get('rating'),
                     uf.get('watched'), uf.get('watchlisted'), uf.get('liked'),
                     uf.get('scraped_at')
-                ))
+                ) for uf in chunk])
             logger.info(f"Imported {len(data['user_films'])} user interactions")
     
+    if getattr(args, "maintenance", RUN_VACUUM_ANALYZE_DEFAULT):
+        run_maintenance(vacuum=True, analyze=True)
+
     logger.info(f"Import completed from {args.file}")
 
 
@@ -1031,7 +1098,11 @@ def cmd_svd_info(args: argparse.Namespace) -> None:
         return
     
     svd = SVDRecommender(n_factors=min(50, len(all_user_films) - 1))
-    svd.fit(all_user_films)
+    try:
+        svd.fit(all_user_films)
+    except ValueError as e:
+        logger.error(f"Unable to fit SVD model: {e}")
+        return
     
     logger.info(f"\nSVD Model Info:")
     logger.info(f"  Users: {len(svd.user_index)}")
@@ -1109,6 +1180,60 @@ def cmd_rebuild_idf(args: argparse.Namespace) -> None:
     logger.info("\nIDF scores will now be used to prioritize rare/distinctive preferences in recommendations.")
 
 
+def cmd_refresh_metadata(args: argparse.Namespace) -> None:
+    """Refresh missing or low-quality film metadata."""
+    init_db()
+    with get_db(read_only=True) as conn:
+        rows = conn.execute(
+            """
+            SELECT slug FROM films
+            WHERE avg_rating IS NULL
+               OR rating_count IS NULL
+               OR rating_count < ?
+               OR json_array_length(genres) IS NULL
+            UNION
+            SELECT uf.film_slug AS slug
+            FROM user_films uf
+            LEFT JOIN films f ON uf.film_slug = f.slug
+            WHERE f.slug IS NULL
+            LIMIT ?
+            """,
+            (args.min_rating_count, args.limit),
+        ).fetchall()
+
+    slugs = [r['slug'] for r in rows]
+    if not slugs:
+        logger.info("No films need refreshing.")
+        return
+
+    scraper = LetterboxdScraper(delay=1.0)
+    try:
+        _scrape_film_metadata(scraper, slugs, max_per_batch=args.batch, use_async=True)
+    finally:
+        scraper.close()
+
+    if getattr(args, "maintenance", False):
+        run_maintenance(vacuum=False, analyze=True)
+
+
+def cmd_prune_pending(args: argparse.Namespace) -> None:
+    """Prune stale or low-priority pending users."""
+    init_db()
+    cutoff = f"-{args.older_than} days"
+    removed = 0
+    with get_db() as conn:
+        removed += conn.execute(
+            "DELETE FROM pending_users WHERE discovered_at < datetime('now', ?)",
+            (cutoff,),
+        ).rowcount
+        if args.max_priority is not None:
+            removed += conn.execute(
+                "DELETE FROM pending_users WHERE priority <= ?",
+                (args.max_priority,),
+            ).rowcount
+    logger.info(f"Pruned {removed} pending users")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Letterboxd Recommender")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
@@ -1146,6 +1271,8 @@ def main():
                                   help="Days before re-crawling a source from page 1 (default: 7)")
     discover_parser.add_argument("--min-films", type=int, default=50,
                                   help="Minimum film count for activity pre-filtering (default: 50)")
+    discover_parser.add_argument("--maintenance", action="store_true", default=False,
+                                  help="Run VACUUM/ANALYZE after scraping batch")
     discover_parser.set_defaults(func=cmd_discover)
     
     # Recommend command
@@ -1163,6 +1290,9 @@ def main():
     rec_parser.add_argument("--max-per-director", type=int, default=2, help="Max films per director (diversity mode)")
     rec_parser.add_argument("--no-temporal-decay", action="store_true",
                             help="Disable temporal decay (treat old and new ratings equally)")
+    rec_parser.add_argument("--hybrid-meta-weight", type=float, help="Weight for metadata component in hybrid fusion")
+    rec_parser.add_argument("--hybrid-collab-weight", type=float, help="Weight for collaborative component in hybrid fusion")
+    rec_parser.add_argument("--hybrid-diversity", action="store_true", help="Apply diversity constraint to hybrid output")
     rec_parser.add_argument("--format", choices=['text', 'json', 'markdown', 'csv'], default='text',
                             help="Output format")
     rec_parser.set_defaults(func=cmd_recommend)
@@ -1183,6 +1313,8 @@ def main():
     # Import command
     import_parser = subparsers.add_parser("import", help="Import database from JSON")
     import_parser.add_argument("file", help="Input JSON file path")
+    import_parser.add_argument("--maintenance", action="store_true", default=RUN_VACUUM_ANALYZE_DEFAULT,
+                               help="Run VACUUM/ANALYZE after import")
     import_parser.set_defaults(func=cmd_import)
     
     # Profile command
@@ -1214,6 +1346,20 @@ def main():
     # Rebuild-IDF command
     rebuild_idf_parser = subparsers.add_parser("rebuild-idf", help="Rebuild IDF scores for attribute rarity weighting")
     rebuild_idf_parser.set_defaults(func=cmd_rebuild_idf)
+
+    # Refresh metadata command
+    refresh_meta_parser = subparsers.add_parser("refresh-metadata", help="Refresh missing/low-quality film metadata")
+    refresh_meta_parser.add_argument("--limit", type=int, default=200, help="Max films to refresh")
+    refresh_meta_parser.add_argument("--min-rating-count", type=int, default=50, help="Minimum rating count threshold to consider metadata low-quality")
+    refresh_meta_parser.add_argument("--batch", type=int, default=DEFAULT_MAX_PER_BATCH, help="Batch size for metadata scraping")
+    refresh_meta_parser.add_argument("--maintenance", action="store_true", default=False, help="Run ANALYZE after refresh")
+    refresh_meta_parser.set_defaults(func=cmd_refresh_metadata)
+
+    # Prune pending command
+    prune_pending_parser = subparsers.add_parser("prune-pending", help="Prune stale pending users")
+    prune_pending_parser.add_argument("--older-than", type=int, default=PENDING_STALE_DAYS, help="Age in days to prune pending entries")
+    prune_pending_parser.add_argument("--max-priority", type=int, help="Remove pending entries at or below this priority")
+    prune_pending_parser.set_defaults(func=cmd_prune_pending)
 
     args = parser.parse_args()
     
