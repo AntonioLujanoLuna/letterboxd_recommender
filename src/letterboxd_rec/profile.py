@@ -107,13 +107,42 @@ def _compute_temporal_weight(
         return 1.0
 
 
+def _compute_weight_absolute(rating: float) -> float:
+    """Extract weight from rating alone (absolute scale)."""
+    if rating >= 4.5:
+        return WEIGHT_LOVED
+    elif rating >= 3.5:
+        return WEIGHT_LIKED
+    elif rating >= 3.0:
+        return WEIGHT_NEUTRAL
+    elif rating >= 2.0:
+        return WEIGHT_DISLIKED
+    else:
+        return WEIGHT_HATED
+
+
+def _z_to_weight(z_score: float) -> float:
+    """Map z-score to weight constant."""
+    if z_score >= 1.5:
+        return WEIGHT_LOVED
+    elif z_score >= 0.5:
+        return WEIGHT_LIKED
+    elif z_score >= -0.5:
+        return WEIGHT_NEUTRAL
+    elif z_score >= -1.5:
+        return WEIGHT_DISLIKED
+    else:
+        return WEIGHT_HATED
+
+
 def _compute_weight_normalized(
-    uf: dict, 
-    user_mean: float, 
-    user_std: float) -> float:
+    uf: dict,
+    user_mean: float,
+    user_std: float
+) -> float:
     """
     Compute preference weight normalized to user's personal rating distribution.
-    
+
     A user who averages 4.2 with std 0.6 giving a 3.0 is ~2 std below their mean,
     which is a strong negative signal—even though 3.0 is "neutral" in absolute terms.
     """
@@ -121,69 +150,53 @@ def _compute_weight_normalized(
     liked = uf.get('liked', False)
     watched = uf.get('watched', False)
     watchlisted = uf.get('watchlisted', False)
-    
+
     if rating is not None and user_std > 0:
-        # Z-score: how many standard deviations from user's mean?
         z_score = (rating - user_mean) / user_std
-        
-        # Map z-score to weight
-        # z >= 1.5  → loved (+2.0)
-        # z >= 0.5  → liked (+1.0)  
-        # z >= -0.5 → neutral (+0.3)
-        # z >= -1.5 → disliked (-0.5)
-        # z < -1.5  → hated (-1.5)
-        if z_score >= 1.5:
-            return WEIGHT_LOVED
-        elif z_score >= 0.5:
-            return WEIGHT_LIKED
-        elif z_score >= -0.5:
-            return WEIGHT_NEUTRAL
-        elif z_score >= -1.5:
-            return WEIGHT_DISLIKED
-        else:
-            return WEIGHT_HATED
-    
-    # Fall back to absolute thresholds if no distribution info
+        return _z_to_weight(z_score)
+
     elif rating is not None:
         return _compute_weight_absolute(rating)
-    
-    # Non-rated interactions unchanged
+
     if liked:
         return WEIGHT_LIKED_NO_RATING
     if watched:
         return WEIGHT_WATCHED_ONLY
     if watchlisted:
         return WEIGHT_WATCHLISTED
-    
+
     return 0.0
 
 
+def _compute_weight_blended(
+    uf: dict,
+    user_mean: float,
+    user_std: float,
+    n_ratings: int
+) -> float:
     """
     Blend absolute and normalized weights based on confidence.
-    
+
     With few ratings, trust absolute scale more.
     With many ratings, trust user's personal scale more.
     """
     rating = uf.get('rating')
     if rating is None:
-        return _compute_weight(uf)  # Fall back for non-rated
-    
-    # Absolute weight (current system)
+        return _compute_weight(uf)
+
     absolute_weight = _compute_weight(uf)
-    
-    # Normalized weight
+
     if user_std > 0.2 and n_ratings >= 10:
         z_score = (rating - user_mean) / user_std
         normalized_weight = _z_to_weight(z_score)
     else:
         normalized_weight = absolute_weight
-    
-    # Blend based on sample size
+
     # At 10 ratings: 50/50 blend
     # At 50+ ratings: 90% normalized
     confidence = min(1.0, n_ratings / 50)
-    blend_factor = 0.5 + (confidence * 0.4)  # Range: 0.5 to 0.9
-    
+    blend_factor = 0.5 + (confidence * 0.4)
+
     return (blend_factor * normalized_weight) + ((1 - blend_factor) * absolute_weight)
 
 

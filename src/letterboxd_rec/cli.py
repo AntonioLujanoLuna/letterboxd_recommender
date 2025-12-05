@@ -14,6 +14,7 @@ from .database import (
 from .config import DISCOVERY_PRIORITY_MAP
 from .scraper import LetterboxdScraper
 from .recommender import MetadataRecommender, CollaborativeRecommender, Recommendation
+from .matrix_factorization import SVDRecommender
 from .profile import build_profile
 from tqdm import tqdm
 import asyncio
@@ -644,6 +645,76 @@ def cmd_recommend(args: argparse.Namespace) -> None:
                 genres=args.genres,
                 exclude_genres=args.exclude_genres
             )
+        elif strategy == 'svd':        
+            # SVD needs all users' data
+            all_user_films = _load_all_user_films(conn)
+            
+            if username not in all_user_films:
+                logger.error(f"No data for '{username}'.")
+                return
+            
+            # Check minimum data requirements
+            n_users = len(all_user_films)
+            n_ratings = sum(
+                1 for films in all_user_films.values() 
+                for f in films if f.get('rating')
+            )
+            
+            if n_users < 10 or n_ratings < 100:
+                logger.warning(f"SVD works best with more data (have {n_users} users, {n_ratings} ratings). "
+                            f"Consider using 'metadata' strategy or running 'discover' to add more users.")
+            
+            # Fit SVD model
+            logger.info(f"Fitting SVD model on {n_users} users...")
+            svd = SVDRecommender(n_factors=min(50, n_users - 1))
+            svd.fit(all_user_films)
+            
+            # Get seen films for filtering
+            seen_slugs = {f['slug'] for f in user_films}
+            
+            # Get raw recommendations (slug, predicted_rating)
+            svd_recs = svd.recommend(username, seen_slugs, n=args.limit * 3)
+            
+            # Apply filters and build Recommendation objects
+            recs = []
+            for slug, predicted_rating in svd_recs:
+                if slug not in all_films:
+                    continue
+                
+                film = all_films[slug]
+                
+                # Apply year filters
+                year = film.get('year')
+                if args.min_year and year and year < args.min_year:
+                    continue
+                if args.max_year and year and year > args.max_year:
+                    continue
+                
+                # Apply genre filters
+                film_genres = load_json(film.get('genres', []))
+                if args.genres:
+                    genres_lower = [g.lower() for g in args.genres]
+                    if not any(g in film_genres for g in genres_lower):
+                        continue
+                if args.exclude_genres:
+                    exclude_lower = [g.lower() for g in args.exclude_genres]
+                    if any(g in film_genres for g in exclude_lower):
+                        continue
+                
+                # Apply rating filter
+                if args.min_rating and film.get('avg_rating') and film['avg_rating'] < args.min_rating:
+                    continue
+                
+                recs.append(Recommendation(
+                    slug=slug,
+                    title=film.get('title', slug),
+                    year=year,
+                    score=predicted_rating,
+                    reasons=[f"Predicted rating: {predicted_rating:.1f}★"]
+                ))
+                
+                if len(recs) >= args.limit:
+                    break
         else:
             # Metadata-based (default)
             diversity = getattr(args, 'diversity', False)
@@ -948,6 +1019,35 @@ def cmd_triage(args: argparse.Namespace) -> None:
         logger.info(f"   Why: {', '.join(r.reasons)}")
 
 
+def cmd_svd_info(args: argparse.Namespace) -> None:
+    """Show SVD model diagnostics."""
+    from .matrix_factorization import SVDRecommender
+    
+    with get_db() as conn:
+        all_user_films = _load_all_user_films(conn)
+    
+    if len(all_user_films) < 5:
+        logger.error("Need at least 5 users for SVD. Run 'discover' first.")
+        return
+    
+    svd = SVDRecommender(n_factors=min(50, len(all_user_films) - 1))
+    svd.fit(all_user_films)
+    
+    logger.info(f"\nSVD Model Info:")
+    logger.info(f"  Users: {len(svd.user_index)}")
+    logger.info(f"  Films: {len(svd.item_index)}")
+    logger.info(f"  Latent factors: {svd.n_factors}")
+    logger.info(f"  Global mean rating: {svd.global_mean:.2f}★")
+    
+    # Show user with highest/lowest bias
+    if svd.user_biases is not None:
+        usernames = list(svd.user_index.keys())
+        harshest_idx = svd.user_biases.argmin()
+        generous_idx = svd.user_biases.argmax()
+        logger.info(f"\n  Most generous rater: {usernames[generous_idx]} (+{svd.user_biases[generous_idx]:.2f})")
+        logger.info(f"  Harshest rater: {usernames[harshest_idx]} ({svd.user_biases[harshest_idx]:.2f})")
+
+
 def cmd_gaps(args: argparse.Namespace) -> None:
     """Find gaps in filmography of favorite directors."""
     # Validate username
@@ -1051,7 +1151,7 @@ def main():
     # Recommend command
     rec_parser = subparsers.add_parser("recommend", help="Generate recommendations")
     rec_parser.add_argument("username", help="Letterboxd username")
-    rec_parser.add_argument("--strategy", choices=['metadata', 'collaborative', 'hybrid'], 
+    rec_parser.add_argument("--strategy", choices=['metadata', 'collaborative', 'hybrid', 'svd'], 
                             default='metadata', help="Recommendation strategy")
     rec_parser.add_argument("--limit", type=int, default=20, help="Number of recommendations")
     rec_parser.add_argument("--min-year", type=int, help="Minimum release year")
@@ -1070,6 +1170,10 @@ def main():
     # Stats command
     stats_parser = subparsers.add_parser("stats", help="Show database statistics")
     stats_parser.set_defaults(func=cmd_stats)
+
+    # SVD command
+    svd_parser = subparsers.add_parser("svd-info", help="Show SVD model diagnostics")
+    svd_parser.set_defaults(func=cmd_svd_info)
     
     # Export command
     export_parser = subparsers.add_parser("export", help="Export database to JSON")
