@@ -125,6 +125,10 @@ LIST_MULTIPLIER_CURATED = 1.3
 MAX_CAST_CONSIDERED = 5
 MAX_THEMES_CONSIDERED = 10
 SECONDARY_COUNTRY_WEIGHT = 0.3
+# Blended weighting confidence ramp
+BLENDED_CONFIDENCE_MAX_RATINGS = 50   # Ratings to reach full confidence in normalized weights
+BLENDED_CONFIDENCE_BASE = 0.5         # Blend factor floor when very few ratings
+BLENDED_CONFIDENCE_SPAN = 0.4         # Additional blend weight as confidence approaches 1.0
 
 # Normalization exponents (0 = no normalization, 0.5 = sqrt, 1.0 = full count normalization)
 NORM_EXPONENT_DEFAULT = 0.5
@@ -151,6 +155,12 @@ WEIGHTS = {
 SERENDIPITY_FACTOR = 0.15
 SERENDIPITY_MIN_RATING = 3.5
 SERENDIPITY_POPULARITY_CAP = 50000
+# Percentile window to draw discovery picks from (fallbacks to rank bounds)
+SERENDIPITY_PERCENTILE_WINDOW = (0.2, 0.8)
+SERENDIPITY_MIN_RANK = 50
+SERENDIPITY_MAX_RANK = 300
+# How much to reward attributes that are relatively under-sampled for broad viewers
+SERENDIPITY_RELATIVE_NOVELTY_WEIGHT = 0.8
 
 # Match Thresholds
 MATCH_THRESHOLD_GENRE = 0.5
@@ -205,7 +215,7 @@ IDF_DISTINCTIVE_THRESHOLD = 2.0  # IDF above this is "distinctive taste"
 # - Normalization exponents change (NORM_EXPONENT_*)
 # - List multipliers change (LIST_MULTIPLIER_*)
 # - Confidence min samples change (CONFIDENCE_MIN_SAMPLES)
-PROFILE_SCHEMA_VERSION = 2
+PROFILE_SCHEMA_VERSION = 3
 
 # Discovery Priority Configuration
 # Priority scores for different user discovery sources

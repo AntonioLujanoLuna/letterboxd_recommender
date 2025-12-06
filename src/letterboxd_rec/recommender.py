@@ -1,7 +1,6 @@
 from dataclasses import dataclass, field
 import logging
-from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 import math
 import json
 from pathlib import Path
@@ -36,6 +35,10 @@ from .config import (
     SERENDIPITY_FACTOR,
     SERENDIPITY_MIN_RATING,
     SERENDIPITY_POPULARITY_CAP,
+    SERENDIPITY_PERCENTILE_WINDOW,
+    SERENDIPITY_MIN_RANK,
+    SERENDIPITY_MAX_RANK,
+    SERENDIPITY_RELATIVE_NOVELTY_WEIGHT,
     ATTRIBUTE_CAPS,
     LONG_TAIL_BOOST,
     LONG_TAIL_RATING_COUNT,
@@ -68,6 +71,46 @@ class AttributeConfig:
     distinctive_reason_template: str   # e.g., "Genre: {} (distinctive taste)"
 
 
+RuleFunc = Callable[
+    ["MetadataRecommender", dict, UserProfile, list[str], list[str]],
+    tuple[float, list[str], list[str]],
+]
+
+
+class ScoringEngine:
+    """Composable scoring pipeline for metadata recommendations."""
+
+    def __init__(self, attribute_configs: list[AttributeConfig], rules: list["RuleFunc"] | None = None):
+        self.attribute_configs = attribute_configs
+        self.rules = rules or []
+
+    def score(
+        self,
+        recommender: "MetadataRecommender",
+        film: dict,
+        profile: UserProfile,
+    ) -> tuple[float, list[str], list[str]]:
+        score = 0.0
+        reasons: list[str] = []
+        warnings: list[str] = []
+
+        for config in self.attribute_configs:
+            attr_score, attr_reasons, attr_warnings = recommender._score_attribute(film, profile, config)
+            score += attr_score
+            reasons.extend(attr_reasons)
+            warnings.extend(attr_warnings)
+
+        for rule in self.rules:
+            delta, extra_reasons, extra_warnings = rule(recommender, film, profile, reasons, warnings)
+            score += delta
+            if extra_reasons:
+                reasons.extend(extra_reasons)
+            if extra_warnings:
+                warnings.extend(extra_warnings)
+
+        return score, reasons, warnings
+
+
 def _confidence_weight(count: int, min_for_full_confidence: int = 5) -> float:
     """
     Returns weight between 0.0 and 1.0 based on sample size.
@@ -84,6 +127,155 @@ def _confidence_weight(count: int, min_for_full_confidence: int = 5) -> float:
     if count >= min_for_full_confidence:
         return 1.0
     return (count / min_for_full_confidence) ** 0.5
+
+
+def _director_confidence_rule(
+    recommender: "MetadataRecommender",
+    film: dict,
+    profile: UserProfile,
+    reasons: list[str],
+    warnings: list[str],
+) -> tuple[float, list[str], list[str]]:
+    """Annotate director matches with sample size to make low-confidence signals transparent."""
+    film_directors = recommender._get_list(film, 'directors')
+    for d in film_directors:
+        if d in profile.directors and profile.directors[d] > MATCH_THRESHOLD_DIRECTOR:
+            count = profile.director_counts.get(d, 1)
+            confidence = _confidence_weight(count, CONFIDENCE_MIN_SAMPLES['director'])
+            if confidence < 0.7:
+                for i, reason in enumerate(reasons):
+                    if reason.startswith(f"Director: {d}"):
+                        plural = 's' if count > 1 else ''
+                        reasons[i] = f"Director: {d} (based on {count} film{plural})"
+                        break
+    return 0.0, [], []
+
+
+def _genre_pair_rule(
+    recommender: "MetadataRecommender",
+    film: dict,
+    profile: UserProfile,
+    reasons: list[str],
+    warnings: list[str],
+) -> tuple[float, list[str], list[str]]:
+    """Capture genre co-occurrence preferences as an explicit rule."""
+    film_genres = recommender._get_list(film, 'genres')
+    pair_score = 0.0
+    matched_pairs: list[str] = []
+    pair_warnings: list[str] = []
+
+    for i, g1 in enumerate(film_genres):
+        for g2 in film_genres[i + 1:]:
+            pair = "|".join(sorted([g1, g2]))
+            if pair in profile.genre_pairs:
+                pair_value = profile.genre_pairs[pair]
+                if pair_value < 0:
+                    pair_score += pair_value * NEGATIVE_PENALTY_MULTIPLIER
+                    if pair_value < -0.5:
+                        pair_warnings.append(f"⚠️ Genre combo: {g1}+{g2} (disliked)")
+                else:
+                    pair_score += pair_value
+                    if pair_value > 0.5:
+                        matched_pairs.append(f"{g1}+{g2}")
+
+    pair_reasons = [f"Genre combo: {matched_pairs[0]}"] if matched_pairs else []
+    return pair_score * WEIGHTS.get('genre_pair', 0.6), pair_reasons, pair_warnings
+
+
+def _decade_rule(
+    recommender: "MetadataRecommender",
+    film: dict,
+    profile: UserProfile,
+    reasons: list[str],
+    warnings: list[str],
+) -> tuple[float, list[str], list[str]]:
+    """Decade affinity scoring."""
+    year = film.get('year')
+    if not year:
+        return 0.0, [], []
+
+    decade = (year // 10) * 10
+    if decade in profile.decades:
+        return profile.decades[decade] * WEIGHTS['decade'], [], []
+    return 0.0, [], []
+
+
+def _country_rule(
+    recommender: "MetadataRecommender",
+    film: dict,
+    profile: UserProfile,
+    reasons: list[str],
+    warnings: list[str],
+) -> tuple[float, list[str], list[str]]:
+    """Country affinity with primary/secondary weighting and confidence."""
+    film_countries = recommender._get_list(film, 'countries')
+    country_reasons: list[str] = []
+    country_score_total = 0.0
+
+    for i, country in enumerate(film_countries):
+        if country in profile.countries:
+            country_score = profile.countries[country]
+            count = profile.country_counts.get(country, 1)
+            confidence = _confidence_weight(count, CONFIDENCE_MIN_SAMPLES['country'])
+
+            country_weight = WEIGHTS['country'] if i == 0 else WEIGHTS['country'] * recommender.COUNTRY_SECONDARY_WEIGHT
+            country_score_total += country_score * country_weight * confidence
+            if i == 0 and country_score > 0.5:
+                country_reasons.append(f"Country: {country}")
+
+    return country_score_total, country_reasons, []
+
+
+def _community_rating_rule(
+    recommender: "MetadataRecommender",
+    film: dict,
+    profile: UserProfile,
+    reasons: list[str],
+    warnings: list[str],
+) -> tuple[float, list[str], list[str]]:
+    """Favor films whose community rating aligns to the user's sweet spot."""
+    avg = film.get('avg_rating')
+    if avg and profile.avg_liked_rating:
+        rating_diff = abs(avg - profile.avg_liked_rating)
+        if rating_diff < RATING_DIFF_HIGH:
+            return 1.0 * WEIGHTS['community_rating'], [f"Highly rated ({avg:.1f}★)"], []
+        elif rating_diff < RATING_DIFF_MED:
+            return 0.5 * WEIGHTS['community_rating'], [], []
+    return 0.0, [], []
+
+
+def _popularity_rule(
+    recommender: "MetadataRecommender",
+    film: dict,
+    profile: UserProfile,
+    reasons: list[str],
+    warnings: list[str],
+) -> tuple[float, list[str], list[str]]:
+    """Gentle popularity shaping plus long-tail boost."""
+    _ = profile  # unused in this rule
+    count = film.get('rating_count') or 0
+    score = 0.0
+    popularity_reasons: list[str] = []
+
+    if count > POPULARITY_HIGH_THRESHOLD:
+        score += 0.3 * WEIGHTS['popularity']
+    elif count > POPULARITY_MED_THRESHOLD:
+        score += 0.1 * WEIGHTS['popularity']
+    elif count and count < LONG_TAIL_RATING_COUNT:
+        score += LONG_TAIL_BOOST
+        popularity_reasons.append("Underseen gem")
+
+    return score, popularity_reasons, []
+
+
+DEFAULT_SCORING_RULES: list[RuleFunc] = [
+    _director_confidence_rule,
+    _genre_pair_rule,
+    _decade_rule,
+    _country_rule,
+    _community_rating_rule,
+    _popularity_rule,
+]
 
 
 # Fields we repeatedly parse from JSON-encoded strings
@@ -367,6 +559,7 @@ class MetadataRecommender:
         else:
             self.idf = {}
         self._tfidf: TfidfEmbedder | None = None
+        self.scoring_engine = ScoringEngine(ATTRIBUTE_CONFIGS, DEFAULT_SCORING_RULES)
 
     def _get_list(self, film: dict, field: str, limit: int | None = None) -> list:
         """Return a parsed list for a film field (uses pre-parsed cache when available)."""
@@ -479,6 +672,7 @@ class MetadataRecommender:
         if not ranked_candidates or n <= 0:
             return []
 
+        total_candidates = len(ranked_candidates)
         n_serendipitous = max(1, int(n * serendipity_factor)) if serendipity_factor > 0 else 0
         n_core = n - n_serendipitous
         
@@ -486,10 +680,15 @@ class MetadataRecommender:
         core_recs = ranked_candidates[:n_core]
         core_slugs = {c[0] for c in core_recs}
         
-        # Find serendipitous candidates from mid-tier
-        # (ranked 50-200, decent score but not obvious)
+        # Find serendipitous candidates from mid-tier based on percentile window with rank guards
+        start_pct, end_pct = SERENDIPITY_PERCENTILE_WINDOW
+        start_idx = max(n_core, int(total_candidates * start_pct), SERENDIPITY_MIN_RANK)
+        end_idx = min(int(total_candidates * end_pct), SERENDIPITY_MAX_RANK, total_candidates)
+        if end_idx <= start_idx:
+            start_idx = min(start_idx, total_candidates)
+            end_idx = total_candidates
         serendipity_pool = [
-            c for c in ranked_candidates[50:300]
+            c for c in ranked_candidates[start_idx:end_idx]
             if c[0] not in core_slugs
         ]
 
@@ -502,6 +701,16 @@ class MetadataRecommender:
         n_core = max(0, n - n_serendipitous)
         core_recs = ranked_candidates[:n_core]
         core_slugs = {c[0] for c in core_recs}
+
+        # Precompute averages to reward relative novelty for broad-taste users
+        avg_genre_count = (
+            sum(profile.genre_counts.values()) / len(profile.genre_counts)
+            if profile.genre_counts else 0.0
+        )
+        avg_country_count = (
+            sum(profile.country_counts.values()) / len(profile.country_counts)
+            if profile.country_counts else 0.0
+        )
         
         # Score for serendipity value
         serendipity_scored = []
@@ -526,12 +735,18 @@ class MetadataRecommender:
                     novelty += 1.0
                 elif count < 10:
                     novelty += 0.3
+                elif avg_genre_count:
+                    relative_gap = max(0.0, 1 - (count / avg_genre_count))
+                    novelty += relative_gap * SERENDIPITY_RELATIVE_NOVELTY_WEIGHT
             
             # Country novelty
             film_countries = self._get_list(film, 'countries')
             for country in film_countries[:1]:  # Primary country
                 if profile.country_counts.get(country, 0) < 5:
                     novelty += 1.5
+                elif avg_country_count:
+                    relative_gap = max(0.0, 1 - (profile.country_counts.get(country, 0) / avg_country_count))
+                    novelty += relative_gap * SERENDIPITY_RELATIVE_NOVELTY_WEIGHT
             
             # Decade novelty
             year = film.get('year')
@@ -816,97 +1031,7 @@ class MetadataRecommender:
         Score a film against user profile using configuration-driven attribute scoring.
         Returns (score, list of reasons, list of warnings).
         """
-        score = 0.0
-        reasons = []
-        warnings = []
-
-        # Score all configured attributes using generic method
-        for config in ATTRIBUTE_CONFIGS:
-            attr_score, attr_reasons, attr_warnings = self._score_attribute(film, profile, config)
-            score += attr_score
-            reasons.extend(attr_reasons)
-            warnings.extend(attr_warnings)
-
-        # Special case: Directors with low confidence get annotated reasons
-        film_directors = self._get_list(film, 'directors')
-        for d in film_directors:
-            if d in profile.directors and profile.directors[d] > MATCH_THRESHOLD_DIRECTOR:
-                count = profile.director_counts.get(d, 1)
-                confidence = _confidence_weight(count, CONFIDENCE_MIN_SAMPLES['director'])
-                if confidence < 0.7:
-                    # Replace generic director reason with annotated version
-                    for i, reason in enumerate(reasons):
-                        if reason.startswith(f"Director: {d}"):
-                            reasons[i] = f"Director: {d} (based on {count} film{'s' if count > 1 else ''})"
-                            break
-
-        # Genre pair matching (co-occurrence preferences)
-        film_genres = self._get_list(film, 'genres')
-        pair_score = 0.0
-        matched_pairs = []
-        for i, g1 in enumerate(film_genres):
-            for g2 in film_genres[i+1:]:
-                pair = "|".join(sorted([g1, g2]))
-                if pair in profile.genre_pairs:
-                    pair_value = profile.genre_pairs[pair]
-                    # Apply negative penalty multiplier for negative pair preferences
-                    if pair_value < 0:
-                        pair_score += pair_value * NEGATIVE_PENALTY_MULTIPLIER
-                        if pair_value < -0.5:  # Threshold for reporting negative pairs
-                            warnings.append(f"⚠️ Genre combo: {g1}+{g2} (disliked)")
-                    else:
-                        pair_score += pair_value
-                        if pair_value > 0.5:  # Threshold for reporting positive pairs
-                            matched_pairs.append(f"{g1}+{g2}")
-
-        score += pair_score * WEIGHTS.get('genre_pair', 0.6)
-        if matched_pairs:
-            reasons.append(f"Genre combo: {matched_pairs[0]}")
-
-        # Decade match
-        year = film.get('year')
-        if year:
-            decade = (year // 10) * 10
-            if decade in profile.decades:
-                score += profile.decades[decade] * WEIGHTS['decade']
-
-        # Country match (with primary/secondary weighting)
-        film_countries = self._get_list(film, 'countries')
-        for i, country in enumerate(film_countries):
-            if country in profile.countries:
-                country_score = profile.countries[country]
-                count = profile.country_counts.get(country, 1)
-                confidence = _confidence_weight(count, CONFIDENCE_MIN_SAMPLES['country'])
-
-                # Primary country gets full weight, secondary reduced
-                country_weight = WEIGHTS['country'] if i == 0 else WEIGHTS['country'] * self.COUNTRY_SECONDARY_WEIGHT
-                score += country_score * country_weight * confidence
-                if i == 0 and country_score > 0.5:
-                    reasons.append(f"Country: {country}")
-
-        # Community rating bonus
-        # Favor films rated similarly to user's liked films
-        avg = film.get('avg_rating')
-        if avg and profile.avg_liked_rating:
-            # Bonus for films near user's sweet spot
-            rating_diff = abs(avg - profile.avg_liked_rating)
-            if rating_diff < RATING_DIFF_HIGH:
-                score += 1.0 * WEIGHTS['community_rating']
-                reasons.append(f"Highly rated ({avg:.1f}★)")
-            elif rating_diff < RATING_DIFF_MED:
-                score += 0.5 * WEIGHTS['community_rating']
-
-        # Slight popularity boost (avoid total obscurity)
-        count = film.get('rating_count') or 0
-        if count > POPULARITY_HIGH_THRESHOLD:
-            score += 0.3 * WEIGHTS['popularity']
-        elif count > POPULARITY_MED_THRESHOLD:
-            score += 0.1 * WEIGHTS['popularity']
-        elif count and count < LONG_TAIL_RATING_COUNT and score > 0:
-            score += LONG_TAIL_BOOST
-            reasons.append("Underseen gem")
-
-        return score, reasons, warnings
+        return self.scoring_engine.score(self, film, profile)
     
     def similar_to(self, slug: str, n: int = 10) -> list[Recommendation]:
         """Find films similar to a specific film (item-based)."""

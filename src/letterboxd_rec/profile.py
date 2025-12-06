@@ -9,6 +9,9 @@ from .config import (
     MAX_CAST_CONSIDERED,
     MAX_THEMES_CONSIDERED,
     SECONDARY_COUNTRY_WEIGHT,
+    BLENDED_CONFIDENCE_BASE,
+    BLENDED_CONFIDENCE_MAX_RATINGS,
+    BLENDED_CONFIDENCE_SPAN,
     WEIGHT_LOVED,
     WEIGHT_LIKED,
     WEIGHT_NEUTRAL,
@@ -203,9 +206,9 @@ def _compute_weight_blended(
     else:
         normalized_weight = absolute_weight
 
-    # At 10 ratings: 50/50 blend; at 50+ ratings: 90% normalized
-    confidence = min(1.0, n_ratings / 50)
-    blend_factor = 0.5 + (confidence * 0.4)
+    # Confidence ramp is configurable to avoid hard-coded convergence speed
+    confidence = min(1.0, n_ratings / BLENDED_CONFIDENCE_MAX_RATINGS)
+    blend_factor = BLENDED_CONFIDENCE_BASE + (confidence * BLENDED_CONFIDENCE_SPAN)
 
     return (blend_factor * normalized_weight) + ((1 - blend_factor) * absolute_weight)
 
