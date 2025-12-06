@@ -914,7 +914,50 @@ class AsyncLetterboxdScraper:
         # Coordinated rate limiting: when one task hits 429, all tasks pause
         self._rate_limit_event = asyncio.Event()
         self._rate_limit_event.set()  # Start in "not rate limited" state
-    
+
+    @staticmethod
+    def _parse_rating(span) -> float | None:
+        """
+        Parse rating from span element with class like 'rated-8' (representing 4.0 stars).
+
+        Mirrors the synchronous scraper's logic so async user scraping can share the same format handling.
+        """
+        classes = span.attributes.get("class", "")
+        for cls in classes.split():
+            if cls.startswith("rated-"):
+                try:
+                    val = int(cls.replace("rated-", "")) / 2
+                    if 0.5 <= val <= 5.0:
+                        return val
+                    logger.warning(f"Rating value outside range [0.5-5.0]: {val} from class '{cls}'")
+                    return None
+                except ValueError as exc:
+                    logger.warning(f"Unexpected rating format in class '{cls}': {exc}")
+                    return None
+
+        if classes:
+            logger.debug(f"No 'rated-*' class found in span classes: {classes}")
+        return None
+
+    @staticmethod
+    def _detect_soft_block(tree: HTMLParser | None) -> bool:
+        """Detect CAPTCHA/please-wait soft blocks to avoid burning retries."""
+        if not tree:
+            return False
+
+        if tree.css_first("form[action*='captcha'], .captcha-container"):
+            return True
+
+        body_el = tree.css_first("body")
+        body_text = body_el.text() if body_el else ""
+        soft_block_phrases = [
+            "please wait",
+            "too many requests",
+            "try again later",
+            "access denied",
+        ]
+        return any(phrase in body_text.lower() for phrase in soft_block_phrases)
+
     async def __aenter__(self):
         """Async context manager entry."""
         self.client = httpx.AsyncClient(
@@ -930,6 +973,175 @@ class AsyncLetterboxdScraper:
         if self.client:
             await self.client.aclose()
         return False
+
+    async def _get(self, url: str) -> HTMLParser | None:
+        """
+        Internal async GET with coordinated rate limiting and retry logic.
+        Requires the context manager to have initialized self.client.
+        """
+        if not self.client:
+            raise RuntimeError("AsyncLetterboxdScraper must be used as an async context manager for user scraping")
+
+        async with self.semaphore:
+            await asyncio.sleep(self.delay)
+
+            for attempt in range(MAX_HTTP_RETRIES):
+                await self._rate_limit_event.wait()
+
+                try:
+                    resp = await self.client.get(url)
+
+                    if resp.status_code == 404:
+                        return None
+
+                    if resp.status_code == 429:
+                        retry_after = int(resp.headers.get("Retry-After", DEFAULT_RETRY_AFTER))
+                        logger.warning(
+                            f"Rate limited on {url}, pausing ALL tasks for {retry_after}s "
+                            f"(attempt {attempt + 1}/{MAX_HTTP_RETRIES})"
+                        )
+                        self._rate_limit_event.clear()
+                        await asyncio.sleep(retry_after)
+                        self._rate_limit_event.set()
+
+                        import random
+                        jitter = random.uniform(0, self.delay * 2)
+                        await asyncio.sleep(jitter)
+                        self.delay = min(SCRAPER_ADAPTIVE_DELAY_MAX, self.delay * SCRAPER_429_BACKOFF)
+                        continue
+
+                    resp.raise_for_status()
+                    return HTMLParser(resp.text)
+
+                except httpx.TimeoutException:
+                    wait_time = 2 ** attempt
+                    logger.warning(
+                        f"Timeout on {url}, retrying in {wait_time}s (attempt {attempt + 1}/{MAX_HTTP_RETRIES})"
+                    )
+                    await asyncio.sleep(wait_time)
+
+                except httpx.HTTPStatusError as exc:
+                    logger.error(f"HTTP {exc.response.status_code} on {url}: {exc}")
+                    return None
+
+                except httpx.HTTPError as exc:
+                    logger.error(f"Request error on {url}: {type(exc).__name__}: {exc}")
+                    return None
+
+            logger.error(f"Max retries exceeded for {url}")
+            return None
+
+    async def _get_with_soft_block_recovery(self, url: str) -> HTMLParser | None:
+        """Enhanced _get with soft block detection and a short backoff sequence."""
+        tree = await self._get(url)
+        if tree and self._detect_soft_block(tree):
+            logger.warning(f"Soft block detected on {url}, backing off...")
+            for wait_time in [1, 2, 4]:
+                await asyncio.sleep(wait_time)
+                tree = await self._get(url)
+                if tree and not self._detect_soft_block(tree):
+                    return tree
+            logger.error(f"Persistent soft block on {url}")
+            return None
+        return tree
+
+    async def scrape_user(self, username: str, existing_slugs: set[str] | None = None, stop_on_existing: bool = False) -> list[FilmInteraction]:
+        """
+        Async variant of user scraping. Uses the shared client/semaphore so requests are globally rate limited.
+        """
+        films: dict[str, FilmInteraction] = {}
+
+        logger.info(f"Scraping {username}'s films (async)...")
+        page = 1
+        consecutive_existing = 0
+
+        while True:
+            tree = await self._get_with_soft_block_recovery(f"{self.BASE}/{username}/films/page/{page}/")
+            if not tree:
+                break
+
+            items = tree.css("li.griditem")
+            if not items:
+                break
+
+            page_had_new_films = False
+            stop_after_page = len(items) < SCRAPER_PAGE_SIZE
+
+            for item in items:
+                react_comp = item.css_first("div.react-component")
+                if not react_comp:
+                    continue
+
+                slug = validate_slug(react_comp.attributes.get("data-item-slug"))
+                if not slug:
+                    continue
+
+                if stop_on_existing and existing_slugs and slug in existing_slugs:
+                    consecutive_existing += 1
+                    if consecutive_existing >= MAX_CONSECUTIVE_EXISTING:
+                        logger.info(
+                            f"  Found {consecutive_existing} consecutive existing films, stopping early (incremental mode)"
+                        )
+                        return list(films.values())
+                    continue
+                else:
+                    consecutive_existing = 0
+                    page_had_new_films = True
+
+                rating = None
+                liked = False
+                viewing_data = item.css_first("p.poster-viewingdata")
+                if viewing_data:
+                    rating_span = viewing_data.css_first("span.rating")
+                    if rating_span:
+                        rating = self._parse_rating(rating_span)
+                    liked = viewing_data.css_first("span.like") is not None
+
+                films[slug] = FilmInteraction(slug, rating, True, False, liked)
+
+            page += 1
+            logger.debug(f"  Watched page {page-1}: {len(items)} films")
+
+            if stop_on_existing and not page_had_new_films and existing_slugs:
+                logger.info(f"  No new films found on page {page-1}, stopping early (incremental mode)")
+                break
+            if stop_after_page:
+                break
+
+        logger.info(f"Scraping {username}'s watchlist (async)...")
+        page = 1
+        while True:
+            tree = await self._get_with_soft_block_recovery(f"{self.BASE}/{username}/watchlist/page/{page}/")
+            if not tree:
+                break
+
+            items = tree.css("li.griditem")
+            if not items:
+                break
+
+            stop_after_page = len(items) < SCRAPER_PAGE_SIZE
+            for item in items:
+                react_comp = item.css_first("div.react-component")
+                if not react_comp:
+                    continue
+
+                slug = validate_slug(react_comp.attributes.get("data-item-slug"))
+                if not slug:
+                    continue
+
+                if slug in films:
+                    films[slug].watchlisted = True
+                else:
+                    films[slug] = FilmInteraction(slug, None, False, True, False)
+
+            page += 1
+            if stop_after_page:
+                break
+
+        n_rated = sum(1 for f in films.values() if f.rating)
+        n_liked = sum(1 for f in films.values() if f.liked)
+        logger.info(f"Total: {len(films)} films ({n_rated} rated, {n_liked} liked)")
+        return list(films.values())
     
     async def scrape_films_batch(self, slugs: list[str]) -> list[FilmMetadata]:
         """

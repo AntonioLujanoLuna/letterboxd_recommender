@@ -139,6 +139,62 @@ async def test_async_scraper_batch_summarizes_failures(monkeypatch):
     assert [film.slug for film in results] == ["ok"]
 
 
+@pytest.mark.asyncio
+async def test_async_scrape_user_parses_films_and_watchlist(monkeypatch):
+    films_html = """
+    <html>
+      <ul>
+        <li class="griditem">
+          <div class="react-component" data-item-slug="film-a"></div>
+          <p class="poster-viewingdata">
+            <span class="rating rated-8"></span>
+            <span class="like"></span>
+          </p>
+        </li>
+      </ul>
+    </html>
+    """
+    watchlist_html = """
+    <html>
+      <ul>
+        <li class="griditem">
+          <div class="react-component" data-item-slug="film-b"></div>
+        </li>
+      </ul>
+    </html>
+    """
+    empty_html = "<html></html>"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "/films/page/1/" in url:
+            return httpx.Response(200, text=films_html)
+        if "/films/page/2/" in url:
+            return httpx.Response(200, text=empty_html)
+        if "/watchlist/page/1/" in url:
+            return httpx.Response(200, text=watchlist_html)
+        if "/watchlist/page/2/" in url:
+            return httpx.Response(200, text=empty_html)
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(handler)
+    original_async_client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original_async_client(transport=transport, **kwargs))
+
+    async with scraper.AsyncLetterboxdScraper(delay=0.0, max_concurrent=3) as async_scraper:
+        interactions = await async_scraper.scrape_user("alice")
+
+    by_slug = {i.film_slug: i for i in interactions}
+
+    assert by_slug["film-a"].watched is True
+    assert by_slug["film-a"].liked is True
+    assert by_slug["film-a"].rating == 4.0
+
+    assert by_slug["film-b"].watchlisted is True
+    assert by_slug["film-b"].watched is False
+    assert by_slug["film-b"].rating is None
+
+
 def test_check_user_activity_parses_profile(monkeypatch):
     lb_scraper = scraper.LetterboxdScraper(delay=0.0)
     sample_html = """

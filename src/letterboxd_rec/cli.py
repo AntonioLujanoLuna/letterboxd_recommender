@@ -23,10 +23,13 @@ from .config import (
     IMPORT_CHUNK_SIZE,
     PENDING_STALE_DAYS,
     DEFAULT_MAX_PER_BATCH,
+    DEFAULT_MAX_CONCURRENT,
+    DEFAULT_MAX_CONCURRENT_USERS,
+    DEFAULT_ASYNC_DELAY,
     NOTIFICATION_WEBHOOK_URL,
     NOTIFICATION_INTERVAL,
 )
-from .scraper import LetterboxdScraper
+from .scraper import LetterboxdScraper, AsyncLetterboxdScraper
 from .recommender import MetadataRecommender, CollaborativeRecommender, Recommendation, _fuse_normalized
 from .matrix_factorization import SVDRecommender
 from .profile import build_profile
@@ -159,7 +162,13 @@ def _load_films_with_filters(
     return {r['slug']: dict(r) for r in rows}
 
 
-def _scrape_film_metadata(scraper: 'LetterboxdScraper', slugs: list[str], max_per_batch: int = 100, use_async: bool = True) -> None:
+def _scrape_film_metadata(
+    scraper: 'LetterboxdScraper',
+    slugs: list[str],
+    max_per_batch: int = 100,
+    use_async: bool = True,
+    async_scraper: 'AsyncLetterboxdScraper | None' = None,
+) -> None:
     """Helper to scrape film metadata for a list of slugs."""
     if not slugs:
         return
@@ -170,11 +179,13 @@ def _scrape_film_metadata(scraper: 'LetterboxdScraper', slugs: list[str], max_pe
         from .scraper import AsyncLetterboxdScraper
         logger.info(f"Fetching {len(limited_slugs)} films (async)...")
 
-        async def scrape_batch():
-            async with AsyncLetterboxdScraper(delay=0.2, max_concurrent=5) as async_scraper:
-                return await async_scraper.scrape_films_batch(limited_slugs)
+        async def scrape_batch(shared: AsyncLetterboxdScraper | None):
+            if shared:
+                return await shared.scrape_films_batch(limited_slugs)
+            async with AsyncLetterboxdScraper(delay=0.2, max_concurrent=5) as temp_async:
+                return await temp_async.scrape_films_batch(limited_slugs)
 
-        metadata_list = asyncio.run(scrape_batch())
+        metadata_list = asyncio.run(scrape_batch(async_scraper))
     else:
         metadata_list = []
         for slug in tqdm(limited_slugs, desc="Metadata"):
@@ -205,6 +216,45 @@ def _scrape_film_metadata(scraper: 'LetterboxdScraper', slugs: list[str], max_pe
 
         logger.info(f"Saved {len(metadata_list)} films")
 
+
+async def _scrape_film_metadata_async(
+    async_scraper: 'AsyncLetterboxdScraper',
+    slugs: list[str],
+    max_per_batch: int = 100,
+) -> None:
+    """
+    Async helper to scrape film metadata using a shared AsyncLetterboxdScraper.
+    Mirrors _scrape_film_metadata but avoids blocking the event loop.
+    """
+    if not slugs:
+        return
+
+    limited_slugs = slugs[:max_per_batch]
+    metadata_list = await async_scraper.scrape_films_batch(limited_slugs)
+
+    if not metadata_list:
+        return
+
+    def _persist():
+        with get_db() as conn:
+            conn.executemany("""
+                INSERT OR REPLACE INTO films
+                (slug, title, year, directors, genres, cast, themes, runtime, avg_rating, rating_count,
+                 countries, languages, writers, cinematographers, composers)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, [(
+                m.slug, m.title, m.year,
+                json.dumps(m.directors), json.dumps(m.genres),
+                json.dumps(m.cast), json.dumps(m.themes),
+                m.runtime, m.avg_rating, m.rating_count,
+                json.dumps(m.countries), json.dumps(m.languages),
+                json.dumps(m.writers), json.dumps(m.cinematographers),
+                json.dumps(m.composers)
+            ) for m in metadata_list])
+            populate_normalized_tables_batch(conn, metadata_list)
+
+    await asyncio.to_thread(_persist)
+    logger.info(f"Saved {len(metadata_list)} films")
 
 def cmd_scrape(args: argparse.Namespace) -> None:
     """Scrape a user's Letterboxd data."""
@@ -553,10 +603,9 @@ def cmd_discover(args: argparse.Namespace) -> None:
         scraper.close()
 
 
-def cmd_scrape_daemon(args: argparse.Namespace) -> None:
-    """Continuously drain the pending queue with graceful shutdown."""
+async def _cmd_scrape_daemon_async(args: argparse.Namespace) -> None:
+    """Async daemon: drain pending queue with shared client + coordinated rate limiting."""
     init_db()
-    scraper = LetterboxdScraper(delay=args.delay)
 
     # Track session progress and allow resuming visibility
     session_id = create_scrape_session()
@@ -564,92 +613,129 @@ def cmd_scrape_daemon(args: argparse.Namespace) -> None:
     films_added = 0
     session_start = datetime.now()
 
-    # Cache known film slugs to reduce redundant metadata lookups
-    with get_db(read_only=True) as conn:
-        known_film_slugs = {r['slug'] for r in conn.execute("SELECT slug FROM films")}
+    async def _load_known_slugs() -> set[str]:
+        def _load():
+            with get_db(read_only=True) as conn:
+                return {r['slug'] for r in conn.execute("SELECT slug FROM films")}
+        return await asyncio.to_thread(_load)
 
+    known_film_slugs = await _load_known_slugs()
+    user_semaphore = asyncio.Semaphore(getattr(args, "max_concurrent_users", 1))
     shutdown_requested = False
 
-    def _handle_signal(signum, _frame):
-        nonlocal shutdown_requested
-        logger.info("\nShutdown requested, finishing current user...")
-        shutdown_requested = True
+    async def _persist_user_films(username: str, interactions):
+        def _persist():
+            with get_db() as conn:
+                scraped_at = datetime.now().isoformat()
+                conn.executemany("""
+                    INSERT OR REPLACE INTO user_films
+                    (username, film_slug, rating, watched, watchlisted, liked, scraped_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, [
+                    (username, i.film_slug, i.rating, i.watched, i.watchlisted, i.liked, scraped_at)
+                    for i in interactions
+                ])
+        await asyncio.to_thread(_persist)
 
-    for sig_name in ("SIGINT", "SIGTERM"):
-        if hasattr(signal, sig_name):
-            signal.signal(getattr(signal, sig_name), _handle_signal)
+    async def _remove_pending(username: str):
+        await asyncio.to_thread(remove_pending_user, username)
 
-    try:
-        while not shutdown_requested:
-            pending = get_pending_users(limit=1)
-            if not pending:
-                if args.wait_for_queue:
-                    logger.info(f"Queue empty, waiting {args.wait_seconds}s for new entries...")
-                    time.sleep(args.wait_seconds)
-                    continue
-                logger.info("Pending queue empty, stopping.")
-                break
+    async def _update_session():
+        if session_id:
+            await asyncio.to_thread(update_session_progress, session_id, scraped_count, films_added)
 
-            username = pending[0]['username']
-            try:
-                interactions = scraper.scrape_user(username)
+    async def _notify(scraped_count_local: int):
+        if scraped_count_local and NOTIFICATION_INTERVAL and scraped_count_local % NOTIFICATION_INTERVAL == 0:
+            queue_remaining = await asyncio.to_thread(lambda: get_pending_queue_stats()['total'])
+            send_notification(
+                f"Scrape progress: {scraped_count_local} users done, {queue_remaining} remaining"
+            )
 
-                if interactions:
-                    with get_db() as conn:
-                        scraped_at = datetime.now().isoformat()
-                        conn.executemany("""
-                            INSERT OR REPLACE INTO user_films
-                            (username, film_slug, rating, watched, watchlisted, liked, scraped_at)
-                            VALUES (?, ?, ?, ?, ?, ?, ?)
-                        """, [
-                            (username, i.film_slug, i.rating, i.watched, i.watchlisted, i.liked, scraped_at)
-                            for i in interactions
-                        ])
+    async with AsyncLetterboxdScraper(
+        delay=getattr(args, "async_delay", getattr(args, "delay", DEFAULT_ASYNC_DELAY)),
+        max_concurrent=getattr(args, "max_concurrent_requests", DEFAULT_MAX_CONCURRENT),
+    ) as async_scraper:
 
-                    new_slugs = [i.film_slug for i in interactions if i.film_slug not in known_film_slugs]
-                    _scrape_film_metadata(scraper, new_slugs, max_per_batch=args.batch)
-                    known_film_slugs.update(new_slugs)
+        async def _process_user(username: str):
+            nonlocal films_added, scraped_count, known_film_slugs
+            async with user_semaphore:
+                try:
+                    interactions = await async_scraper.scrape_user(username)
 
-                    scraped_count += 1
-                    films_added += len(interactions)
+                    if interactions:
+                        await _persist_user_films(username, interactions)
+                        new_slugs = [i.film_slug for i in interactions if i.film_slug not in known_film_slugs]
+                        await _scrape_film_metadata_async(async_scraper, new_slugs, max_per_batch=args.batch)
+                        known_film_slugs.update(new_slugs)
 
-                    elapsed_hours = (datetime.now() - session_start).total_seconds() / 3600
-                    rate = scraped_count / elapsed_hours if elapsed_hours > 0 else 0
-                    logger.info(f"[{scraped_count}] {username}: {len(interactions)} films ({rate:.1f}/hr)")
-                else:
-                    logger.warning(f"No interactions found for {username}")
+                        scraped_count += 1
+                        films_added += len(interactions)
 
-                remove_pending_user(username)
+                        elapsed_hours = (datetime.now() - session_start).total_seconds() / 3600
+                        rate = scraped_count / elapsed_hours if elapsed_hours > 0 else 0
+                        logger.info(f"[{scraped_count}] {username}: {len(interactions)} films ({rate:.1f}/hr)")
+                    else:
+                        logger.warning(f"No interactions found for {username}")
+
+                    await _remove_pending(username)
+
+                    if args.user_delay:
+                        await asyncio.sleep(args.user_delay)
+
+                except Exception as exc:  # noqa: BLE001
+                    logger.error(f"Error scraping {username}: {exc}")
+                    if args.remove_on_error:
+                        await _remove_pending(username)
+
+        tasks: set[asyncio.Task] = set()
+
+        try:
+            while not shutdown_requested:
+                # Refill task set up to max_concurrent_users
+                while len(tasks) < getattr(args, "max_concurrent_users", 1):
+                    next_batch = await asyncio.to_thread(get_pending_users, 1)
+                    if not next_batch:
+                        break
+                    uname = next_batch[0]['username']
+                    tasks.add(asyncio.create_task(_process_user(uname)))
+
+                if not tasks:
+                    if args.wait_for_queue:
+                        logger.info(f"Queue empty, waiting {args.wait_seconds}s for new entries...")
+                        await asyncio.sleep(args.wait_seconds)
+                        continue
+                    logger.info("Pending queue empty, stopping.")
+                    break
+
+                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED, timeout=1)
+                tasks = pending
+
+                await _update_session()
+                await _notify(scraped_count)
 
                 if args.target and scraped_count >= args.target:
                     logger.info(f"Reached target of {args.target} users.")
                     break
 
-                if args.user_delay:
-                    time.sleep(args.user_delay)
+        finally:
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
 
-            except Exception as exc:
-                logger.error(f"Error scraping {username}: {exc}")
-                if args.remove_on_error:
-                    remove_pending_user(username)
+    elapsed = (datetime.now() - session_start).total_seconds()
+    status = "interrupted" if shutdown_requested else "completed"
+    if session_id:
+        complete_session(session_id, status=status)
+    logger.info(f"\nSession complete: {scraped_count} users in {elapsed/3600:.1f} hours")
 
-            # Session progress & optional notifications
-            if session_id:
-                update_session_progress(session_id, scraped_count, films_added)
 
-            if scraped_count and NOTIFICATION_INTERVAL and scraped_count % NOTIFICATION_INTERVAL == 0:
-                queue_remaining = get_pending_queue_stats()['total']
-                send_notification(
-                    f"Scrape progress: {scraped_count} users done, {queue_remaining} remaining"
-                )
-
-    finally:
-        scraper.close()
-        elapsed = (datetime.now() - session_start).total_seconds()
-        status = "interrupted" if shutdown_requested else "completed"
-        if session_id:
-            complete_session(session_id, status=status)
-        logger.info(f"\nSession complete: {scraped_count} users in {elapsed/3600:.1f} hours")
+def cmd_scrape_daemon(args: argparse.Namespace) -> None:
+    """Entry point wrapper to run the async daemon with asyncio."""
+    try:
+        asyncio.run(_cmd_scrape_daemon_async(args))
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user.")
 
 
 def cmd_queue_status(args: argparse.Namespace) -> None:
@@ -1660,6 +1746,12 @@ def main():
     daemon_parser.add_argument("--wait-seconds", type=int, default=60, help="Wait duration when queue is empty and --wait-for-queue is set")
     daemon_parser.add_argument("--batch", type=int, default=DEFAULT_MAX_PER_BATCH, help="Batch size for metadata fetches")
     daemon_parser.add_argument("--remove-on-error", action="store_true", help="Remove user from queue on scrape error")
+    daemon_parser.add_argument("--max-concurrent-users", type=int, default=DEFAULT_MAX_CONCURRENT_USERS,
+                               help="Max users to scrape in parallel (async daemon)")
+    daemon_parser.add_argument("--max-concurrent-requests", type=int, default=DEFAULT_MAX_CONCURRENT,
+                               help="Max concurrent HTTP requests across tasks (async)")
+    daemon_parser.add_argument("--async-delay", type=float, default=DEFAULT_ASYNC_DELAY,
+                               help="Base async delay between requests (seconds)")
     daemon_parser.set_defaults(func=cmd_scrape_daemon)
     
     # Recommend command

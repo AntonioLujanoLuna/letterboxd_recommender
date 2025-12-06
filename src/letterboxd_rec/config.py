@@ -64,6 +64,7 @@ DB_PATH = Path(os.environ.get("LETTERBOXD_DB", "data/letterboxd.db"))
 DEFAULT_SCRAPER_DELAY = _get_float_env("LETTERBOXD_SCRAPER_DELAY", 1.0, min_val=0.1)
 DEFAULT_ASYNC_DELAY = _get_float_env("LETTERBOXD_ASYNC_DELAY", 0.2, min_val=0.0)
 DEFAULT_MAX_CONCURRENT = _get_int_env("LETTERBOXD_MAX_CONCURRENT", 5, min_val=1)
+DEFAULT_MAX_CONCURRENT_USERS = _get_int_env("LETTERBOXD_MAX_CONCURRENT_USERS", 2, min_val=1)
 SCRAPER_ADAPTIVE_DELAY_MIN = 0.1
 SCRAPER_ADAPTIVE_DELAY_MAX = 5.0
 SCRAPER_429_BACKOFF = 1.5
@@ -258,7 +259,7 @@ ITEM_SIM_CACHE_PATH = Path("data/item_similarity.npz")
 
 # Item-item similarity safeguards (controls compute cost)
 ITEM_SIM_MIN_RATINGS = 2        # skip items with fewer than this many ratings
-ITEM_SIM_MAX_ITEMS = 10_000       # cap number of items to include in pairwise pass
+ITEM_SIM_MAX_ITEMS = 20_000       # cap number of items to include in pairwise pass
 
 # Migrations
 MIGRATIONS_PATH = Path("src/letterboxd_rec/migrations")
