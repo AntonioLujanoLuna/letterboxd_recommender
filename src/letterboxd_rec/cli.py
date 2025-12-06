@@ -2,6 +2,8 @@ import argparse
 import json
 import logging
 import atexit
+import signal
+import time
 from pathlib import Path
 from collections import defaultdict
 from datetime import datetime, timedelta
@@ -10,7 +12,8 @@ from .database import (
     init_db, get_db, load_json, load_user_lists, parse_timestamp_naive,
     get_discovery_source, update_discovery_source, add_pending_users,
     get_pending_users, remove_pending_user, get_pending_queue_stats,
-    compute_and_store_idf, populate_normalized_tables_batch, close_pool, run_maintenance
+    compute_and_store_idf, populate_normalized_tables_batch, close_pool, run_maintenance,
+    create_scrape_session, update_session_progress, complete_session, get_session_history,
 )
 from .config import (
     DISCOVERY_PRIORITY_MAP,
@@ -20,6 +23,8 @@ from .config import (
     IMPORT_CHUNK_SIZE,
     PENDING_STALE_DAYS,
     DEFAULT_MAX_PER_BATCH,
+    NOTIFICATION_WEBHOOK_URL,
+    NOTIFICATION_INTERVAL,
 )
 from .scraper import LetterboxdScraper
 from .recommender import MetadataRecommender, CollaborativeRecommender, Recommendation
@@ -32,6 +37,23 @@ logger = logging.getLogger(__name__)
 
 # Register cleanup on exit
 atexit.register(close_pool)
+
+
+def send_notification(message: str) -> None:
+    """Send a notification to a configured webhook (Discord/Slack-style)."""
+    if not NOTIFICATION_WEBHOOK_URL:
+        return
+
+    try:
+        import httpx
+
+        httpx.post(
+            NOTIFICATION_WEBHOOK_URL,
+            json={"content": message},
+            timeout=10,
+        )
+    except Exception as exc:  # pragma: no cover - best-effort notifications
+        logger.warning(f"Failed to send notification: {exc}")
 
 
 def _validate_slug(slug: str) -> str:
@@ -452,6 +474,13 @@ def cmd_discover(args: argparse.Namespace) -> None:
             # Update discovery source cache
             update_discovery_source(source, source_id, page - 1, len(all_discovered))
 
+            # Queue-only mode: stop after enqueuing
+            if getattr(args, 'queue_only', False):
+                queue_stats = get_pending_queue_stats()
+                logger.info(f"\nQueue now has {queue_stats['total']} pending users")
+                logger.info("Run 'scrape-daemon' to process the queue")
+                return
+
             # Now get users to scrape from pending queue
             pending = get_pending_users(limit=args.limit)
             usernames_to_scrape = [p['username'] for p in pending]
@@ -522,6 +551,336 @@ def cmd_discover(args: argparse.Namespace) -> None:
 
     finally:
         scraper.close()
+
+
+def cmd_scrape_daemon(args: argparse.Namespace) -> None:
+    """Continuously drain the pending queue with graceful shutdown."""
+    init_db()
+    scraper = LetterboxdScraper(delay=args.delay)
+
+    # Track session progress and allow resuming visibility
+    session_id = create_scrape_session()
+    scraped_count = 0
+    films_added = 0
+    session_start = datetime.now()
+
+    # Cache known film slugs to reduce redundant metadata lookups
+    with get_db(read_only=True) as conn:
+        known_film_slugs = {r['slug'] for r in conn.execute("SELECT slug FROM films")}
+
+    shutdown_requested = False
+
+    def _handle_signal(signum, _frame):
+        nonlocal shutdown_requested
+        logger.info("\nShutdown requested, finishing current user...")
+        shutdown_requested = True
+
+    for sig_name in ("SIGINT", "SIGTERM"):
+        if hasattr(signal, sig_name):
+            signal.signal(getattr(signal, sig_name), _handle_signal)
+
+    try:
+        while not shutdown_requested:
+            pending = get_pending_users(limit=1)
+            if not pending:
+                if args.wait_for_queue:
+                    logger.info(f"Queue empty, waiting {args.wait_seconds}s for new entries...")
+                    time.sleep(args.wait_seconds)
+                    continue
+                logger.info("Pending queue empty, stopping.")
+                break
+
+            username = pending[0]['username']
+            try:
+                interactions = scraper.scrape_user(username)
+
+                if interactions:
+                    with get_db() as conn:
+                        scraped_at = datetime.now().isoformat()
+                        conn.executemany("""
+                            INSERT OR REPLACE INTO user_films
+                            (username, film_slug, rating, watched, watchlisted, liked, scraped_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """, [
+                            (username, i.film_slug, i.rating, i.watched, i.watchlisted, i.liked, scraped_at)
+                            for i in interactions
+                        ])
+
+                    new_slugs = [i.film_slug for i in interactions if i.film_slug not in known_film_slugs]
+                    _scrape_film_metadata(scraper, new_slugs, max_per_batch=args.batch)
+                    known_film_slugs.update(new_slugs)
+
+                    scraped_count += 1
+                    films_added += len(interactions)
+
+                    elapsed_hours = (datetime.now() - session_start).total_seconds() / 3600
+                    rate = scraped_count / elapsed_hours if elapsed_hours > 0 else 0
+                    logger.info(f"[{scraped_count}] {username}: {len(interactions)} films ({rate:.1f}/hr)")
+                else:
+                    logger.warning(f"No interactions found for {username}")
+
+                remove_pending_user(username)
+
+                if args.target and scraped_count >= args.target:
+                    logger.info(f"Reached target of {args.target} users.")
+                    break
+
+                if args.user_delay:
+                    time.sleep(args.user_delay)
+
+            except Exception as exc:
+                logger.error(f"Error scraping {username}: {exc}")
+                if args.remove_on_error:
+                    remove_pending_user(username)
+
+            # Session progress & optional notifications
+            if session_id:
+                update_session_progress(session_id, scraped_count, films_added)
+
+            if scraped_count and NOTIFICATION_INTERVAL and scraped_count % NOTIFICATION_INTERVAL == 0:
+                queue_remaining = get_pending_queue_stats()['total']
+                send_notification(
+                    f"Scrape progress: {scraped_count} users done, {queue_remaining} remaining"
+                )
+
+    finally:
+        scraper.close()
+        elapsed = (datetime.now() - session_start).total_seconds()
+        status = "interrupted" if shutdown_requested else "completed"
+        if session_id:
+            complete_session(session_id, status=status)
+        logger.info(f"\nSession complete: {scraped_count} users in {elapsed/3600:.1f} hours")
+
+
+def cmd_queue_status(args: argparse.Namespace) -> None:
+    """Show pending queue statistics."""
+    init_db()
+    stats = get_pending_queue_stats()
+
+    logger.info("\nPending Queue Status")
+    logger.info("-" * 30)
+    logger.info(f"Total pending users: {stats['total']}")
+    if stats['avg_priority'] is not None:
+        logger.info(f"Average priority: {stats['avg_priority']:.1f}")
+
+    if stats['breakdown']:
+        logger.info("\nBy source:")
+        for source_type, count in sorted(stats['breakdown'].items(), key=lambda x: -x[1]):
+            logger.info(f"  {source_type}: {count}")
+
+    if stats['total'] > 0:
+        est_hours = (stats['total'] * 30) / 3600  # rough estimate: ~30s/user
+        logger.info(f"\nEstimated time to drain: {est_hours:.1f} hours")
+
+    if args.verbose:
+        pending = get_pending_users(limit=args.limit)
+        if pending:
+            logger.info("\nNext in queue:")
+            for p in pending:
+                logger.info(f"  [{p['priority']}] {p['username']} (from {p['discovered_from_type']})")
+
+
+def cmd_queue_add(args: argparse.Namespace) -> None:
+    """Manually add usernames to the pending queue."""
+    init_db()
+
+    usernames: list[str] = []
+    if args.file:
+        path = Path(args.file)
+        if not path.exists():
+            logger.error(f"File not found: {args.file}")
+            return
+        usernames = [line.strip() for line in path.read_text().splitlines() if line.strip()]
+    else:
+        usernames = args.usernames or []
+
+    sanitized = [_validate_username(u) for u in usernames if u]
+    if not sanitized:
+        logger.error("No usernames provided.")
+        return
+
+    added = add_pending_users(sanitized, "manual", "cli", priority=args.priority)
+    skipped = len(sanitized) - added
+    logger.info(f"Added {added} users to queue ({skipped} already existed)")
+
+
+def cmd_queue_clear(args: argparse.Namespace) -> None:
+    """Clear pending queue (optionally by source type)."""
+    init_db()
+    with get_db() as conn:
+        if args.source:
+            count = conn.execute(
+                "DELETE FROM pending_users WHERE discovered_from_type = ?",
+                (args.source,),
+            ).rowcount
+        else:
+            count = conn.execute("DELETE FROM pending_users").rowcount
+    logger.info(f"Removed {count} users from queue")
+
+
+def cmd_discover_refill(args: argparse.Namespace) -> None:
+    """Auto-refill queue from multiple sources when it runs low."""
+    init_db()
+    stats = get_pending_queue_stats()
+
+    if stats['total'] >= args.min_queue:
+        logger.info(f"Queue has {stats['total']} users (>= {args.min_queue}), skipping refill")
+        return
+
+    target_add = max(args.target - stats['total'], 0)
+
+    # Default weighted sources
+    sources = [
+        ("film_reviews", "parasite", 100, 2),
+        ("film_reviews", "perfect-blue", 100, 2),
+        ("film_reviews", "in-the-mood-for-love", 100, 1),
+        ("film_reviews", "mulholland-drive", 100, 1),
+        ("popular", "members", 70, 1),
+    ]
+
+    if args.sources_file:
+        import json as _json
+        with open(args.sources_file) as f:
+            loaded = _json.load(f)
+            loaded_sources = loaded.get("sources", loaded) if isinstance(loaded, dict) else loaded
+
+        normalized_sources = []
+        for item in loaded_sources:
+            if isinstance(item, dict):
+                source_type = item.get("type") or item.get("source_type")
+                source_id = item.get("id") or item.get("source_id") or item.get("film_slug") or item.get("film")
+                priority = item.get("priority", 50)
+                weight = item.get("weight", 1)
+                normalized_sources.append((source_type, source_id, priority, weight))
+            else:
+                normalized_sources.append(tuple(item))
+        sources = normalized_sources
+
+    scraper = LetterboxdScraper(delay=1.0)
+    total_added = 0
+
+    try:
+        for entry in sources:
+            try:
+                source_type, source_id, priority, weight = entry
+            except ValueError:
+                logger.warning(f"Invalid source entry {entry}, expected 4 values")
+                continue
+
+            if not source_type or not source_id:
+                logger.warning(f"Skipping source with missing type/id: {entry}")
+                continue
+
+            if total_added >= target_add:
+                break
+
+            limit = min(int(50 * weight), target_add - total_added)
+
+            cached = get_discovery_source(source_type, source_id)
+            if cached and cached.get('scraped_at'):
+                age_days = (datetime.now() - parse_timestamp_naive(cached['scraped_at'])).days
+                if age_days < args.source_refresh_days:
+                    continue
+
+            logger.info(f"Discovering from {source_type}:{source_id} (limit {limit})...")
+
+            if source_type == "film_reviews":
+                users = [r['username'] for r in scraper.scrape_film_reviewers(source_id, limit=limit)]
+            elif source_type == "popular":
+                users = scraper.scrape_popular_members(limit=limit)
+            elif source_type == "followers":
+                users = scraper.scrape_followers(source_id, limit=limit)
+            else:
+                logger.warning(f"Unknown source {source_type}, skipping")
+                continue
+
+            filtered = []
+            for username in users:
+                activity = scraper.check_user_activity(username)
+                if activity and activity['film_count'] >= args.min_films and activity['has_ratings']:
+                    filtered.append(username)
+
+            added = add_pending_users(filtered, source_type, source_id, priority)
+            total_added += added
+            logger.info(f"  Added {added} users")
+
+            update_discovery_source(source_type, source_id, 1, len(filtered))
+
+    finally:
+        scraper.close()
+
+    logger.info(f"\nRefill complete: added {total_added} users, queue now at {stats['total'] + total_added}")
+
+
+def cmd_session_history(args: argparse.Namespace) -> None:
+    """Show scraping session history."""
+    init_db()
+    sessions = get_session_history(limit=args.limit)
+    if not sessions:
+        logger.info("No scraping sessions recorded yet.")
+        return
+
+    logger.info("\nRecent Scraping Sessions")
+    logger.info("-" * 44)
+    for s in sessions:
+        started = s['started_at'][:16].replace('T', ' ')
+        status = s['status']
+        users = s.get('users_scraped') or 0
+        films = s.get('films_added') or 0
+
+        if s.get('completed_at'):
+            start_dt = parse_timestamp_naive(s['started_at'])
+            end_dt = parse_timestamp_naive(s['completed_at'])
+            duration = (end_dt - start_dt).total_seconds() / 3600
+            duration_str = f"{duration:.1f}h"
+        else:
+            duration_str = "ongoing"
+
+        logger.info(f"  [{s['id']}] {started} | {status:10} | {users:4} users | {films:5} films | {duration_str}")
+
+
+def cmd_discover_from_taste(args: argparse.Namespace) -> None:
+    """Discover users who reviewed films similar to your taste."""
+    init_db()
+    username = _validate_username(args.username)
+
+    with get_db(read_only=True) as conn:
+        rows = conn.execute("""
+            SELECT film_slug FROM user_films
+            WHERE username = ? AND rating >= ?
+            ORDER BY rating DESC
+            LIMIT ?
+        """, (username, args.min_rating, args.film_limit)).fetchall()
+
+    if not rows:
+        logger.error(f"No films found for {username} with rating >= {args.min_rating}")
+        return
+
+    film_slugs = [r['film_slug'] for r in rows]
+    logger.info(f"Discovering reviewers from {len(film_slugs)} of {username}'s top films...")
+
+    scraper = LetterboxdScraper(delay=1.0)
+    total_added = 0
+
+    try:
+        for slug in film_slugs:
+            reviewers = scraper.scrape_film_reviewers(slug, limit=args.per_film)
+            usernames = [r['username'] for r in reviewers if r.get('has_rating', True)]
+
+            filtered = []
+            for user in usernames[:args.per_film]:
+                activity = scraper.check_user_activity(user)
+                if activity and activity['film_count'] >= args.min_films and activity['has_ratings']:
+                    filtered.append(user)
+
+            added = add_pending_users(filtered, "taste_match", slug, priority=90)
+            total_added += added
+            logger.info(f"  {slug}: +{added} users")
+
+    finally:
+        scraper.close()
+
+    logger.info(f"\nAdded {total_added} taste-matched users to queue")
 
 
 def cmd_recommend(args: argparse.Namespace) -> None:
@@ -1290,7 +1649,20 @@ def main():
                                   help="Minimum film count for activity pre-filtering (default: 50)")
     discover_parser.add_argument("--maintenance", action="store_true", default=False,
                                   help="Run VACUUM/ANALYZE after scraping batch")
+    discover_parser.add_argument("--queue-only", action="store_true",
+                                 help="Only add discovered users to queue without scraping")
     discover_parser.set_defaults(func=cmd_discover)
+
+    # Scrape daemon command
+    daemon_parser = subparsers.add_parser("scrape-daemon", help="Continuously scrape from pending queue")
+    daemon_parser.add_argument("--target", type=int, help="Stop after scraping N users")
+    daemon_parser.add_argument("--delay", type=float, default=1.0, help="Delay between requests (seconds)")
+    daemon_parser.add_argument("--user-delay", type=float, default=0, help="Extra delay between users (seconds)")
+    daemon_parser.add_argument("--wait-for-queue", action="store_true", help="Wait for new queue entries instead of exiting when empty")
+    daemon_parser.add_argument("--wait-seconds", type=int, default=60, help="Wait duration when queue is empty and --wait-for-queue is set")
+    daemon_parser.add_argument("--batch", type=int, default=DEFAULT_MAX_PER_BATCH, help="Batch size for metadata fetches")
+    daemon_parser.add_argument("--remove-on-error", action="store_true", help="Remove user from queue on scrape error")
+    daemon_parser.set_defaults(func=cmd_scrape_daemon)
     
     # Recommend command
     rec_parser = subparsers.add_parser("recommend", help="Generate recommendations")
@@ -1383,6 +1755,44 @@ def main():
     prune_pending_parser.add_argument("--older-than", type=int, default=PENDING_STALE_DAYS, help="Age in days to prune pending entries")
     prune_pending_parser.add_argument("--max-priority", type=int, help="Remove pending entries at or below this priority")
     prune_pending_parser.set_defaults(func=cmd_prune_pending)
+
+    # Queue management commands
+    queue_status_parser = subparsers.add_parser("queue-status", help="Show pending queue status")
+    queue_status_parser.add_argument("--verbose", action="store_true", help="Show next pending users")
+    queue_status_parser.add_argument("--limit", type=int, default=10, help="Number of pending users to show with --verbose")
+    queue_status_parser.set_defaults(func=cmd_queue_status)
+
+    queue_add_parser = subparsers.add_parser("queue-add", help="Add usernames to queue")
+    queue_add_parser.add_argument("usernames", nargs="*", help="Usernames to add")
+    queue_add_parser.add_argument("--file", "-f", help="File with usernames (one per line)")
+    queue_add_parser.add_argument("--priority", type=int, default=50, help="Priority for new queue entries")
+    queue_add_parser.set_defaults(func=cmd_queue_add)
+
+    queue_clear_parser = subparsers.add_parser("queue-clear", help="Clear pending queue")
+    queue_clear_parser.add_argument("--source", help="Only clear users discovered from this source type")
+    queue_clear_parser.set_defaults(func=cmd_queue_clear)
+
+    # Discovery helpers
+    refill_parser = subparsers.add_parser("discover-refill", help="Auto-refill queue from configured sources")
+    refill_parser.add_argument("--min-queue", type=int, default=50, help="Only refill if queue size is below this")
+    refill_parser.add_argument("--target", type=int, default=200, help="Target queue size after refill")
+    refill_parser.add_argument("--source-refresh-days", type=int, default=7, help="Minimum age before reusing a discovery source")
+    refill_parser.add_argument("--sources-file", help="JSON file with source definitions")
+    refill_parser.add_argument("--min-films", type=int, default=50, help="Minimum films for activity filter")
+    refill_parser.set_defaults(func=cmd_discover_refill)
+
+    taste_parser = subparsers.add_parser("discover-taste", help="Discover users from your top films")
+    taste_parser.add_argument("username", help="Your Letterboxd username")
+    taste_parser.add_argument("--min-rating", type=float, default=4.0, help="Minimum rating to consider a film a favorite")
+    taste_parser.add_argument("--film-limit", type=int, default=20, help="Number of top films to use")
+    taste_parser.add_argument("--per-film", type=int, default=25, help="Reviewers per film to consider")
+    taste_parser.add_argument("--min-films", type=int, default=50, help="Minimum film count for candidate users")
+    taste_parser.set_defaults(func=cmd_discover_from_taste)
+
+    # Session history
+    session_parser = subparsers.add_parser("session-history", help="Show scraping session history")
+    session_parser.add_argument("--limit", type=int, default=10, help="Number of sessions to display")
+    session_parser.set_defaults(func=cmd_session_history)
 
     args = parser.parse_args()
     

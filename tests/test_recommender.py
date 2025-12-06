@@ -111,3 +111,33 @@ def test_similar_to_finds_item_matches(fresh_recommender_modules):
     assert "neighbor" in slugs
     assert "distant" not in slugs
 
+
+def test_collaborative_recommender_item_fallback_when_neighbors_sparse(fresh_recommender_modules):
+    rec, _, _ = fresh_recommender_modules
+
+    all_user_films = {
+        "alice": [
+            {"slug": "film-a", "rating": 5.0, "watched": True},
+        ],
+        "bob": [
+            {"slug": "film-a", "rating": 4.0, "watched": True},
+            {"slug": "film-b", "rating": 4.5, "watched": True},
+        ],
+        "carol": [
+            {"slug": "film-a", "rating": 4.0, "watched": True},
+            {"slug": "film-b", "rating": 5.0, "watched": True},
+        ],
+    }
+
+    films = {
+        "film-a": _film("film-a", "Film A", genres=["drama"], directors=["DirA"]),
+        "film-b": _film("film-b", "Film B", genres=["drama"], directors=["DirB"]),
+    }
+
+    # Require too many neighbors to force item-similarity fallback
+    collab = rec.CollaborativeRecommender(all_user_films, films)
+    recs = collab.recommend("alice", n=1, min_neighbors=5)
+
+    assert recs
+    assert recs[0].slug == "film-b"
+

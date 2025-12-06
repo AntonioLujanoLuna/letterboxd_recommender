@@ -11,6 +11,8 @@ def test_validate_slug_and_rating_count():
 
     assert scraper._parse_rating_count("1.5M") == 1_500_000
     assert scraper._parse_rating_count("12,345") == 12345
+    assert scraper._parse_rating_count("bad") is None
+    assert scraper.validate_slug("x" * 300) is None
 
 
 def test_parse_film_page_extracts_metadata():
@@ -65,3 +67,97 @@ async def test_async_scraper_batch_uses_provided_client():
     assert len(results) == 1
     assert results[0].slug == "mock-film"
 
+
+def test_parse_rating_from_span():
+    html = "<span class='rating rated-8'></span>"
+    tree = HTMLParser(html)
+    span = tree.css_first("span")
+
+    lb_scraper = scraper.LetterboxdScraper(delay=0.0)
+    try:
+        rating = lb_scraper._parse_rating(span)
+        assert rating == 4.0
+    finally:
+        lb_scraper.close()
+
+
+def test_parse_rating_handles_outliers_and_bad_formats():
+    lb_scraper = scraper.LetterboxdScraper(delay=0.0)
+    try:
+        # Above 5.0 should be rejected
+        too_high = HTMLParser("<span class='rating rated-12'></span>").css_first("span")
+        assert lb_scraper._parse_rating(too_high) is None
+
+        # Non-numeric suffix should be rejected
+        bad_format = HTMLParser("<span class='rating rated-xx'></span>").css_first("span")
+        assert lb_scraper._parse_rating(bad_format) is None
+
+        # No rated-* class should also return None
+        no_rating = HTMLParser("<span class='rating other-class'></span>").css_first("span")
+        assert lb_scraper._parse_rating(no_rating) is None
+    finally:
+        lb_scraper.close()
+
+
+@pytest.mark.asyncio
+async def test_async_scraper_batch_summarizes_failures(monkeypatch):
+    async_scraper = scraper.AsyncLetterboxdScraper(delay=0.0, max_concurrent=2)
+
+    async def fake_scrape(_client, slug):
+        if slug == "ok":
+            return scraper.FilmMetadata(
+                slug="ok",
+                title="Good",
+                year=2023,
+                directors=["A"],
+                genres=["test"],
+                cast=[],
+                themes=[],
+                runtime=None,
+                avg_rating=None,
+                rating_count=None,
+                countries=[],
+                languages=[],
+                writers=[],
+                cinematographers=[],
+                composers=[],
+            )
+        if slug == "missing":
+            return None
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(async_scraper, "_scrape_film_async", fake_scrape)
+
+    # Provide a dummy client; the fake coroutine ignores it
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        results = await async_scraper._scrape_batch_with_client(client, ["ok", "missing", "err"])
+
+    assert [film.slug for film in results] == ["ok"]
+
+
+def test_check_user_activity_parses_profile(monkeypatch):
+    lb_scraper = scraper.LetterboxdScraper(delay=0.0)
+    sample_html = """
+    <html>
+      <a class="thousands" href="/films/"><span>2,479</span><span>Films</span></a>
+      <a href="/films/ratings/rated/1/">ratings</a>
+      <a href="/alice/film/example/">recent</a>
+    </html>
+    """
+
+    monkeypatch.setattr(lb_scraper, "_get", lambda _url: HTMLParser(sample_html))
+
+    try:
+        info = lb_scraper.check_user_activity("alice")
+    finally:
+        lb_scraper.close()
+
+    assert info == {
+        "film_count": 2479,
+        "has_ratings": True,
+        "recent_activity": True,
+    }

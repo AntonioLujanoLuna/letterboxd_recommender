@@ -23,3 +23,15 @@ def test_db_path_respects_env(monkeypatch, tmp_path):
 
     assert cfg.DB_PATH == db_path
 
+
+def test_invalid_env_values_fall_back_to_defaults(monkeypatch):
+    # Use clearly invalid strings to exercise the ValueError branches
+    monkeypatch.setenv("LETTERBOXD_SCRAPER_DELAY", "not-a-float")
+    monkeypatch.setenv("LETTERBOXD_ASYNC_DELAY", "oops")
+    monkeypatch.setenv("LETTERBOXD_MAX_CONCURRENT", "bad-int")
+
+    cfg = importlib.reload(config)
+
+    assert cfg.DEFAULT_SCRAPER_DELAY == 1.0
+    assert cfg.DEFAULT_ASYNC_DELAY == 0.2
+    assert cfg.DEFAULT_MAX_CONCURRENT == 5

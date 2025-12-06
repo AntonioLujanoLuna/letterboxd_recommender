@@ -116,3 +116,54 @@ def test_temporal_decay_reduces_old_weights(fresh_recommender_modules):
 
     assert profile_obj.genres["sci-fi"] > profile_obj.genres["noir"]
 
+
+def test_weighting_modes_normalized_and_blended(fresh_recommender_modules):
+    _, profile, _ = fresh_recommender_modules
+
+    film_metadata = {
+        "top": {
+            "slug": "top",
+            "title": "Top",
+            "genres": ["top-genre"],
+            "directors": [],
+            "cast": [],
+            "themes": [],
+            "languages": [],
+            "writers": [],
+            "cinematographers": [],
+            "composers": [],
+            "countries": [],
+            "year": 2022,
+        },
+        "low": {
+            "slug": "low",
+            "title": "Low",
+            "genres": ["low-genre"],
+            "directors": [],
+            "cast": [],
+            "themes": [],
+            "languages": [],
+            "writers": [],
+            "cinematographers": [],
+            "composers": [],
+            "countries": [],
+            "year": 2022,
+        },
+    }
+
+    user_films = [
+        {"slug": "top", "rating": 5.0, "watched": True},
+        {"slug": "low", "rating": 2.0, "watched": True},
+    ]
+
+    norm_profile = profile.build_profile(
+        user_films, film_metadata, use_temporal_decay=False, weighting_mode="normalized"
+    )
+    assert norm_profile.genres["top-genre"] > 0
+    assert norm_profile.genres["low-genre"] < 0
+
+    blended_profile = profile.build_profile(
+        user_films, film_metadata, use_temporal_decay=False, weighting_mode="blended"
+    )
+    assert blended_profile.genres["top-genre"] > blended_profile.genres["low-genre"]
+

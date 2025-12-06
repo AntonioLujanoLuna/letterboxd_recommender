@@ -38,3 +38,19 @@ def test_svd_fit_predict_and_recommend(tmp_path):
     assert loaded is not None
     assert loaded.is_fitted
 
+
+def test_svd_load_rejects_mismatched_fingerprint(tmp_path):
+    all_user_films = {
+        "alice": [{"slug": "film-a", "rating": 4.0}, {"slug": "film-b", "rating": 3.0}],
+        "bob": [{"slug": "film-a", "rating": 3.0}],
+    }
+
+    svd = SVDRecommender(n_factors=1)
+    svd.fit(all_user_films)
+
+    cache_path = tmp_path / "svd_model.npz"
+    svd.save(cache_path)
+
+    wrong_fp = {"n_users": 99, "n_items": 1, "n_ratings": 2}
+    assert SVDRecommender.load(cache_path, expected_fingerprint=wrong_fp) is None
+

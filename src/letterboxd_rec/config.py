@@ -257,3 +257,7 @@ MIGRATION_VERSION_TABLE = "schema_migrations"
 
 # Housekeeping
 PENDING_STALE_DAYS = _get_int_env("LETTERBOXD_PENDING_STALE_DAYS", 30, min_val=1)
+
+# Notifications
+NOTIFICATION_WEBHOOK_URL = os.environ.get("LETTERBOXD_WEBHOOK_URL")
+NOTIFICATION_INTERVAL = _get_int_env("LETTERBOXD_NOTIFICATION_INTERVAL", 50, min_val=1)

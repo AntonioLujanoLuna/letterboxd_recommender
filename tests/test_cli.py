@@ -1,4 +1,5 @@
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -26,4 +27,21 @@ def test_main_dispatches_to_subcommand(monkeypatch):
     cli.main()
 
     assert called["command"] == "stats"
+
+
+def test_send_notification_uses_webhook(monkeypatch):
+    payload = {}
+
+    def fake_post(url, json, timeout):
+        payload.update({"url": url, "json": json, "timeout": timeout})
+
+    dummy_httpx = SimpleNamespace(post=fake_post)
+    monkeypatch.setitem(sys.modules, "httpx", dummy_httpx)
+    monkeypatch.setattr(cli, "NOTIFICATION_WEBHOOK_URL", "https://hook.test")
+
+    cli.send_notification("hello world")
+
+    assert payload["url"] == "https://hook.test"
+    assert payload["json"]["content"] == "hello world"
+    assert payload["timeout"] == 10
 
