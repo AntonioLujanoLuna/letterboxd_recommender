@@ -23,6 +23,7 @@ from .config import (
     SIMILAR_CAST_SCORE,
     SIMILAR_DECADE_SCORE,
     NEGATIVE_PENALTY_MULTIPLIER,
+    NEGATIVE_PENALTY_MULTIPLIERS,
     NEGATIVE_THRESHOLD_DIRECTOR,
     NEGATIVE_THRESHOLD_GENRE,
     NEGATIVE_THRESHOLD_ACTOR,
@@ -170,7 +171,8 @@ def _genre_pair_rule(
             if pair in profile.genre_pairs:
                 pair_value = profile.genre_pairs[pair]
                 if pair_value < 0:
-                    pair_score += pair_value * NEGATIVE_PENALTY_MULTIPLIER
+                    pair_penalty = NEGATIVE_PENALTY_MULTIPLIERS.get('genre_pair', NEGATIVE_PENALTY_MULTIPLIER)
+                    pair_score += pair_value * pair_penalty
                     if pair_value < -0.5:
                         pair_warnings.append(f"⚠️ Genre combo: {g1}+{g2} (disliked)")
                 else:
@@ -619,7 +621,8 @@ class MetadataRecommender:
 
             # Handle negative scores with amplified penalty
             if value_score < 0:
-                total_score += value_score * NEGATIVE_PENALTY_MULTIPLIER * confidence * idf_weight
+                penalty_multiplier = NEGATIVE_PENALTY_MULTIPLIERS.get(config.name, NEGATIVE_PENALTY_MULTIPLIER)
+                total_score += value_score * penalty_multiplier * confidence * idf_weight
                 if config.negative_threshold != 0.0 and value_score < config.negative_threshold:
                     warnings.append(config.warning_template.format(value))
             else:

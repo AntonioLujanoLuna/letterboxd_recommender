@@ -181,7 +181,12 @@ SIMILAR_CAST_SCORE = 0.5
 SIMILAR_DECADE_SCORE = 0.5
 
 # Negative Penalty Configuration
-NEGATIVE_PENALTY_MULTIPLIER = 1.5  # Amplify negative matches
+NEGATIVE_PENALTY_MULTIPLIER = 1.5  # Amplify negative matches (default)
+# Attribute-specific penalty multipliers so strong "avoid" signals hit harder
+NEGATIVE_PENALTY_MULTIPLIERS = {
+    'director': 2.0,  # Stronger avoid signal for directors you dislike
+    'writer': 1.8,    # Writers are also a strong taste marker
+}
 
 # Negative thresholds (when to surface negative matches in warnings)
 NEGATIVE_THRESHOLD_DIRECTOR = -0.8
