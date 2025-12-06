@@ -20,8 +20,10 @@ class SVDRecommender:
     - Σ captures factor importance
     """
     
-    def __init__(self, n_factors: int = 50):
+    def __init__(self, n_factors: int = 50, use_implicit: bool = True, implicit_weight: float = 0.3):
         self.n_factors = n_factors
+        self.use_implicit = use_implicit
+        self.implicit_weight = implicit_weight
         self.user_factors = None
         self.item_factors = None
         self.user_index = None
@@ -65,10 +67,14 @@ class SVDRecommender:
         usernames = list(all_user_films.keys())
         self.user_index = {u: i for i, u in enumerate(usernames)}
         
+        def _has_implicit_signal(f: dict) -> bool:
+            return bool(f.get('liked') or f.get('watched') or f.get('watchlisted'))
+
         all_films = set()
         for films in all_user_films.values():
             for f in films:
-                if f.get('rating'):
+                rating = f.get('rating')
+                if rating is not None or (self.use_implicit and _has_implicit_signal(f)):
                     all_films.add(f['slug'])
         
         film_list = list(all_films)
@@ -79,23 +85,50 @@ class SVDRecommender:
         
         # Build COO data
         rows, cols, data = [], [], []
+        implicit_rows, implicit_cols, implicit_data = [], [], []
         for username, films in all_user_films.items():
             user_idx = self.user_index[username]
             for f in films:
                 rating = f.get('rating')
-                if rating and f['slug'] in self.item_index:
+                film_idx = self.item_index.get(f['slug'])
+                if film_idx is None:
+                    continue
+
+                if rating is not None:
                     rows.append(user_idx)
-                    cols.append(self.item_index[f['slug']])
+                    cols.append(film_idx)
                     data.append(rating)
+                    continue
+
+                # Implicit feedback (only when no explicit rating)
+                if not self.use_implicit:
+                    continue
+
+                implicit_score = 0.0
+                if f.get('liked'):
+                    implicit_score = 4.5  # Strong positive
+                elif f.get('watched'):
+                    implicit_score = 3.0  # Mild positive (chose to watch)
+                elif f.get('watchlisted'):
+                    implicit_score = 2.5  # Interest signal
+
+                if implicit_score > 0:
+                    implicit_rows.append(user_idx)
+                    implicit_cols.append(film_idx)
+                    implicit_data.append(implicit_score)
         
-        if not data:
+        all_rows = rows + implicit_rows
+        all_cols = cols + implicit_cols
+        all_data = data + [d * self.implicit_weight for d in implicit_data]
+
+        if not all_data:
             logger.warning("No ratings to fit SVD model")
             raise ValueError("Cannot fit SVD model because no ratings were provided.")
         
-        R = csr_matrix((data, (rows, cols)), shape=(n_users, n_items), dtype=np.float32)
+        R = csr_matrix((all_data, (all_rows, all_cols)), shape=(n_users, n_items), dtype=np.float32)
         
         # Compute biases
-        self.global_mean = np.mean(data)
+        self.global_mean = np.mean(all_data)
         
         # User biases: mean rating per user - global mean
         user_sums = np.array(R.sum(axis=1)).flatten()
@@ -135,6 +168,8 @@ class SVDRecommender:
             "n_ratings": len(data),
             "created_at": datetime.utcnow().isoformat(),
             "n_factors": self.n_factors,
+            "use_implicit": self.use_implicit,
+            "implicit_weight": self.implicit_weight,
         }
         
         logger.info(f"Fitted SVD with {k} factors on {n_users} users × {n_items} items")

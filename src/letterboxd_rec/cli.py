@@ -27,7 +27,7 @@ from .config import (
     NOTIFICATION_INTERVAL,
 )
 from .scraper import LetterboxdScraper
-from .recommender import MetadataRecommender, CollaborativeRecommender, Recommendation
+from .recommender import MetadataRecommender, CollaborativeRecommender, Recommendation, _fuse_normalized
 from .matrix_factorization import SVDRecommender
 from .profile import build_profile
 from tqdm import tqdm
@@ -974,30 +974,15 @@ def cmd_recommend(args: argparse.Namespace) -> None:
                 exclude_genres=args.exclude_genres
             )
             
-            # Rank-based fusion (reciprocal-rank style) with director diversity cap
-            def _fuse(meta_results, collab_results, weight_meta: float = 0.6, weight_collab: float = 0.4):
-                fused_scores = {}
-                reasons_map = {}
-
-                for idx, r in enumerate(meta_results):
-                    fused_scores[r.slug] = fused_scores.get(r.slug, 0.0) + weight_meta / (idx + 1)
-                    reasons_map.setdefault(r.slug, []).extend(r.reasons)
-
-                for idx, r in enumerate(collab_results):
-                    fused_scores[r.slug] = fused_scores.get(r.slug, 0.0) + weight_collab / (idx + 1)
-                    reasons_map.setdefault(r.slug, []).extend(r.reasons)
-
-                return fused_scores, reasons_map
-
-            fused_scores, reasons_map = _fuse(meta_recs, collab_recs, weight_meta=meta_weight, weight_collab=collab_weight)
-            ranked = sorted(fused_scores.items(), key=lambda x: -x[1])
+            # Score-based fusion with normalization to preserve magnitude
+            ranked = _fuse_normalized(meta_recs, collab_recs, weight_meta=meta_weight, weight_collab=collab_weight)
 
             max_per_director = getattr(args, 'max_per_director', 2)
             apply_diversity = bool(getattr(args, 'hybrid_diversity', False))
             director_counts = defaultdict(int)
 
             recs = []
-            for slug, score in ranked:
+            for slug, score, reasons in ranked:
                 film = all_films.get(slug)
                 if not film:
                     continue
@@ -1012,7 +997,7 @@ def cmd_recommend(args: argparse.Namespace) -> None:
                     title=film.get('title', slug),
                     year=film.get('year'),
                     score=score,
-                    reasons=list(dict.fromkeys(reasons_map.get(slug, [])))[:3]
+                    reasons=list(dict.fromkeys(reasons))[:3]
                 ))
 
                 for d in directors:
@@ -1054,14 +1039,23 @@ def cmd_recommend(args: argparse.Namespace) -> None:
             # Try loading cached SVD model first
             cache_path = SVD_CACHE_PATH
             n_factors = min(50, n_users - 1)
-            fingerprint = SVDRecommender.compute_fingerprint(all_user_films, hyperparams={"n_factors": n_factors})
+            use_implicit = True
+            implicit_weight = 0.3
+            fingerprint = SVDRecommender.compute_fingerprint(
+                all_user_films,
+                hyperparams={
+                    "n_factors": n_factors,
+                    "use_implicit": use_implicit,
+                    "implicit_weight": implicit_weight,
+                },
+            )
             svd = SVDRecommender.load(cache_path, expected_fingerprint=fingerprint)
 
             if svd:
                 logger.info(f"Using cached SVD model ({n_users} users, {n_ratings} ratings).")
             else:
                 logger.info(f"Fitting SVD model on {n_users} users...")
-                svd = SVDRecommender(n_factors=n_factors)
+                svd = SVDRecommender(n_factors=n_factors, use_implicit=use_implicit, implicit_weight=implicit_weight)
                 try:
                     svd.fit(all_user_films)
                 except ValueError as e:
@@ -1074,7 +1068,11 @@ def cmd_recommend(args: argparse.Namespace) -> None:
                     "n_users": n_users,
                     "n_items": len(svd.item_index) if svd.item_index else 0,
                     "n_ratings": n_ratings,
-                    "hyperparams": {"n_factors": n_factors},
+                    "hyperparams": {
+                        "n_factors": n_factors,
+                        "use_implicit": use_implicit,
+                        "implicit_weight": implicit_weight,
+                    },
                 }
                 svd.save(cache_path, metadata=cache_metadata)
             

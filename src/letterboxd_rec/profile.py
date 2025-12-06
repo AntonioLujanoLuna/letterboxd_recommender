@@ -2,7 +2,7 @@ import logging
 import math
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from statistics import mean, pstdev
 from .database import load_json, parse_timestamp_naive
 from .config import (
@@ -70,6 +70,8 @@ class UserProfile:
 
     # Genre co-occurrence preferences (e.g., horror+comedy vs separate)
     genre_pairs: dict[str, float] = field(default_factory=dict)
+    preference_momentum: dict[str, float] = field(default_factory=dict)
+    genre_interactions: dict[str, float] = field(default_factory=dict)
 
 
 def _compute_temporal_weight(
@@ -211,6 +213,128 @@ def _compute_weight_blended(
     blend_factor = BLENDED_CONFIDENCE_BASE + (confidence * BLENDED_CONFIDENCE_SPAN)
 
     return (blend_factor * normalized_weight) + ((1 - blend_factor) * absolute_weight)
+
+
+def _compute_preference_momentum(
+    user_films: list[dict],
+    film_metadata: dict[str, dict],
+    window_days: int = 180
+) -> dict[str, float]:
+    """
+    Detect which preferences are strengthening vs weakening over time.
+
+    Returns dict mapping attribute -> momentum score
+    - Positive: preference is getting stronger recently
+    - Negative: preference is waning
+    """
+    now = datetime.now()
+    cutoff = now - timedelta(days=window_days)
+
+    recent_weights = defaultdict(float)
+    recent_counts = defaultdict(int)
+    older_weights = defaultdict(float)
+    older_counts = defaultdict(int)
+
+    for uf in user_films:
+        rating = uf.get('rating')
+        if not rating:
+            continue
+
+        film = film_metadata.get(uf['slug'])
+        if not film:
+            continue
+
+        weight = (rating - 2.5) / 2.5  # Normalize to roughly -1 to +1
+
+        scraped_at = uf.get('scraped_at')
+        is_recent = False
+        if scraped_at:
+            try:
+                ts = parse_timestamp_naive(scraped_at)
+                is_recent = ts > cutoff
+            except Exception:
+                pass
+
+        for genre in load_json(film.get('genres', [])):
+            key = f"genre:{genre}"
+            if is_recent:
+                recent_weights[key] += weight
+                recent_counts[key] += 1
+            else:
+                older_weights[key] += weight
+                older_counts[key] += 1
+
+        for director in load_json(film.get('directors', [])):
+            key = f"director:{director}"
+            if is_recent:
+                recent_weights[key] += weight
+                recent_counts[key] += 1
+            else:
+                older_weights[key] += weight
+                older_counts[key] += 1
+
+    momentum: dict[str, float] = {}
+    all_keys = set(recent_counts.keys()) | set(older_counts.keys())
+
+    for key in all_keys:
+        recent_avg = recent_weights[key] / recent_counts[key] if recent_counts[key] > 2 else 0
+        older_avg = older_weights[key] / older_counts[key] if older_counts[key] > 2 else 0
+
+        if recent_counts[key] >= 2 and older_counts[key] >= 2:
+            momentum[key] = recent_avg - older_avg
+
+    return momentum
+
+
+def _compute_genre_interactions(
+    user_films: list[dict],
+    film_metadata: dict[str, dict]
+) -> dict[str, float]:
+    """
+    Model interaction effects between genres.
+
+    Some users might like horror and comedy separately,
+    but dislike horror-comedy combinations (or vice versa).
+    """
+    single_genre_ratings = defaultdict(list)
+    combo_ratings = defaultdict(list)
+
+    for uf in user_films:
+        rating = uf.get('rating')
+        if not rating:
+            continue
+
+        film = film_metadata.get(uf['slug'])
+        if not film:
+            continue
+
+        genres = load_json(film.get('genres', []))
+
+        for g in genres:
+            single_genre_ratings[g].append(rating)
+
+        for i, g1 in enumerate(genres):
+            for g2 in genres[i + 1:]:
+                pair = "|".join(sorted([g1, g2]))
+                combo_ratings[pair].append(rating)
+
+    interactions: dict[str, float] = {}
+
+    for pair, ratings in combo_ratings.items():
+        if len(ratings) < 3:
+            continue
+
+        g1, g2 = pair.split("|")
+
+        g1_avg = sum(single_genre_ratings[g1]) / len(single_genre_ratings[g1]) if single_genre_ratings[g1] else 3.0
+        g2_avg = sum(single_genre_ratings[g2]) / len(single_genre_ratings[g2]) if single_genre_ratings[g2] else 3.0
+        expected = (g1_avg + g2_avg) / 2
+
+        actual = sum(ratings) / len(ratings)
+
+        interactions[pair] = actual - expected
+
+    return interactions
 
 
 def build_profile(
@@ -455,6 +579,10 @@ def build_profile(
     else:
         profile.avg_liked_rating = None
     
+    # Advanced signals
+    profile.preference_momentum = _compute_preference_momentum(user_films, film_metadata)
+    profile.genre_interactions = _compute_genre_interactions(user_films, film_metadata)
+
     # Save to cache if username provided
     if username:
         from .database import save_user_profile

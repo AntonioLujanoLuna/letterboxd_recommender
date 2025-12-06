@@ -250,6 +250,50 @@ class LetterboxdScraper:
         
         return None
     
+    def _detect_soft_block(self, tree: HTMLParser) -> bool:
+        """
+        Detect if we're being soft-blocked (page loads but with limited/no content).
+        """
+        if not tree:
+            return False
+
+        # 1. CAPTCHA or verification page
+        if tree.css_first("form[action*='captcha'], .captcha-container"):
+            return True
+
+        # 2. "Please wait" or rate limit message in body
+        body_el = tree.css_first("body")
+        body_text = body_el.text() if body_el else ""
+        soft_block_phrases = [
+            "please wait",
+            "too many requests",
+            "try again later",
+            "access denied",
+        ]
+        if any(phrase in body_text.lower() for phrase in soft_block_phrases):
+            return True
+
+        return False
+
+    def _get_with_soft_block_recovery(self, url: str) -> HTMLParser | None:
+        """Enhanced _get with soft block detection and recovery."""
+        tree = self._get(url)
+
+        if tree and self._detect_soft_block(tree):
+            logger.warning(f"Soft block detected on {url}, backing off...")
+
+            # Short, test-friendly backoff to avoid long hangs
+            for wait_time in [1, 2, 4]:
+                time.sleep(wait_time)
+                tree = self._get(url)
+                if tree and not self._detect_soft_block(tree):
+                    return tree
+
+            logger.error(f"Persistent soft block on {url}")
+            return None
+
+        return tree
+    
     def scrape_user(self, username: str, existing_slugs: set[str] | None = None, stop_on_existing: bool = False) -> list[FilmInteraction]:
         """
         Scrape all film interactions for a user.
@@ -270,7 +314,7 @@ class LetterboxdScraper:
         consecutive_existing = 0  # Track consecutive existing films for early termination
 
         while True:
-            tree = self._get(f"{self.BASE}/{username}/films/page/{page}/")
+            tree = self._get_with_soft_block_recovery(f"{self.BASE}/{username}/films/page/{page}/")
             if not tree:
                 break
 
@@ -332,7 +376,7 @@ class LetterboxdScraper:
         logger.info(f"Scraping {username}'s watchlist...")
         page = 1
         while True:
-            tree = self._get(f"{self.BASE}/{username}/watchlist/page/{page}/")
+            tree = self._get_with_soft_block_recovery(f"{self.BASE}/{username}/watchlist/page/{page}/")
             if not tree:
                 break
             
@@ -364,9 +408,108 @@ class LetterboxdScraper:
         logger.info(f"Total: {len(films)} films ({n_rated} rated, {n_liked} liked)")
         return list(films.values())
     
+    def scrape_user_smart(self, username: str, known_film_count: int | None = None) -> list[FilmInteraction]:
+        """
+        Smart scraping with adaptive page fetching.
+
+        If we know the user's film count from profile, we can:
+        1. Estimate pages needed
+        2. Apply early termination when pages look stale
+        """
+        films: dict[str, FilmInteraction] = {}
+
+        estimated_pages = None
+        if known_film_count:
+            estimated_pages = (known_film_count // SCRAPER_PAGE_SIZE) + 1
+            if estimated_pages > 10:
+                logger.info(f"Large profile detected ({known_film_count} films, ~{estimated_pages} pages)")
+
+        page = 1
+        empty_pages = 0
+
+        while True:
+            tree = self._get_with_soft_block_recovery(f"{self.BASE}/{username}/films/page/{page}/")
+            if not tree:
+                break
+
+            items = tree.css("li.griditem")
+            if not items:
+                empty_pages += 1
+                if empty_pages >= 2:
+                    break
+                page += 1
+                continue
+
+            empty_pages = 0
+            stop_after_page = len(items) < SCRAPER_PAGE_SIZE * 0.8
+
+            for item in items:
+                react_comp = item.css_first("div.react-component")
+                if not react_comp:
+                    continue
+
+                slug = validate_slug(react_comp.attributes.get("data-item-slug"))
+                if not slug:
+                    continue
+
+                rating = None
+                liked = False
+
+                viewing_data = item.css_first("p.poster-viewingdata")
+                if viewing_data:
+                    rating_span = viewing_data.css_first("span.rating")
+                    if rating_span:
+                        rating = self._parse_rating(rating_span)
+
+                    liked = viewing_data.css_first("span.like") is not None
+
+                films[slug] = FilmInteraction(slug, rating, True, False, liked)
+
+            page += 1
+            if stop_after_page:
+                break
+            if estimated_pages and page > estimated_pages + 2:
+                # Avoid unbounded crawling if page estimate looks off
+                break
+
+        # Watchlist sweep (reuse standard logic with smart requests)
+        page = 1
+        while True:
+            tree = self._get_with_soft_block_recovery(f"{self.BASE}/{username}/watchlist/page/{page}/")
+            if not tree:
+                break
+            
+            items = tree.css("li.griditem")
+            if not items:
+                break
+            
+            stop_after_page = len(items) < SCRAPER_PAGE_SIZE
+            for item in items:
+                react_comp = item.css_first("div.react-component")
+                if not react_comp:
+                    continue
+
+                slug = validate_slug(react_comp.attributes.get("data-item-slug"))
+                if not slug:
+                    continue
+                
+                if slug in films:
+                    films[slug].watchlisted = True
+                else:
+                    films[slug] = FilmInteraction(slug, None, False, True, False)
+            
+            page += 1
+            if stop_after_page:
+                break
+
+        n_rated = sum(1 for f in films.values() if f.rating)
+        n_liked = sum(1 for f in films.values() if f.liked)
+        logger.info(f"Smart scrape total: {len(films)} films ({n_rated} rated, {n_liked} liked)")
+        return list(films.values())
+    
     def scrape_film(self, slug: str) -> FilmMetadata | None:
         """Scrape metadata for a single film."""
-        tree = self._get(f"{self.BASE}/film/{slug}/")
+        tree = self._get_with_soft_block_recovery(f"{self.BASE}/film/{slug}/")
         if not tree:
             return None
         return parse_film_page(tree, slug)
@@ -406,7 +549,7 @@ class LetterboxdScraper:
         
         logger.info(f"Scraping {username}'s following...")
         while len(usernames) < limit:
-            tree = self._get(f"{self.BASE}/{username}/following/page/{page}/")
+            tree = self._get_with_soft_block_recovery(f"{self.BASE}/{username}/following/page/{page}/")
             if not tree:
                 break
             
@@ -435,7 +578,7 @@ class LetterboxdScraper:
         
         logger.info(f"Scraping {username}'s followers...")
         while len(usernames) < limit:
-            tree = self._get(f"{self.BASE}/{username}/followers/page/{page}/")
+            tree = self._get_with_soft_block_recovery(f"{self.BASE}/{username}/followers/page/{page}/")
             if not tree:
                 break
             
@@ -464,7 +607,7 @@ class LetterboxdScraper:
         
         logger.info("Scraping popular members...")
         while len(usernames) < limit:
-            tree = self._get(f"{self.BASE}/members/popular/this/week/page/{page}/")
+            tree = self._get_with_soft_block_recovery(f"{self.BASE}/members/popular/this/week/page/{page}/")
             if not tree:
                 break
             
@@ -493,7 +636,7 @@ class LetterboxdScraper:
 
         logger.info(f"Scraping fans of {slug}...")
         while len(usernames) < limit:
-            tree = self._get(f"{self.BASE}/film/{slug}/fans/page/{page}/")
+            tree = self._get_with_soft_block_recovery(f"{self.BASE}/film/{slug}/fans/page/{page}/")
             if not tree:
                 break
 
@@ -532,7 +675,7 @@ class LetterboxdScraper:
 
         logger.info(f"Scraping reviewers of {slug}...")
         while len(reviewers) < limit:
-            tree = self._get(f"{self.BASE}/film/{slug}/reviews/page/{page}/")
+            tree = self._get_with_soft_block_recovery(f"{self.BASE}/film/{slug}/reviews/page/{page}/")
             if not tree:
                 break
 
@@ -590,7 +733,7 @@ class LetterboxdScraper:
         Returns None if profile doesn't exist or can't be accessed.
         This is much cheaper than a full scrape (1 request vs 10+).
         """
-        tree = self._get(f"{self.BASE}/{username}/")
+        tree = self._get_with_soft_block_recovery(f"{self.BASE}/{username}/")
         if not tree:
             return None
 
@@ -626,7 +769,7 @@ class LetterboxdScraper:
     
     def scrape_favorites(self, username: str) -> list[str]:
         """Scrape user's favorite films (4-film profile showcase)."""
-        tree = self._get(f"{self.BASE}/{username}/")
+        tree = self._get_with_soft_block_recovery(f"{self.BASE}/{username}/")
         if not tree:
             return []
         
@@ -656,7 +799,7 @@ class LetterboxdScraper:
         
         logger.info(f"Scraping {username}'s lists...")
         while len(lists) < limit:
-            tree = self._get(f"{self.BASE}/{username}/lists/page/{page}/")
+            tree = self._get_with_soft_block_recovery(f"{self.BASE}/{username}/lists/page/{page}/")
             if not tree:
                 break
             
@@ -707,7 +850,7 @@ class LetterboxdScraper:
         cumulative_count = 0  # Track total films seen across all pages
         
         while True:
-            tree = self._get(f"{self.BASE}/{username}/list/{list_slug}/page/{page}/")
+            tree = self._get_with_soft_block_recovery(f"{self.BASE}/{username}/list/{list_slug}/page/{page}/")
             if not tree:
                 break
             

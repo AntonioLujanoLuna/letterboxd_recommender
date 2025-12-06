@@ -3,6 +3,7 @@ import json
 import logging
 import threading
 import time
+from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime
 from .config import DB_PATH, MIGRATIONS_PATH, MIGRATION_VERSION_TABLE
@@ -1035,3 +1036,127 @@ def run_maintenance(vacuum: bool = True, analyze: bool = True) -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+def load_user_films_batch(usernames: list[str]) -> dict[str, list[dict]]:
+    """
+    Load films for multiple users in a single query.
+
+    Much more efficient than N separate queries for collaborative filtering.
+    """
+    if not usernames:
+        return {}
+
+    with get_db(read_only=True) as conn:
+        placeholders = ','.join('?' * len(usernames))
+        rows = conn.execute(f"""
+            SELECT username, film_slug as slug, rating, watched, watchlisted, liked, scraped_at
+            FROM user_films
+            WHERE username IN ({placeholders})
+        """, usernames).fetchall()
+
+    result = defaultdict(list)
+    for row in rows:
+        row_dict = dict(row)
+        username = row_dict.pop('username')
+        result[username].append(row_dict)
+
+    return dict(result)
+
+
+def load_films_by_attribute(
+    attribute_type: str,
+    attribute_values: list[str],
+    limit_per_value: int = 50
+) -> dict[str, list[dict]]:
+    """
+    Efficiently load films grouped by attribute (genre, director, etc).
+    Useful for "find more films by X" queries.
+    """
+    if not attribute_values:
+        return {}
+
+    with get_db(read_only=True) as conn:
+        if attribute_type == 'director':
+            table, col = 'film_directors', 'director'
+        elif attribute_type == 'genre':
+            table, col = 'film_genres', 'genre'
+        elif attribute_type == 'actor':
+            table, col = 'film_cast', 'actor'
+        else:
+            raise ValueError(f"Unknown attribute type: {attribute_type}")
+
+        placeholders = ','.join('?' * len(attribute_values))
+
+        rows = conn.execute(f"""
+            WITH ranked AS (
+                SELECT 
+                    a.{col} as attr_value,
+                    f.*,
+                    ROW_NUMBER() OVER (PARTITION BY a.{col} ORDER BY f.rating_count DESC) as rn
+                FROM {table} a
+                JOIN films f ON a.film_slug = f.slug
+                WHERE a.{col} IN ({placeholders})
+            )
+            SELECT * FROM ranked WHERE rn <= ?
+        """, [*attribute_values, limit_per_value]).fetchall()
+
+    result = defaultdict(list)
+    for row in rows:
+        row_dict = dict(row)
+        attr_value = row_dict.pop('attr_value')
+        row_dict.pop('rn', None)
+        result[attr_value].append(row_dict)
+
+    return dict(result)
+
+
+def update_idf_incremental(new_film_slugs: list[str]) -> None:
+    """
+    Incrementally update IDF scores when new films are added.
+    Much faster than full recompute for small additions.
+    """
+    import math
+
+    if not new_film_slugs:
+        return
+
+    with get_db() as conn:
+        current_total = conn.execute("SELECT COUNT(*) FROM films").fetchone()[0]
+        new_total = current_total  # Already includes new films
+
+        for attr_type, table, col in [
+            ('genre', 'film_genres', 'genre'),
+            ('director', 'film_directors', 'director'),
+            ('actor', 'film_cast', 'actor'),
+            ('theme', 'film_themes', 'theme'),
+        ]:
+            placeholders = ','.join('?' * len(new_film_slugs))
+
+            new_values = conn.execute(f"""
+                SELECT {col}, COUNT(*) as new_count
+                FROM {table}
+                WHERE film_slug IN ({placeholders})
+                GROUP BY {col}
+            """, new_film_slugs).fetchall()
+
+            for row in new_values:
+                value, added_count = row[col], row['new_count']
+
+                existing = conn.execute("""
+                    SELECT doc_count FROM attribute_idf
+                    WHERE attribute_type = ? AND attribute_value = ?
+                """, (attr_type, value)).fetchone()
+
+                if existing:
+                    new_doc_count = existing['doc_count'] + added_count
+                else:
+                    new_doc_count = added_count
+
+                new_idf = math.log(new_total / (1 + new_doc_count))
+
+                conn.execute("""
+                    INSERT OR REPLACE INTO attribute_idf 
+                    (attribute_type, attribute_value, doc_count, idf_score)
+                    VALUES (?, ?, ?, ?)
+                """, (attr_type, value, new_doc_count, new_idf))

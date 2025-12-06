@@ -55,6 +55,60 @@ from .config import (
 logger = logging.getLogger(__name__)
 
 
+def _fuse_normalized(
+    meta_results: list["Recommendation"],
+    collab_results: list["Recommendation"],
+    weight_meta: float = 0.6,
+    weight_collab: float = 0.4,
+) -> list[tuple[str, float, list[str]]]:
+    """
+    Score-based fusion with min-max normalization.
+
+    Preserves relative score differences within each strategy.
+    """
+
+    def normalize_scores(recs: list["Recommendation"]) -> dict[str, float]:
+        if not recs:
+            return {}
+        scores = [r.score for r in recs]
+        min_s, max_s = min(scores), max(scores)
+        range_s = max_s - min_s if max_s > min_s else 1.0
+        return {r.slug: (r.score - min_s) / range_s for r in recs}
+
+    meta_norm = normalize_scores(meta_results)
+    collab_norm = normalize_scores(collab_results)
+
+    # Collect all slugs
+    all_slugs = set(meta_norm.keys()) | set(collab_norm.keys())
+
+    fused: dict[str, float] = {}
+    reasons_map: dict[str, list[str]] = {}
+    for slug in all_slugs:
+        m_score = meta_norm.get(slug, 0.0) * weight_meta
+        c_score = collab_norm.get(slug, 0.0) * weight_collab
+
+        # Bonus for appearing in both (consensus signal)
+        consensus_bonus = 0.1 if slug in meta_norm and slug in collab_norm else 0.0
+
+        fused[slug] = m_score + c_score + consensus_bonus
+
+        # Merge reasons
+        reasons = []
+        for r in meta_results:
+            if r.slug == slug:
+                reasons.extend(r.reasons)
+                reasons.extend(r.warnings)
+        for r in collab_results:
+            if r.slug == slug:
+                reasons.extend(r.reasons)
+                reasons.extend(getattr(r, "warnings", []))
+        reasons_map[slug] = list(dict.fromkeys(reasons))  # dedupe preserving order
+
+    return [
+        (slug, score, reasons_map.get(slug, []))
+        for slug, score in sorted(fused.items(), key=lambda x: -x[1])
+    ]
+
 @dataclass
 class AttributeConfig:
     """Configuration for scoring a film attribute."""
@@ -168,17 +222,25 @@ def _genre_pair_rule(
     for i, g1 in enumerate(film_genres):
         for g2 in film_genres[i + 1:]:
             pair = "|".join(sorted([g1, g2]))
-            if pair in profile.genre_pairs:
+            pair_value = None
+            # Prefer interaction effects when available, otherwise fall back to co-occurrence counts
+            if hasattr(profile, "genre_interactions") and pair in getattr(profile, "genre_interactions", {}):
+                pair_value = profile.genre_interactions[pair]
+            elif pair in profile.genre_pairs:
                 pair_value = profile.genre_pairs[pair]
-                if pair_value < 0:
-                    pair_penalty = NEGATIVE_PENALTY_MULTIPLIERS.get('genre_pair', NEGATIVE_PENALTY_MULTIPLIER)
-                    pair_score += pair_value * pair_penalty
-                    if pair_value < -0.5:
-                        pair_warnings.append(f"⚠️ Genre combo: {g1}+{g2} (disliked)")
-                else:
-                    pair_score += pair_value
-                    if pair_value > 0.5:
-                        matched_pairs.append(f"{g1}+{g2}")
+
+            if pair_value is None:
+                continue
+
+            if pair_value < 0:
+                pair_penalty = NEGATIVE_PENALTY_MULTIPLIERS.get('genre_pair', NEGATIVE_PENALTY_MULTIPLIER)
+                pair_score += pair_value * pair_penalty
+                if pair_value < -0.5:
+                    pair_warnings.append(f"⚠️ Genre combo: {g1}+{g2} (disliked)")
+            else:
+                pair_score += pair_value
+                if pair_value > 0.5:
+                    matched_pairs.append(f"{g1}+{g2}")
 
     pair_reasons = [f"Genre combo: {matched_pairs[0]}"] if matched_pairs else []
     return pair_score * WEIGHTS.get('genre_pair', 0.6), pair_reasons, pair_warnings
@@ -656,6 +718,80 @@ class MetadataRecommender:
 
         return total_score * config.weight, reasons, warnings
 
+    def _compute_negative_profile(self, user_films: list[dict], film_metadata: dict[str, dict]) -> dict[str, set]:
+        """
+        Build explicit negative preferences from low-rated films.
+
+        Helps avoid recommending films similar to ones the user disliked.
+        """
+        negatives: dict[str, set] = {
+            'directors': set(),
+            'genres': set(),
+            'actors': set(),
+            'themes': set(),
+        }
+
+        for uf in user_films:
+            rating = uf.get('rating')
+            if rating is None or rating >= 2.5:
+                continue
+
+            film = film_metadata.get(uf['slug'])
+            if not film:
+                continue
+
+            # Strong negative signal (1-2 stars)
+            if rating <= 2.0:
+                negatives['directors'].update(self._get_list(film, 'directors'))
+                negatives['genres'].update(self._get_list(film, 'genres'))
+
+            # Mild negative (2-2.5 stars) - track top-billed actors/themes
+            if rating <= 2.5:
+                negatives['actors'].update(self._get_list(film, 'cast', limit=3))
+                negatives['themes'].update(self._get_list(film, 'themes'))
+
+        return negatives
+
+    def _apply_negative_filter(
+        self,
+        candidates: list[tuple[str, float, list[str], list[str]]],
+        negatives: dict[str, set],
+        hard_filter: bool = False
+    ) -> list[tuple[str, float, list[str], list[str]]]:
+        """
+        Penalize or filter candidates matching negative preferences.
+        """
+        if not candidates or not negatives:
+            return candidates
+
+        filtered: list[tuple[str, float, list[str], list[str]]] = []
+        for slug, score, reasons, warnings in candidates:
+            film = self.films.get(slug)
+            if not film:
+                continue
+
+            penalty = 0.0
+            warning_list = list(warnings)
+
+            film_directors = set(self._get_list(film, 'directors'))
+            film_genres = set(self._get_list(film, 'genres'))
+
+            if film_directors & negatives['directors']:
+                if hard_filter:
+                    continue
+                penalty += 2.0
+                warning_list.append("⚠️ Director you've disliked")
+
+            genre_overlap = film_genres & negatives['genres']
+            if len(genre_overlap) >= 2:
+                penalty += 0.5 * len(genre_overlap)
+
+            adjusted_score = score - penalty
+            if adjusted_score > 0:
+                filtered.append((slug, adjusted_score, reasons, warning_list))
+
+        return filtered
+
     def inject_serendipity(
         self,
         ranked_candidates: list[tuple[str, float, list[str], list[str]]],
@@ -820,6 +956,7 @@ class MetadataRecommender:
         
         # Get seen films
         seen = {f['slug'] for f in user_films}
+        negatives = self._compute_negative_profile(user_films, self.films)
         
         # Score all unseen films
         candidates = []
@@ -853,6 +990,9 @@ class MetadataRecommender:
 
             if score > 0:
                 candidates.append((slug, score, reasons, warnings))
+
+        # Apply explicit negative preferences
+        candidates = self._apply_negative_filter(candidates, negatives)
 
         # Sort by score
         candidates.sort(key=lambda x: -x[1])
@@ -928,6 +1068,8 @@ class MetadataRecommender:
                 ))
             return results
 
+        negatives = self._compute_negative_profile(user_films, self.films)
+
         scored_candidates = []
         for slug in candidates:
             if slug not in self.films:
@@ -939,6 +1081,7 @@ class MetadataRecommender:
             if score > 0:
                 scored_candidates.append((slug, score, reasons, warnings))
 
+        scored_candidates = self._apply_negative_filter(scored_candidates, negatives)
         # Sort by score
         scored_candidates.sort(key=lambda x: -x[1])
 
@@ -1196,6 +1339,156 @@ class MetadataRecommender:
 
         return results
 
+    def explain_recommendation_detailed(
+        self,
+        film: dict,
+        profile: UserProfile,
+        user_films: list[dict]
+    ) -> dict:
+        """
+        Generate detailed, human-readable explanation for why a film was recommended.
+        """
+        explanation = {
+            "summary": "",
+            "positive_factors": [],
+            "negative_factors": [],
+            "similar_films_you_liked": [],
+            "confidence": 0.0,
+            "discovery_potential": "",
+        }
+
+        score, reasons, warnings = self._score_film(film, profile)
+
+        # Find similar films the user has liked
+        film_directors = set(self._get_list(film, 'directors'))
+        film_genres = set(self._get_list(film, 'genres'))
+
+        similar_liked = []
+        for uf in user_films:
+            if (uf.get('rating') and uf['rating'] >= 4.0) or uf.get('liked'):
+                other_film = self.films.get(uf['slug'])
+                if not other_film:
+                    continue
+
+                other_directors = set(self._get_list(other_film, 'directors'))
+                other_genres = set(self._get_list(other_film, 'genres'))
+
+                overlap_reasons = []
+                if film_directors & other_directors:
+                    overlap_reasons.append(f"same director: {list(film_directors & other_directors)[0]}")
+                if len(film_genres & other_genres) >= 2:
+                    overlap_reasons.append("similar genres")
+
+                if overlap_reasons:
+                    similar_liked.append({
+                        "title": other_film.get('title', uf['slug']),
+                        "your_rating": uf.get('rating'),
+                        "connection": ", ".join(overlap_reasons)
+                    })
+
+        explanation["similar_films_you_liked"] = similar_liked[:3]
+
+        # Compute confidence based on how much data supports the recommendation
+        supporting_observations = 0
+        for d in film_directors:
+            supporting_observations += profile.director_counts.get(d, 0)
+        for g in film_genres:
+            supporting_observations += profile.genre_counts.get(g, 0)
+
+        explanation["confidence"] = min(1.0, supporting_observations / 20) if supporting_observations else 0.0
+
+        # Discovery potential: is this outside their usual zone?
+        genre_familiarity = sum(profile.genre_counts.get(g, 0) for g in film_genres)
+        if genre_familiarity < 5:
+            explanation["discovery_potential"] = "This explores genres you haven't watched much"
+        elif genre_familiarity > 30:
+            explanation["discovery_potential"] = "This is squarely in your comfort zone"
+        else:
+            explanation["discovery_potential"] = "A nice balance of familiar and new"
+
+        # Build summary
+        if similar_liked:
+            explanation["summary"] = f"Based on your love of {similar_liked[0]['title']}"
+        elif reasons:
+            explanation["summary"] = reasons[0]
+        else:
+            explanation["summary"] = "Matches your overall taste profile"
+
+        explanation["positive_factors"] = reasons
+        explanation["negative_factors"] = warnings
+        explanation["score"] = score
+
+        return explanation
+
+    def compute_recommendation_diversity(
+        self,
+        recommendations: list[Recommendation]
+    ) -> dict:
+        """
+        Compute diversity metrics for a recommendation set.
+        Helps ensure recommendations aren't too narrow.
+        """
+        if not recommendations:
+            return {"diversity_score": 0.0}
+
+        all_genres: list[str] = []
+        all_directors: list[str] = []
+        all_countries: list[str] = []
+        all_decades: list[int] = []
+
+        for rec in recommendations:
+            film = self.films.get(rec.slug)
+            if not film:
+                continue
+
+            all_genres.extend(self._get_list(film, 'genres'))
+            all_directors.extend(self._get_list(film, 'directors'))
+            all_countries.extend(self._get_list(film, 'countries')[:1])  # Primary only
+
+            year = film.get('year')
+            if year:
+                all_decades.append((year // 10) * 10)
+
+        def entropy(items: list) -> float:
+            """Shannon entropy as diversity measure."""
+            from collections import Counter
+            if not items:
+                return 0.0
+
+            counts = Counter(items)
+            total = len(items)
+            probs = [c / total for c in counts.values()]
+            return -sum(p * math.log2(p) for p in probs if p > 0)
+
+        # Normalize entropies to 0-1 scale
+        n = len(recommendations)
+        max_entropy = math.log2(n) if n > 1 else 1.0
+
+        genre_diversity = entropy(all_genres) / max_entropy if max_entropy > 0 else 0
+        director_diversity = entropy(all_directors) / max_entropy if max_entropy > 0 else 0
+        country_diversity = entropy(all_countries) / max_entropy if max_entropy > 0 else 0
+        decade_diversity = entropy(all_decades) / max_entropy if max_entropy > 0 else 0
+
+        # Weighted overall score
+        overall = (
+            genre_diversity * 0.3 +
+            director_diversity * 0.3 +
+            country_diversity * 0.2 +
+            decade_diversity * 0.2
+        )
+
+        return {
+            "diversity_score": round(overall, 3),
+            "genre_diversity": round(genre_diversity, 3),
+            "director_diversity": round(director_diversity, 3),
+            "country_diversity": round(country_diversity, 3),
+            "decade_diversity": round(decade_diversity, 3),
+            "unique_genres": len(set(all_genres)),
+            "unique_directors": len(set(all_directors)),
+            "unique_countries": len(set(all_countries)),
+            "decade_range": (min(all_decades), max(all_decades)) if all_decades else None,
+        }
+
 
 class CollaborativeRecommender:
     """
@@ -1368,35 +1661,80 @@ class CollaborativeRecommender:
             logger.warning(f"Could not save item similarity cache: {e}")
 
     def _compute_item_similarities(self):
-        """Compute top-K item-item similarities using binary overlap matrix."""
-        import numpy as np
-        if self._overlap_matrix is None:
-            return
-        logger.info("Computing item-item similarity cache...")
-        # Item overlap (films x films)
-        overlap = self._overlap_matrix.T @ self._overlap_matrix
-        overlap = overlap.tocsr()
-        diag = np.array(overlap.diagonal()).flatten()
-        film_slugs = [None] * len(self._film_index)
-        for slug, idx in self._film_index.items():
-            film_slugs[idx] = slug
+        """
+        Compute item similarity using rating patterns, not just co-occurrence.
 
-        for i, slug in enumerate(film_slugs):
-            row_start = overlap.indptr[i]
-            row_end = overlap.indptr[i + 1]
-            indices = overlap.indices[row_start:row_end]
-            data = overlap.data[row_start:row_end]
-            sims = []
-            for idx, co_count in zip(indices, data):
-                if idx == i or co_count == 0:
+        Films are similar if users who rate one highly also rate the other highly.
+        """
+        import numpy as np
+        from collections import defaultdict
+
+        if not self.all_user_films:
+            return
+
+        logger.info("Computing item-item similarity cache...")
+
+        # Build item -> [(user, rating)] mapping
+        item_ratings: dict[str, list[tuple[int, float]]] = defaultdict(list)
+
+        for username, films in self.all_user_films.items():
+            user_idx = self._user_index[username]
+            for f in films:
+                rating = f.get('rating')
+                if rating:
+                    item_ratings[f['slug']].append((user_idx, rating))
+
+        if not item_ratings:
+            return
+
+        # Compute adjusted cosine similarity between items (ratings centered by user mean)
+        user_means = {}
+        for username, films in self.all_user_films.items():
+            ratings = [f['rating'] for f in films if f.get('rating')]
+            if ratings:
+                user_means[self._user_index[username]] = sum(ratings) / len(ratings)
+
+        film_slugs = list(item_ratings.keys())
+        sim_map: dict[str, list[tuple[str, float]]] = defaultdict(list)
+
+        for i, slug_a in enumerate(film_slugs):
+            ratings_a = item_ratings[slug_a]
+            users_a = {u for u, _ in ratings_a}
+
+            for slug_b in film_slugs[i + 1:]:
+                ratings_b = item_ratings[slug_b]
+                users_b = {u for u, _ in ratings_b}
+
+                common_users = users_a & users_b
+                # Allow similarity computation for small communities; need at least 2 overlaps
+                if len(common_users) < 2:
                     continue
-                denom = math.sqrt(diag[i] * diag[idx] + COLLAB_SHRINKAGE)
-                if denom == 0:
-                    continue
-                sims.append((film_slugs[idx], co_count / denom))
+
+                ratings_a_dict = dict(ratings_a)
+                ratings_b_dict = dict(ratings_b)
+
+                dot_product = 0.0
+                norm_a = 0.0
+                norm_b = 0.0
+
+                for user in common_users:
+                    mean = user_means.get(user, 3.0)
+                    adj_a = ratings_a_dict[user] - mean
+                    adj_b = ratings_b_dict[user] - mean
+
+                    dot_product += adj_a * adj_b
+                    norm_a += adj_a ** 2
+                    norm_b += adj_b ** 2
+
+                if norm_a > 0 and norm_b > 0:
+                    sim = dot_product / (np.sqrt(norm_a) * np.sqrt(norm_b))
+                    if sim > 0.3:
+                        sim_map[slug_a].append((slug_b, sim))
+                        sim_map[slug_b].append((slug_a, sim))
+
+        for slug, sims in sim_map.items():
             sims.sort(key=lambda x: -x[1])
-            if sims:
-                self._item_similarities[slug] = sims[: self._item_sim_top_k]
+            self._item_similarities[slug] = sims[: self._item_sim_top_k]
 
         self._save_item_similarity_cache()
 
@@ -1435,7 +1773,18 @@ class CollaborativeRecommender:
         target_films = self.all_user_films[username]
         
         # Find neighbors (users with similar taste)
-        neighbors = self._find_neighbors(username, target_films)
+        neighbor_k = max(10, min_neighbors * 2)
+        influencers, _ = self._find_neighbors_asymmetric(username, k=neighbor_k)
+        base_neighbors = self._find_neighbors(username, target_films, k=neighbor_k)
+
+        neighbor_scores: dict[str, float] = {}
+        for user, sim in influencers:
+            neighbor_scores[user] = sim
+        for user, sim in base_neighbors:
+            if user not in neighbor_scores or sim > neighbor_scores[user]:
+                neighbor_scores[user] = sim
+
+        neighbors = sorted(neighbor_scores.items(), key=lambda x: -x[1])[:neighbor_k]
         
         if len(neighbors) < min_neighbors:
             logger.warning(f"Warning: Only found {len(neighbors)} neighbors (min: {min_neighbors})")
@@ -1582,8 +1931,8 @@ class CollaborativeRecommender:
         overlap_vec = self._overlap_matrix @ target_binary.T
         overlaps = np.asarray(overlap_vec.toarray()).ravel()
 
-        # Filter and weight
-        min_overlap = 5
+        # Filter and weight (be lenient on tiny datasets)
+        min_overlap = 2 if n_users < 20 or self._overlap_matrix.shape[1] < 50 else 5
         valid = (overlaps >= min_overlap) & (np.arange(n_users) != target_idx)
         confidence = np.minimum(overlaps / 20.0, 1.0)  # Full confidence at 20+ common films
         shrinkage = overlaps / (overlaps + COLLAB_SHRINKAGE)
@@ -1604,6 +1953,53 @@ class CollaborativeRecommender:
         # Build result list
         usernames = list(self._user_index.keys())
         return [(usernames[i], weighted[i]) for i in top_k]
+
+    def _find_neighbors_asymmetric(
+        self,
+        username: str,
+        k: int = 10
+    ) -> tuple[list[tuple[str, float]], list[tuple[str, float]]]:
+        """
+        Find neighbors with asymmetric similarity.
+
+        Returns:
+            influencers: Users whose taste predicts yours (they rated first, you agreed)
+            followers: Users who tend to agree with your ratings
+        """
+        if username not in self._user_index:
+            return [], []
+
+        target_films = self.all_user_films[username]
+        target_ratings = {f['slug']: f.get('rating') for f in target_films if f.get('rating') is not None}
+
+        influencer_scores: dict[str, float] = {}
+
+        for other_username, other_films in self.all_user_films.items():
+            if other_username == username:
+                continue
+
+            other_ratings = {f['slug']: f.get('rating') for f in other_films if f.get('rating') is not None}
+            common = set(target_ratings.keys()) & set(other_ratings.keys())
+
+            # Permit very small overlaps for sparse datasets
+            if len(common) < 1:
+                continue
+
+            agreements = []
+            for slug in common:
+                diff = abs(target_ratings[slug] - other_ratings[slug])
+                agreements.append(1.0 - (diff / 4.5))  # Normalize to 0-1
+
+            agreement_score = sum(agreements) / len(agreements)
+
+            # Weight by how many more films they've seen (experience)
+            experience_ratio = len(other_ratings) / max(len(target_ratings), 1)
+            influencer_weight = min(experience_ratio, 2.0)  # Cap at 2x
+
+            influencer_scores[other_username] = agreement_score * influencer_weight * (len(common) / 20)
+
+        sorted_influencers = sorted(influencer_scores.items(), key=lambda x: -x[1])[:k]
+        return sorted_influencers, []
 
 @dataclass
 class ExplainedRecommendation(Recommendation):
