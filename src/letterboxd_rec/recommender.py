@@ -475,7 +475,11 @@ class MetadataRecommender:
         2. Have high community ratings (quality floor)
         3. Introduce underexplored attributes (genres, countries, decades user hasn't seen much of)
         """
-        n_serendipitous = max(1, int(n * serendipity_factor))
+        # If we don't have enough candidates, skip serendipity to avoid truncation.
+        if not ranked_candidates or n <= 0:
+            return []
+
+        n_serendipitous = max(1, int(n * serendipity_factor)) if serendipity_factor > 0 else 0
         n_core = n - n_serendipitous
         
         # Take top core recommendations
@@ -488,6 +492,16 @@ class MetadataRecommender:
             c for c in ranked_candidates[50:300]
             if c[0] not in core_slugs
         ]
+
+        # Nothing to inject? Just return the top-N as-is.
+        if not serendipity_pool:
+            return ranked_candidates[:n]
+
+        # Cap serendipity picks by available pool and requested size.
+        n_serendipitous = min(n_serendipitous, len(serendipity_pool), max(0, n))
+        n_core = max(0, n - n_serendipitous)
+        core_recs = ranked_candidates[:n_core]
+        core_slugs = {c[0] for c in core_recs}
         
         # Score for serendipity value
         serendipity_scored = []
@@ -543,7 +557,18 @@ class MetadataRecommender:
             # Insert at positions 5, 10, 15... to mix with core recommendations
             insert_pos = min((i + 1) * 5, len(result))
             result.insert(insert_pos, pick)
-        
+
+        # Backfill if we still have fewer than requested (can happen with small pools)
+        if len(result) < n:
+            used = {slug for slug, *_ in result}
+            for slug, score, reasons, warnings in ranked_candidates:
+                if slug in used:
+                    continue
+                result.append((slug, score, reasons, warnings))
+                used.add(slug)
+                if len(result) >= n:
+                    break
+
         return result[:n]
 
     def recommend(

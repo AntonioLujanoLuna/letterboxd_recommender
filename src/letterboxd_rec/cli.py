@@ -968,6 +968,8 @@ def cmd_import(args: argparse.Namespace) -> None:
                     film.get('countries'), film.get('languages'),
                     film.get('writers'), film.get('cinematographers'), film.get('composers')
                 ) for film in chunk])
+                # Keep normalized tables in sync with imported films
+                populate_normalized_tables_batch(conn, chunk)
             logger.info(f"Imported {len(data['films'])} films")
         
         if 'user_films' in data:
@@ -982,6 +984,11 @@ def cmd_import(args: argparse.Namespace) -> None:
                     uf.get('scraped_at')
                 ) for uf in chunk])
             logger.info(f"Imported {len(data['user_films'])} user interactions")
+
+    # Recompute IDF to clear stale attribute weights after import
+    with get_db() as conn:
+        conn.execute("DELETE FROM attribute_idf")
+    compute_and_store_idf()
     
     if getattr(args, "maintenance", RUN_VACUUM_ANALYZE_DEFAULT):
         run_maintenance(vacuum=True, analyze=True)
