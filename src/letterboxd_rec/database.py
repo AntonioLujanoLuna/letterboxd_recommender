@@ -748,11 +748,16 @@ def add_pending_users(
             )
         }
 
-        # Filter to truly new users
-        new_users = [
-            u for u in usernames
-            if u not in existing_scraped and u not in existing_pending
-        ]
+        # Filter to truly new users and de-duplicate this batch while preserving order
+        seen = set()
+        new_users = []
+        for u in usernames:
+            if u in seen:
+                continue
+            seen.add(u)
+            if u in existing_scraped or u in existing_pending:
+                continue
+            new_users.append(u)
 
         if not new_users:
             return 0

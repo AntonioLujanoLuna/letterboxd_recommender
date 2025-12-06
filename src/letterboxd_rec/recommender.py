@@ -1571,11 +1571,13 @@ class CollaborativeRecommender:
 
         # Similarity = normalized_matrix @ target_row.T (single sparse matrix-vector multiply)
         target_row = self._normalized_matrix[target_idx]
-        similarities = np.array(self._normalized_matrix @ target_row.T).flatten()
+        similarities = np.asarray(self._normalized_matrix @ target_row.T).ravel()
 
         # Overlap counts for confidence weighting
         target_binary = self._overlap_matrix[target_idx]
-        overlaps = np.array(self._overlap_matrix @ target_binary.T).flatten()
+        # Force dense array to avoid sparse truthiness/boolean issues downstream
+        overlap_vec = self._overlap_matrix @ target_binary.T
+        overlaps = np.asarray(overlap_vec.toarray()).ravel()
 
         # Filter and weight
         min_overlap = 5
