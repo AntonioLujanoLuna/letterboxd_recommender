@@ -3,6 +3,7 @@ import math
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
+from statistics import mean, pstdev
 from .database import load_json, parse_timestamp_naive
 from .config import (
     MAX_CAST_CONSIDERED,
@@ -38,6 +39,9 @@ class UserProfile:
     n_rated: int = 0
     n_liked: int = 0
     avg_liked_rating: float | None = None
+    rating_mean: float | None = None
+    rating_std: float | None = None
+    weighting_mode: str = "absolute"
 
     genres: dict[str, float] = field(default_factory=dict)
     directors: dict[str, float] = field(default_factory=dict)
@@ -121,8 +125,21 @@ def _compute_weight_absolute(rating: float) -> float:
         return WEIGHT_HATED
 
 
+def _normalize_scores(scores: dict, counts: dict, exponent: float = NORM_EXPONENT_DEFAULT) -> dict:
+    """
+    Normalize accumulated scores by count with configurable exponent.
+
+    exponent=0.0: no normalization (raw scores)
+    exponent=0.5: sqrt normalization (balance frequency and magnitude)
+    exponent=1.0: full mean normalization
+    """
+    if exponent == 0:
+        return dict(scores)
+    return {k: v / (counts[k] ** exponent) for k, v in scores.items() if counts[k] > 0}
+
+
 def _z_to_weight(z_score: float) -> float:
-    """Map z-score to weight constant."""
+    """Map z-score to weight constant based on personal rating distribution."""
     if z_score >= 1.5:
         return WEIGHT_LOVED
     elif z_score >= 0.5:
@@ -137,80 +154,60 @@ def _z_to_weight(z_score: float) -> float:
 
 def _compute_weight_normalized(
     uf: dict,
-    user_mean: float,
+    user_mean: float | None,
     user_std: float
 ) -> float:
-    """
-    Compute preference weight normalized to user's personal rating distribution.
-
-    A user who averages 4.2 with std 0.6 giving a 3.0 is ~2 std below their mean,
-    which is a strong negative signal—even though 3.0 is "neutral" in absolute terms.
-    """
+    """Weight using user's personal rating distribution (z-score)."""
     rating = uf.get('rating')
     liked = uf.get('liked', False)
     watched = uf.get('watched', False)
     watchlisted = uf.get('watchlisted', False)
 
-    if rating is not None and user_std > 0:
+    if rating is not None and user_mean is not None and user_std > 0:
         z_score = (rating - user_mean) / user_std
         return _z_to_weight(z_score)
 
-    elif rating is not None:
+    # Fallbacks
+    if rating is not None:
         return _compute_weight_absolute(rating)
-
     if liked:
         return WEIGHT_LIKED_NO_RATING
     if watched:
         return WEIGHT_WATCHED_ONLY
     if watchlisted:
         return WEIGHT_WATCHLISTED
-
     return 0.0
 
 
 def _compute_weight_blended(
     uf: dict,
-    user_mean: float,
+    user_mean: float | None,
     user_std: float,
     n_ratings: int
 ) -> float:
     """
-    Blend absolute and normalized weights based on confidence.
+    Blend absolute and normalized weights based on confidence in user's scale.
 
     With few ratings, trust absolute scale more.
-    With many ratings, trust user's personal scale more.
+    With many ratings and stable std, trust personalized scale more.
     """
     rating = uf.get('rating')
     if rating is None:
         return _compute_weight(uf)
 
-    absolute_weight = _compute_weight(uf)
+    absolute_weight = _compute_weight_absolute(rating)
 
-    if user_std > 0.2 and n_ratings >= 10:
+    if user_mean is not None and user_std > 0.2 and n_ratings >= 10:
         z_score = (rating - user_mean) / user_std
         normalized_weight = _z_to_weight(z_score)
     else:
         normalized_weight = absolute_weight
 
-    # At 10 ratings: 50/50 blend
-    # At 50+ ratings: 90% normalized
+    # At 10 ratings: 50/50 blend; at 50+ ratings: 90% normalized
     confidence = min(1.0, n_ratings / 50)
     blend_factor = 0.5 + (confidence * 0.4)
 
     return (blend_factor * normalized_weight) + ((1 - blend_factor) * absolute_weight)
-
-
-def _normalize_scores(scores: dict, counts: dict, exponent: float = NORM_EXPONENT_DEFAULT) -> dict:
-    """
-    Normalize accumulated scores by count with configurable exponent.
-
-    exponent=0.0: no normalization (raw scores)
-    exponent=0.5: sqrt normalization (balance frequency and magnitude)
-    exponent=1.0: full mean normalization
-    """
-    if exponent == 0:
-        return dict(scores)
-    return {k: v / (counts[k] ** exponent) for k, v in scores.items() if counts[k] > 0}
 
 
 def build_profile(
@@ -220,7 +217,8 @@ def build_profile(
     username: str | None = None,
     use_cache: bool = True,
     use_temporal_decay: bool = TEMPORAL_DECAY_ENABLED,
-    reference_time: datetime | None = None
+    reference_time: datetime | None = None,
+    weighting_mode: str = "absolute",
 ) -> UserProfile:
     """
     Build preference profile from user's film interactions and lists.
@@ -283,6 +281,20 @@ def build_profile(
             scraped_at = uf.get('scraped_at')
             temporal_weights[slug] = _compute_temporal_weight(scraped_at, ref_time)
 
+    # Rating distribution stats for personalized weighting
+    ratings = [uf['rating'] for uf in user_films if uf.get('rating') is not None]
+    n_ratings = len(ratings)
+    user_mean = mean(ratings) if ratings else None
+    user_std = pstdev(ratings) if len(ratings) > 1 else 0.0
+
+    def _weight_for_interaction(uf: dict) -> float:
+        mode = (weighting_mode or "absolute").lower()
+        if mode == "normalized":
+            return _compute_weight_normalized(uf, user_mean, user_std)
+        if mode == "blended":
+            return _compute_weight_blended(uf, user_mean, user_std, n_ratings)
+        return _compute_weight(uf)
+
     # Score accumulators
     scores = {
         'genre': defaultdict(float),
@@ -312,7 +324,7 @@ def build_profile(
             continue
 
         # Determine base weight for this film
-        base_weight = _compute_weight(uf)
+        base_weight = _weight_for_interaction(uf)
 
         # Apply temporal decay if enabled
         if use_temporal_decay:
@@ -425,6 +437,9 @@ def build_profile(
     profile.n_films = len(user_films)
     profile.n_rated = len(rated_films)
     profile.n_liked = sum(1 for f in user_films if f.get('liked'))
+    profile.rating_mean = user_mean
+    profile.rating_std = user_std if n_ratings > 1 else 0.0
+    profile.weighting_mode = weighting_mode
 
     # Compute temporally-weighted average rating
     if rated_films:

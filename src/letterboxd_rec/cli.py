@@ -548,14 +548,20 @@ def cmd_recommend(args: argparse.Namespace) -> None:
             logger.error(f"No data for '{username}'. Run: python main.py scrape {username}")
             return
 
-        # Load film metadata with SQL-side filtering for better performance
-        # This avoids loading all films into memory when filters are specified
-        all_films = _load_films_with_filters(
+        # Load film metadata
+        all_films_filtered = _load_films_with_filters(
             conn,
             min_year=args.min_year,
             max_year=args.max_year,
             min_rating=args.min_rating
         )
+
+        # Hybrid/collaborative flows need the full catalog so collaborative results aren't
+        # constrained by pre-filtered metadata; apply filters later during scoring.
+        if strategy in ('hybrid', 'collaborative'):
+            all_films = {r['slug']: dict(r) for r in conn.execute("SELECT * FROM films")}
+        else:
+            all_films = all_films_filtered
 
         # Check for missing metadata
         seen_slugs = {f['slug'] for f in user_films}
@@ -597,7 +603,8 @@ def cmd_recommend(args: argparse.Namespace) -> None:
                 genres=args.genres,
                 exclude_genres=args.exclude_genres,
                 min_rating=args.min_rating,
-                username=username
+                username=username,
+                weighting_mode=args.weighting_mode,
             )
             collab_recs = collab_rec.recommend(
                 username,
@@ -773,7 +780,8 @@ def cmd_recommend(args: argparse.Namespace) -> None:
                 all_films,
                 user_lists=user_lists,
                 username=username,
-                use_temporal_decay=use_temporal_decay
+                use_temporal_decay=use_temporal_decay,
+                weighting_mode=args.weighting_mode,
             )
 
             recommender = MetadataRecommender(list(all_films.values()))
@@ -788,7 +796,9 @@ def cmd_recommend(args: argparse.Namespace) -> None:
                 diversity=diversity,
                 max_per_director=max_per_director,
                 username=username,
-                user_lists=user_lists
+                user_lists=user_lists,
+                profile=profile,
+                weighting_mode=args.weighting_mode,
             )
     
     # Format results
@@ -1290,6 +1300,12 @@ def main():
     rec_parser.add_argument("--max-per-director", type=int, default=2, help="Max films per director (diversity mode)")
     rec_parser.add_argument("--no-temporal-decay", action="store_true",
                             help="Disable temporal decay (treat old and new ratings equally)")
+    rec_parser.add_argument(
+        "--weighting-mode",
+        choices=["absolute", "normalized", "blended"],
+        default="absolute",
+        help="Scoring weights: absolute (default), normalized (per-user z-score), or blended",
+    )
     rec_parser.add_argument("--hybrid-meta-weight", type=float, help="Weight for metadata component in hybrid fusion")
     rec_parser.add_argument("--hybrid-collab-weight", type=float, help="Weight for collaborative component in hybrid fusion")
     rec_parser.add_argument("--hybrid-diversity", action="store_true", help="Apply diversity constraint to hybrid output")

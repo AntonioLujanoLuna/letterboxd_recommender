@@ -559,11 +559,21 @@ class MetadataRecommender:
         max_per_director: int = 2,
         username: str | None = None,
         user_lists: list[dict] | None = None,
+        profile: UserProfile | None = None,
+        serendipity_factor: float | None = SERENDIPITY_FACTOR,
+        weighting_mode: str = "absolute",
     ) -> list[Recommendation]:
         """Generate recommendations."""
 
         # Build user profile
-        profile = build_profile(user_films, self.films, user_lists=user_lists, username=username)
+        if profile is None:
+            profile = build_profile(
+                user_films,
+                self.films,
+                user_lists=user_lists,
+                username=username,
+                weighting_mode=weighting_mode,
+            )
         
         # Get seen films
         seen = {f['slug'] for f in user_films}
@@ -604,13 +614,21 @@ class MetadataRecommender:
         # Sort by score
         candidates.sort(key=lambda x: -x[1])
 
+        ranked_candidates = candidates
+
+        # Optionally mix in serendipitous picks to add novelty
+        if serendipity_factor and serendipity_factor > 0:
+            ranked_candidates = self.inject_serendipity(
+                ranked_candidates, profile, n, serendipity_factor
+            )
+
         # Apply diversity if requested
         if diversity:
-            return self._diversify(candidates, n, max_per_director)
+            return self._diversify(ranked_candidates, n, max_per_director)
 
         # Build results (standard mode)
         results = []
-        for slug, score, reasons, warnings in candidates[:n]:
+        for slug, score, reasons, warnings in ranked_candidates[:n]:
             film = self.films[slug]
             results.append(Recommendation(
                 slug=slug,
@@ -629,6 +647,7 @@ class MetadataRecommender:
         candidates: list[str],
         n: int = 20,
         profile: UserProfile | None = None,
+        weighting_mode: str = "absolute",
     ) -> list[Recommendation]:
         """
         Score and rank a specific list of films (e.g. watchlist).
@@ -641,7 +660,11 @@ class MetadataRecommender:
         """
         # Build or use provided profile
         if profile is None:
-            profile = build_profile(user_films, self.films)
+            profile = build_profile(
+                user_films,
+                self.films,
+                weighting_mode=weighting_mode,
+            )
 
         # Cold-start fallback: use TF-IDF similarity when profile is too sparse
         if profile.n_rated == 0 and profile.n_liked == 0:
@@ -696,10 +719,11 @@ class MetadataRecommender:
         min_director_score: float = 2.0,
         limit_per_director: int = 3,
         min_year: int | None = None,
-        max_year: int | None = None
+        max_year: int | None = None,
+        weighting_mode: str = "absolute",
     ) -> dict[str, list[Recommendation]]:
         """Find unseen films from directors the user loves."""
-        profile = build_profile(user_films, self.films)
+        profile = build_profile(user_films, self.films, weighting_mode=weighting_mode)
         seen = {f['slug'] for f in user_films}
 
         # Identify high affinity directors
@@ -873,7 +897,11 @@ class MetadataRecommender:
         target_writers = set(self._get_list(target, 'writers'))
 
         target_year = target.get('year')
-        target_decade = (target_year // 10) * 10 if isinstance(target_year, int) and target_year > 0 else None
+        target_decade = (
+            (target_year // 10) * 10
+            if isinstance(target_year, int) and target_year >= 1888
+            else None
+        )
         
         candidates = []
         for other_slug, film in self.films.items():
@@ -921,7 +949,11 @@ class MetadataRecommender:
 
             # Same decade
             film_year = film.get('year')
-            film_decade = (film_year // 10) * 10 if isinstance(film_year, int) and film_year > 0 else None
+            film_decade = (
+                (film_year // 10) * 10
+                if isinstance(film_year, int) and film_year >= 1888
+                else None
+            )
 
             if target_decade is not None and film_decade == target_decade:
                 score += SIMILAR_DECADE_SCORE
@@ -1425,29 +1457,28 @@ class ExplainedRecommendation(Recommendation):
     counterfactuals: list[str] = field(default_factory=list)
     confidence: float = 0.0
 
+    @staticmethod
     def explain_recommendation(
-        self,
+        recommender: "MetadataRecommender",
         film: dict,
         profile: UserProfile,
-        seen_films: set[str]
+        seen_films: set[str] | None = None,
     ) -> "ExplainedRecommendation":
         """Generate detailed explanation for a single film recommendation."""
-        
-        score, reasons, warnings = self._score_film(film, profile)
-        
+
+        _ = seen_films  # reserved for future counterfactual comparisons
+        score, reasons, warnings = recommender._score_film(film, profile)
+
         # Decompose score by attribute type
         contributions = {}
         for config in ATTRIBUTE_CONFIGS:
-            attr_score, _, _ = self._score_attribute(film, profile, config)
+            attr_score, _, _ = recommender._score_attribute(film, profile, config)
             if abs(attr_score) > 0.01:
                 contributions[config.name] = round(attr_score, 2)
-        
-        # Add non-attribute contributions
-        # (decade, community rating, popularity - extract from _score_film logic)
-        
+
         # Generate counterfactuals
         counterfactuals = []
-        
+
         # "If you hadn't liked X director..."
         film_directors = load_json(film.get('directors'))
         for director in film_directors:
@@ -1457,18 +1488,15 @@ class ExplainedRecommendation(Recommendation):
                     counterfactuals.append(
                         f"Without your {director} affinity, score would drop to {hypothetical_score:.1f}"
                     )
-        
-        # "This ranks higher than X because..."
-        # Compare to a similar but lower-ranked film
-        
+
         # Confidence based on profile observation counts
         relevant_counts = []
         for director in film_directors:
             if director in profile.director_counts:
                 relevant_counts.append(profile.director_counts[director])
-        
+
         confidence = min(1.0, sum(relevant_counts) / 10) if relevant_counts else 0.3
-        
+
         return ExplainedRecommendation(
             slug=film['slug'],
             title=film.get('title', film['slug']),

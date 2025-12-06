@@ -864,7 +864,7 @@ class AsyncLetterboxdScraper:
                 await self._rate_limit_event.wait()
 
                 try:
-                resp = await client.get(f"{self.BASE}/film/{slug}/")
+                    resp = await client.get(f"{self.BASE}/film/{slug}/")
 
                     if resp.status_code == 404:
                         logger.debug(f"Film not found: {slug}")
@@ -872,7 +872,10 @@ class AsyncLetterboxdScraper:
 
                     if resp.status_code == 429:
                         retry_after = int(resp.headers.get("Retry-After", DEFAULT_RETRY_AFTER))
-                        logger.warning(f"Rate limited on {slug}, pausing ALL tasks for {retry_after}s (attempt {attempt + 1}/{MAX_HTTP_RETRIES})")
+                        logger.warning(
+                            f"Rate limited on {slug}, pausing ALL tasks for {retry_after}s "
+                            f"(attempt {attempt + 1}/{MAX_HTTP_RETRIES})"
+                        )
 
                         # Pause all concurrent tasks
                         self._rate_limit_event.clear()
@@ -881,6 +884,7 @@ class AsyncLetterboxdScraper:
                         self._rate_limit_event.set()
                         # Add jitter to prevent thundering herd
                         import random
+
                         jitter = random.uniform(0, self.delay * 2)
                         await asyncio.sleep(jitter)
                         # Adjust delay upwards for future calls
@@ -892,8 +896,10 @@ class AsyncLetterboxdScraper:
                     return parse_film_page(tree, slug)
 
                 except httpx.TimeoutException:
-                    wait_time = 2 ** attempt
-                    logger.warning(f"Timeout on {slug}, retrying in {wait_time}s (attempt {attempt + 1}/{MAX_HTTP_RETRIES})")
+                    wait_time = 2**attempt
+                    logger.warning(
+                        f"Timeout on {slug}, retrying in {wait_time}s (attempt {attempt + 1}/{MAX_HTTP_RETRIES})"
+                    )
                     await asyncio.sleep(wait_time)
 
                 except httpx.HTTPStatusError as e:
