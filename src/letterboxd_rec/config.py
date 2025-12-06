@@ -256,6 +256,10 @@ TFIDF_MAX_FEATURES = 20_000
 SVD_CACHE_PATH = Path("data/svd_model.npz")
 ITEM_SIM_CACHE_PATH = Path("data/item_similarity.npz")
 
+# Item-item similarity safeguards (controls compute cost)
+ITEM_SIM_MIN_RATINGS = 2        # skip items with fewer than this many ratings
+ITEM_SIM_MAX_ITEMS = 10_000       # cap number of items to include in pairwise pass
+
 # Migrations
 MIGRATIONS_PATH = Path("src/letterboxd_rec/migrations")
 MIGRATION_VERSION_TABLE = "schema_migrations"

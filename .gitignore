@@ -5,3 +5,6 @@ __pycache__
 *.txt
 Scripts/
 .coverage
+*.bat
+*.sh
+*.log

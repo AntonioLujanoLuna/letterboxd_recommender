@@ -50,6 +50,8 @@ from .config import (
     COLLAB_IMPLICIT_WEIGHTS,
     COLLAB_POPULARITY_DEBIAS,
     ITEM_SIM_CACHE_PATH,
+    ITEM_SIM_MIN_RATINGS,
+    ITEM_SIM_MAX_ITEMS,
 )
 
 logger = logging.getLogger(__name__)
@@ -859,7 +861,7 @@ class MetadataRecommender:
                 continue
             
             # Quality floor
-            avg_rating = film.get('avg_rating', 0)
+            avg_rating = film.get('avg_rating') or 0
             if avg_rating < SERENDIPITY_MIN_RATING:
                 continue
             
@@ -895,7 +897,7 @@ class MetadataRecommender:
                     novelty += 0.5
             
             # Prefer less popular (hidden gems)
-            rating_count = film.get('rating_count', 0)
+            rating_count = film.get('rating_count') or 0
             if rating_count < SERENDIPITY_POPULARITY_CAP:
                 novelty += 0.5
             
@@ -1684,8 +1686,23 @@ class CollaborativeRecommender:
                 if rating:
                     item_ratings[f['slug']].append((user_idx, rating))
 
+        # Filter to reduce compute: drop very sparse items and cap total
+        item_ratings = {
+            slug: ratings for slug, ratings in item_ratings.items()
+            if len(ratings) >= ITEM_SIM_MIN_RATINGS
+        }
         if not item_ratings:
+            logger.info("Item similarity: no items meet minimum rating count")
             return
+
+        if len(item_ratings) > ITEM_SIM_MAX_ITEMS:
+            sorted_items = sorted(item_ratings.items(), key=lambda x: -len(x[1]))
+            dropped = len(sorted_items) - ITEM_SIM_MAX_ITEMS
+            item_ratings = dict(sorted_items[:ITEM_SIM_MAX_ITEMS])
+            logger.info(
+                f"Item similarity: trimming items from {len(sorted_items)} to "
+                f"{ITEM_SIM_MAX_ITEMS} (dropped {dropped}) to cap computation"
+            )
 
         # Compute adjusted cosine similarity between items (ratings centered by user mean)
         user_means = {}
