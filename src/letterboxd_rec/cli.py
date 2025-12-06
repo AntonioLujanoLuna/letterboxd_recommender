@@ -33,6 +33,7 @@ from .scraper import LetterboxdScraper, AsyncLetterboxdScraper
 from .recommender import MetadataRecommender, CollaborativeRecommender, Recommendation, _fuse_normalized
 from .matrix_factorization import SVDRecommender
 from .profile import build_profile
+from .group_recommender import recommend_for_group
 from tqdm import tqdm
 import asyncio
 
@@ -81,6 +82,30 @@ def _validate_username(username: str) -> str:
     if sanitized != username.lower():
         logger.warning(f"Username '{username}' sanitized to '{sanitized}'")
     return sanitized
+
+
+def _parse_weights(weights: list[str] | None) -> dict[str, float]:
+    """
+    Parse CLI weights arguments in the form user:weight into a dict.
+    Invalid entries are ignored with a warning.
+    """
+    if not weights:
+        return {}
+
+    parsed: dict[str, float] = {}
+    for entry in weights:
+        if ":" not in entry:
+            logger.warning("Ignoring weight '%s' (expected user:weight)", entry)
+            continue
+        user_part, weight_part = entry.split(":", 1)
+        try:
+            weight_value = float(weight_part)
+        except ValueError:
+            logger.warning("Ignoring weight '%s' (invalid number)", entry)
+            continue
+        parsed[_validate_username(user_part)] = weight_value
+
+    return parsed
 
 
 def _load_all_user_films(conn, username_filter: str | None = None) -> dict[str, list[dict]]:
@@ -969,282 +994,329 @@ def cmd_discover_from_taste(args: argparse.Namespace) -> None:
     logger.info(f"\nAdded {total_added} taste-matched users to queue")
 
 
-def cmd_recommend(args: argparse.Namespace) -> None:
-    """Generate recommendations."""
-    # Validate username
-    username = _validate_username(args.username)
+def _load_recommendation_data(
+    conn,
+    username: str,
+    strategy: str,
+    args: argparse.Namespace,
+) -> tuple[list[dict], dict[str, dict], dict[str, list[dict]] | None, list[dict] | None]:
+    """
+    Load all data needed for the selected recommendation strategy while
+    avoiding duplicate queries.
+    """
+    all_user_films: dict[str, list[dict]] | None = None
 
-    strategy = getattr(args, 'strategy', 'metadata')
+    if strategy in ('hybrid', 'collaborative', 'svd'):
+        all_user_films = _load_all_user_films(conn)
+        user_films = all_user_films.get(username, [])
+    else:
+        user_films = [dict(r) for r in conn.execute("""
+            SELECT film_slug as slug, rating, watched, watchlisted, liked, scraped_at
+            FROM user_films WHERE username = ?
+        """, (username,))]
 
-    with get_db() as conn:
-        # Load user films based on strategy to avoid duplicate queries
-        if strategy in ('hybrid', 'collaborative'):
-            # Load all users' films once (includes target user)
-            all_user_films = _load_all_user_films(conn)
-            user_films = all_user_films.get(username, [])
-        else:
-            # Metadata-only: just load target user's films (include scraped_at for temporal decay)
-            user_films = [dict(r) for r in conn.execute("""
-                SELECT film_slug as slug, rating, watched, watchlisted, liked, scraped_at
-                FROM user_films WHERE username = ?
-            """, (username,))]
+    all_films_filtered = _load_films_with_filters(
+        conn,
+        min_year=args.min_year,
+        max_year=args.max_year,
+        min_rating=args.min_rating
+    )
 
-        if not user_films:
-            logger.error(f"No data for '{username}'. Run: python main.py scrape {username}")
-            return
+    if strategy in ('hybrid', 'collaborative'):
+        all_films = {r['slug']: dict(r) for r in conn.execute("SELECT * FROM films")}
+    else:
+        all_films = all_films_filtered
 
-        # Load film metadata
-        all_films_filtered = _load_films_with_filters(
-            conn,
-            min_year=args.min_year,
-            max_year=args.max_year,
-            min_rating=args.min_rating
+    user_lists = load_user_lists(username) if strategy == 'metadata' else None
+
+    return user_films, all_films, all_user_films, user_lists
+
+
+def _warn_missing_metadata(user_films: list[dict], all_films: dict[str, dict], username: str) -> None:
+    """Emit a warning when the user's history references films without metadata."""
+    seen_slugs = {f['slug'] for f in user_films}
+    missing_slugs = seen_slugs - set(all_films.keys())
+    if missing_slugs:
+        logger.warning(
+            f"Missing metadata for {len(missing_slugs)} films in {username}'s history. "
+            "Consider running 'scrape' again."
         )
 
-        # Hybrid/collaborative flows need the full catalog so collaborative results aren't
-        # constrained by pre-filtered metadata; apply filters later during scoring.
-        if strategy in ('hybrid', 'collaborative'):
-            all_films = {r['slug']: dict(r) for r in conn.execute("SELECT * FROM films")}
+
+def _run_metadata_strategy(
+    user_films: list[dict],
+    all_films: dict[str, dict],
+    args: argparse.Namespace,
+    username: str,
+    user_lists: list[dict] | None,
+    all_user_films: dict[str, list[dict]] | None = None,
+) -> list[Recommendation]:
+    """Metadata-based recommendation strategy."""
+    diversity = getattr(args, 'diversity', False)
+    max_per_director = getattr(args, 'max_per_director', 2)
+    use_temporal_decay = not getattr(args, 'no_temporal_decay', False)
+    lists = user_lists if user_lists is not None else load_user_lists(username)
+
+    profile = build_profile(
+        user_films,
+        all_films,
+        user_lists=lists,
+        username=username,
+        use_temporal_decay=use_temporal_decay,
+        weighting_mode=args.weighting_mode,
+    )
+
+    recommender = MetadataRecommender(list(all_films.values()))
+    return recommender.recommend(
+        user_films,
+        n=args.limit,
+        min_year=args.min_year,
+        max_year=args.max_year,
+        genres=args.genres,
+        exclude_genres=args.exclude_genres,
+        min_rating=args.min_rating,
+        diversity=diversity,
+        max_per_director=max_per_director,
+        username=username,
+        user_lists=lists,
+        profile=profile,
+        weighting_mode=args.weighting_mode,
+    )
+
+
+def _run_collaborative_strategy(
+    user_films: list[dict],
+    all_films: dict[str, dict],
+    args: argparse.Namespace,
+    username: str,
+    user_lists: list[dict] | None,
+    all_user_films: dict[str, list[dict]] | None,
+) -> list[Recommendation]:
+    """Collaborative filtering strategy."""
+    if not all_user_films:
+        logger.error("Collaborative strategy requires all user data.")
+        return []
+
+    recommender = CollaborativeRecommender(all_user_films, all_films)
+    return recommender.recommend(
+        username,
+        n=args.limit,
+        min_year=args.min_year,
+        max_year=args.max_year,
+        genres=args.genres,
+        exclude_genres=args.exclude_genres
+    )
+
+
+def _run_hybrid_strategy(
+    user_films: list[dict],
+    all_films: dict[str, dict],
+    args: argparse.Namespace,
+    username: str,
+    user_lists: list[dict] | None,
+    all_user_films: dict[str, list[dict]] | None,
+) -> list[Recommendation]:
+    """Hybrid metadata + collaborative strategy."""
+    if not all_user_films:
+        logger.error("Hybrid strategy requires all user data.")
+        return []
+
+    meta_rec = MetadataRecommender(list(all_films.values()))
+    collab_rec = CollaborativeRecommender(all_user_films, all_films)
+
+    rated_count = sum(1 for f in user_films if f.get('rating'))
+    meta_weight = args.hybrid_meta_weight
+    collab_weight = args.hybrid_collab_weight
+
+    if meta_weight is None and collab_weight is None:
+        # Heuristic: lean on metadata when user data or neighbors are sparse
+        if len(all_user_films) < 10 or rated_count < 20:
+            meta_weight = 0.7
+            collab_weight = 0.3
         else:
-            all_films = all_films_filtered
+            meta_weight = 0.6
+            collab_weight = 0.4
+    else:
+        # If only one is provided, derive the other to preserve user intent
+        if meta_weight is None:
+            meta_weight = max(0.0, 1.0 - collab_weight) if collab_weight is not None else 0.6
+        if collab_weight is None:
+            collab_weight = max(0.0, 1.0 - meta_weight) if meta_weight is not None else 0.4
 
-        # Check for missing metadata
-        seen_slugs = {f['slug'] for f in user_films}
-        missing_slugs = seen_slugs - set(all_films.keys())
-        if missing_slugs:
-            logger.warning(f"Missing metadata for {len(missing_slugs)} films in {username}'s history. Consider running 'scrape' again.")
+    meta_recs = meta_rec.recommend(
+        user_films,
+        n=args.limit * 2,
+        min_year=args.min_year,
+        max_year=args.max_year,
+        genres=args.genres,
+        exclude_genres=args.exclude_genres,
+        min_rating=args.min_rating,
+        username=username,
+        weighting_mode=args.weighting_mode,
+    )
+    collab_recs = collab_rec.recommend(
+        username,
+        n=args.limit * 2,
+        min_year=args.min_year,
+        max_year=args.max_year,
+        genres=args.genres,
+        exclude_genres=args.exclude_genres
+    )
 
-        if strategy == 'hybrid':
-            # Hybrid: combine metadata and collaborative (all_user_films already loaded)
-            
-            # Get recommendations from both strategies
-            meta_rec = MetadataRecommender(list(all_films.values()))
-            collab_rec = CollaborativeRecommender(all_user_films, all_films)
+    ranked = _fuse_normalized(meta_recs, collab_recs, weight_meta=meta_weight, weight_collab=collab_weight)
 
-            rated_count = sum(1 for f in user_films if f.get('rating'))
-            meta_weight = args.hybrid_meta_weight
-            collab_weight = args.hybrid_collab_weight
+    max_per_director = getattr(args, 'max_per_director', 2)
+    apply_diversity = bool(getattr(args, 'hybrid_diversity', False))
+    director_counts = defaultdict(int)
 
-            if meta_weight is None and collab_weight is None:
-                # Heuristic: lean on metadata when user data or neighbors are sparse
-                if len(all_user_films) < 10 or rated_count < 20:
-                    meta_weight = 0.7
-                    collab_weight = 0.3
-                else:
-                    meta_weight = 0.6
-                    collab_weight = 0.4
-            else:
-                # If only one is provided, derive the other to preserve user intent
-                if meta_weight is None:
-                    meta_weight = max(0.0, 1.0 - collab_weight) if collab_weight is not None else 0.6
-                if collab_weight is None:
-                    collab_weight = max(0.0, 1.0 - meta_weight) if meta_weight is not None else 0.4
-            
-            meta_recs = meta_rec.recommend(
-                user_films,
-                n=args.limit * 2,
-                min_year=args.min_year,
-                max_year=args.max_year,
-                genres=args.genres,
-                exclude_genres=args.exclude_genres,
-                min_rating=args.min_rating,
-                username=username,
-                weighting_mode=args.weighting_mode,
-            )
-            collab_recs = collab_rec.recommend(
-                username,
-                n=args.limit * 2,
-                min_year=args.min_year,
-                max_year=args.max_year,
-                genres=args.genres,
-                exclude_genres=args.exclude_genres
-            )
-            
-            # Score-based fusion with normalization to preserve magnitude
-            ranked = _fuse_normalized(meta_recs, collab_recs, weight_meta=meta_weight, weight_collab=collab_weight)
+    recs: list[Recommendation] = []
+    for slug, score, reasons in ranked:
+        film = all_films.get(slug)
+        if not film:
+            continue
 
-            max_per_director = getattr(args, 'max_per_director', 2)
-            apply_diversity = bool(getattr(args, 'hybrid_diversity', False))
-            director_counts = defaultdict(int)
+        directors = load_json(film.get('directors'))
+        if apply_diversity and max_per_director and directors:
+            if any(director_counts[d] >= max_per_director for d in directors):
+                continue
 
-            recs = []
-            for slug, score, reasons in ranked:
-                film = all_films.get(slug)
-                if not film:
-                    continue
+        recs.append(Recommendation(
+            slug=slug,
+            title=film.get('title', slug),
+            year=film.get('year'),
+            score=score,
+            reasons=list(dict.fromkeys(reasons))[:3]
+        ))
 
-                directors = load_json(film.get('directors'))
-                if apply_diversity and max_per_director and directors:
-                    if any(director_counts[d] >= max_per_director for d in directors):
-                        continue
+        for d in directors:
+            director_counts[d] += 1
 
-                recs.append(Recommendation(
-                    slug=slug,
-                    title=film.get('title', slug),
-                    year=film.get('year'),
-                    score=score,
-                    reasons=list(dict.fromkeys(reasons))[:3]
-                ))
+        if len(recs) >= args.limit:
+            break
 
-                for d in directors:
-                    director_counts[d] += 1
+    return recs
 
-                if len(recs) >= args.limit:
-                    break
-                    
-        elif strategy == 'collaborative':
-            # Collaborative: all_user_films already loaded above
-            recommender = CollaborativeRecommender(all_user_films, all_films)
-            recs = recommender.recommend(
-                username,
-                n=args.limit,
-                min_year=args.min_year,
-                max_year=args.max_year,
-                genres=args.genres,
-                exclude_genres=args.exclude_genres
-            )
-        elif strategy == 'svd':        
-            # SVD needs all users' data
-            all_user_films = _load_all_user_films(conn)
-            
-            if username not in all_user_films:
-                logger.error(f"No data for '{username}'.")
-                return
-            
-            # Check minimum data requirements
-            n_users = len(all_user_films)
-            n_ratings = sum(
-                1 for films in all_user_films.values() 
-                for f in films if f.get('rating')
-            )
-            
-            if n_users < 10 or n_ratings < 100:
-                logger.warning(f"SVD works best with more data (have {n_users} users, {n_ratings} ratings). "
-                            f"Consider using 'metadata' strategy or running 'discover' to add more users.")
-            
-            # Try loading cached SVD model first
-            cache_path = SVD_CACHE_PATH
-            n_factors = min(50, n_users - 1)
-            use_implicit = True
-            implicit_weight = 0.3
-            fingerprint = SVDRecommender.compute_fingerprint(
-                all_user_films,
-                hyperparams={
-                    "n_factors": n_factors,
-                    "use_implicit": use_implicit,
-                    "implicit_weight": implicit_weight,
-                },
-            )
-            svd = SVDRecommender.load(cache_path, expected_fingerprint=fingerprint)
 
-            if svd:
-                logger.info(f"Using cached SVD model ({n_users} users, {n_ratings} ratings).")
-            else:
-                logger.info(f"Fitting SVD model on {n_users} users...")
-                svd = SVDRecommender(n_factors=n_factors, use_implicit=use_implicit, implicit_weight=implicit_weight)
-                try:
-                    svd.fit(all_user_films)
-                except ValueError as e:
-                    logger.error(f"Unable to fit SVD model: {e}")
-                    logger.error("Try the 'metadata' strategy or add more rated films.")
-                    return
+def _run_svd_strategy(
+    user_films: list[dict],
+    all_films: dict[str, dict],
+    args: argparse.Namespace,
+    username: str,
+    user_lists: list[dict] | None,
+    all_user_films: dict[str, list[dict]] | None,
+) -> list[Recommendation]:
+    """Matrix factorization (SVD) strategy."""
+    if not all_user_films:
+        logger.error("SVD strategy requires all user data.")
+        return []
 
-                cache_metadata = {
-                    "fingerprint": fingerprint,
-                    "n_users": n_users,
-                    "n_items": len(svd.item_index) if svd.item_index else 0,
-                    "n_ratings": n_ratings,
-                    "hyperparams": {
-                        "n_factors": n_factors,
-                        "use_implicit": use_implicit,
-                        "implicit_weight": implicit_weight,
-                    },
-                }
-                svd.save(cache_path, metadata=cache_metadata)
-            
-            # Get seen films for filtering
-            seen_slugs = {f['slug'] for f in user_films}
-            
-            # Get raw recommendations (slug, predicted_rating)
-            svd_recs = svd.recommend(username, seen_slugs, n=args.limit * 3)
-            
-            # Apply filters and build Recommendation objects
-            recs = []
-            for slug, predicted_rating in svd_recs:
-                if slug not in all_films:
-                    continue
-                
-                film = all_films[slug]
-                
-                # Apply year filters
-                year = film.get('year')
-                if args.min_year and year and year < args.min_year:
-                    continue
-                if args.max_year and year and year > args.max_year:
-                    continue
-                
-                # Apply genre filters
-                film_genres = load_json(film.get('genres', []))
-                if args.genres:
-                    genres_lower = [g.lower() for g in args.genres]
-                    if not any(g in film_genres for g in genres_lower):
-                        continue
-                if args.exclude_genres:
-                    exclude_lower = [g.lower() for g in args.exclude_genres]
-                    if any(g in film_genres for g in exclude_lower):
-                        continue
-                
-                # Apply rating filter
-                if args.min_rating and film.get('avg_rating') and film['avg_rating'] < args.min_rating:
-                    continue
-                
-                recs.append(Recommendation(
-                    slug=slug,
-                    title=film.get('title', slug),
-                    year=year,
-                    score=predicted_rating,
-                    reasons=[f"Predicted rating: {predicted_rating:.1f}★"]
-                ))
-                
-                if len(recs) >= args.limit:
-                    break
-        else:
-            # Metadata-based (default)
-            diversity = getattr(args, 'diversity', False)
-            max_per_director = getattr(args, 'max_per_director', 2)
-            use_temporal_decay = not getattr(args, 'no_temporal_decay', False)
-            # Load user lists for profile building
-            user_lists = load_user_lists(username)
+    if username not in all_user_films:
+        logger.error(f"No data for '{username}'.")
+        return []
 
-            # Build profile with temporal decay support
-            from .profile import build_profile
-            profile = build_profile(
-                user_films,
-                all_films,
-                user_lists=user_lists,
-                username=username,
-                use_temporal_decay=use_temporal_decay,
-                weighting_mode=args.weighting_mode,
-            )
+    n_users = len(all_user_films)
+    n_ratings = sum(
+        1 for films in all_user_films.values()
+        for f in films if f.get('rating')
+    )
 
-            recommender = MetadataRecommender(list(all_films.values()))
-            recs = recommender.recommend(
-                user_films,
-                n=args.limit,
-                min_year=args.min_year,
-                max_year=args.max_year,
-                genres=args.genres,
-                exclude_genres=args.exclude_genres,
-                min_rating=args.min_rating,
-                diversity=diversity,
-                max_per_director=max_per_director,
-                username=username,
-                user_lists=user_lists,
-                profile=profile,
-                weighting_mode=args.weighting_mode,
-            )
-    
-    # Format results
+    if n_users < 10 or n_ratings < 100:
+        logger.warning(
+            f"SVD works best with more data (have {n_users} users, {n_ratings} ratings). "
+            "Consider using 'metadata' strategy or running 'discover' to add more users."
+        )
+
+    cache_path = SVD_CACHE_PATH
+    n_factors = min(50, n_users - 1)
+    use_implicit = True
+    implicit_weight = 0.3
+    fingerprint = SVDRecommender.compute_fingerprint(
+        all_user_films,
+        hyperparams={
+            "n_factors": n_factors,
+            "use_implicit": use_implicit,
+            "implicit_weight": implicit_weight,
+        },
+    )
+    svd = SVDRecommender.load(cache_path, expected_fingerprint=fingerprint)
+
+    if svd:
+        logger.info(f"Using cached SVD model ({n_users} users, {n_ratings} ratings).")
+    else:
+        logger.info(f"Fitting SVD model on {n_users} users...")
+        svd = SVDRecommender(n_factors=n_factors, use_implicit=use_implicit, implicit_weight=implicit_weight)
+        try:
+            svd.fit(all_user_films)
+        except ValueError as e:
+            logger.error(f"Unable to fit SVD model: {e}")
+            logger.error("Try the 'metadata' strategy or add more rated films.")
+            return []
+
+        cache_metadata = {
+            "fingerprint": fingerprint,
+            "n_users": n_users,
+            "n_items": len(svd.item_index) if svd.item_index else 0,
+            "n_ratings": n_ratings,
+            "hyperparams": {
+                "n_factors": n_factors,
+                "use_implicit": use_implicit,
+                "implicit_weight": implicit_weight,
+            },
+        }
+        svd.save(cache_path, metadata=cache_metadata)
+
+    seen_slugs = {f['slug'] for f in user_films}
+    svd_recs = svd.recommend(username, seen_slugs, n=args.limit * 3)
+
+    recs: list[Recommendation] = []
+    for slug, predicted_rating in svd_recs:
+        if slug not in all_films:
+            continue
+
+        film = all_films[slug]
+
+        year = film.get('year')
+        if args.min_year and year and year < args.min_year:
+            continue
+        if args.max_year and year and year > args.max_year:
+            continue
+
+        film_genres = load_json(film.get('genres', []))
+        if args.genres:
+            genres_lower = [g.lower() for g in args.genres]
+            if not any(g in film_genres for g in genres_lower):
+                continue
+        if args.exclude_genres:
+            exclude_lower = [g.lower() for g in args.exclude_genres]
+            if any(g in film_genres for g in exclude_lower):
+                continue
+
+        if args.min_rating and film.get('avg_rating') and film['avg_rating'] < args.min_rating:
+            continue
+
+        recs.append(Recommendation(
+            slug=slug,
+            title=film.get('title', slug),
+            year=year,
+            score=predicted_rating,
+            reasons=[f"Predicted rating: {predicted_rating:.1f}★"]
+        ))
+
+        if len(recs) >= args.limit:
+            break
+
+    return recs
+
+
+def _output_recommendations(
+    recs: list[Recommendation],
+    all_films: dict[str, dict],
+    args: argparse.Namespace,
+    username: str,
+    strategy: str,
+) -> None:
+    """Format and log recommendations in the requested format."""
+    recs = recs or []
     output_format = getattr(args, 'format', 'text')
     if output_format == 'json':
         output = []
@@ -1282,6 +1354,130 @@ def cmd_recommend(args: argparse.Namespace) -> None:
         for i, r in enumerate(recs, 1):
             logger.info(f"{i}. {r.title} ({r.year}) - Score: {r.score:.1f}")
             logger.info(f"   Why: {', '.join(r.reasons)}")
+
+
+def cmd_jam(args: argparse.Namespace) -> None:
+    """Generate recommendations for a group watch session."""
+    usernames = [_validate_username(u) for u in args.usernames]
+
+    if len(usernames) < 2:
+        logger.error("Need at least 2 usernames for group recommendations")
+        return
+
+    weights = _parse_weights(getattr(args, "weights", None))
+
+    logger.info(f"\n🎬 Film Jam: Finding movies for {', '.join(usernames)}\n")
+
+    try:
+        recs, group_info = recommend_for_group(
+            usernames,
+            n=args.limit,
+            strategy=args.strategy,
+            min_year=args.min_year,
+            max_year=args.max_year,
+            genres=args.genres,
+            exclude_divisive=not args.include_divisive,
+            weights=weights,
+        )
+    except ValueError as exc:  # e.g., not enough valid users
+        logger.error(str(exc))
+        return
+
+    if args.format == "json":
+        import json
+
+        output = [
+            {
+                "title": rec.title,
+                "year": rec.year,
+                "slug": rec.slug,
+                "group_score": round(rec.group_score, 2),
+                "user_scores": {k: round(v, 2) for k, v in rec.user_scores.items()},
+                "agreement": round(rec.agreement_score, 2),
+                "unanimous": rec.is_unanimous,
+                "reasons": rec.consensus_reasons,
+                "url": f"https://letterboxd.com/film/{rec.slug}/",
+            }
+            for rec in recs
+        ]
+        print(json.dumps({"group_info": group_info, "recommendations": output}, indent=2))
+        return
+
+    logger.info("Group Dynamics:")
+    logger.info(
+        f"  Compatibility: {group_info['overall_compatibility']} - "
+        f"{group_info['compatibility_label']}"
+    )
+
+    if group_info.get("consensus_genres"):
+        logger.info(f"  You all like: {', '.join(group_info['consensus_genres'])}")
+
+    if group_info.get("divisive_genres"):
+        logger.info(f"  Mixed feelings on: {', '.join(group_info['divisive_genres'])}")
+
+    if group_info.get("best_pair"):
+        logger.info(f"  Best match: {group_info['best_pair']}")
+
+    if group_info.get("challenging_pair"):
+        logger.info(f"  Most different: {group_info['challenging_pair']}")
+
+    logger.info(f"  💡 {group_info['recommendation']}")
+
+    if group_info.get("shared_watchlist_count", 0) > 0:
+        logger.info(
+            f"  📋 {group_info['shared_watchlist_count']} films on multiple watchlists"
+        )
+
+    logger.info(f"\n{'=' * 60}")
+    logger.info(f"Top {len(recs)} Films for Your Group:")
+    logger.info(f"{'=' * 60}\n")
+
+    for i, rec in enumerate(recs, 1):
+        unanimous = "✓" if rec.is_unanimous else ""
+        logger.info(f"{i}. {rec.title} ({rec.year}) {unanimous}")
+        logger.info(
+            f"   Group Score: {rec.group_score:.1f} | Agreement: {rec.agreement_score:.0%}"
+        )
+
+        score_parts = [f"{user}: {score:.1f}" for user, score in rec.user_scores.items()]
+        logger.info(f"   Individual: {' | '.join(score_parts)}")
+
+        if rec.consensus_reasons:
+            logger.info(f"   Why: {', '.join(rec.consensus_reasons)}")
+
+        for warning in rec.warnings:
+            logger.info(f"   {warning}")
+
+        logger.info("")
+
+
+def cmd_recommend(args: argparse.Namespace) -> None:
+    """Generate recommendations."""
+    username = _validate_username(args.username)
+    strategy = getattr(args, 'strategy', 'metadata')
+
+    with get_db() as conn:
+        user_films, all_films, all_user_films, user_lists = _load_recommendation_data(
+            conn, username, strategy, args
+        )
+
+    if not user_films:
+        logger.error(f"No data for '{username}'. Run: python main.py scrape {username}")
+        return
+
+    _warn_missing_metadata(user_films, all_films, username)
+
+    strategy_handlers = {
+        'metadata': _run_metadata_strategy,
+        'collaborative': _run_collaborative_strategy,
+        'hybrid': _run_hybrid_strategy,
+        'svd': _run_svd_strategy,
+    }
+
+    handler = strategy_handlers[strategy]
+    recs = handler(user_films, all_films, args, username, user_lists, all_user_films)
+
+    _output_recommendations(recs, all_films, args, username, strategy)
 
 
 def cmd_stats(args: argparse.Namespace) -> None:
@@ -1694,6 +1890,53 @@ def cmd_prune_pending(args: argparse.Namespace) -> None:
     logger.info(f"Pruned {removed} pending users")
 
 
+def setup_jam_parser(subparsers):
+    jam_parser = subparsers.add_parser(
+        "jam",
+        help="Generate recommendations for a group watch session",
+        description="Find films that work for everyone in your watch party",
+    )
+    jam_parser.add_argument(
+        "usernames",
+        nargs="+",
+        help="Letterboxd usernames (at least 2)",
+    )
+    jam_parser.add_argument(
+        "--strategy",
+        choices=[
+            "least_misery",
+            "most_pleasure",
+            "average",
+            "fairness",
+            "approval",
+            "multiplicative",
+        ],
+        default="fairness",
+        help="How to combine preferences (default: fairness)",
+    )
+    jam_parser.add_argument("--limit", type=int, default=15, help="Number of recommendations")
+    jam_parser.add_argument("--min-year", type=int, help="Minimum release year")
+    jam_parser.add_argument("--max-year", type=int, help="Maximum release year")
+    jam_parser.add_argument("--genres", nargs="+", help="Required genres")
+    jam_parser.add_argument(
+        "--include-divisive",
+        action="store_true",
+        help="Include films with divisive genres/directors",
+    )
+    jam_parser.add_argument(
+        "--format",
+        choices=["text", "json"],
+        default="text",
+        help="Output format",
+    )
+    jam_parser.add_argument(
+        "--weights",
+        nargs="+",
+        help="User weights as user:weight pairs (e.g., alex:2.0 for birthday person)",
+    )
+    jam_parser.set_defaults(func=cmd_jam)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Letterboxd Recommender")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
@@ -1781,6 +2024,9 @@ def main():
     rec_parser.add_argument("--format", choices=['text', 'json', 'markdown', 'csv'], default='text',
                             help="Output format")
     rec_parser.set_defaults(func=cmd_recommend)
+    
+    # Group recommendation command
+    setup_jam_parser(subparsers)
     
     # Stats command
     stats_parser = subparsers.add_parser("stats", help="Show database statistics")
