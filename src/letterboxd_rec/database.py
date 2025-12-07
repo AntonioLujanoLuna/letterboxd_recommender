@@ -3,12 +3,66 @@ import json
 import logging
 import threading
 import time
+import random
+from typing import Any, Callable
 from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime
 from .config import DB_PATH, MIGRATIONS_PATH, MIGRATION_VERSION_TABLE
 
 logger = logging.getLogger(__name__)
+
+_LOCK_RETRY_ATTEMPTS = 5
+_LOCK_RETRY_BASE_DELAY = 0.1
+_LOCK_RETRY_MAX_DELAY = 1.0
+
+
+def _is_lock_error(exc: sqlite3.OperationalError) -> bool:
+    """Check if the OperationalError corresponds to a SQLite lock/busy."""
+    msg = str(exc).lower()
+    return "database is locked" in msg or "database is busy" in msg
+
+
+def _execute_with_retry(fn: Callable[[], Any], *, attempts: int = _LOCK_RETRY_ATTEMPTS) -> Any:
+    """
+    Run a DB operation with small exponential backoff on SQLite lock.
+
+    Retries only for OperationalError that indicates the database is locked/busy.
+    """
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except sqlite3.OperationalError as exc:  # pragma: no cover - timing dependent
+            if not _is_lock_error(exc):
+                raise
+            if attempt == attempts - 1:
+                raise
+
+            delay = min(
+                _LOCK_RETRY_MAX_DELAY,
+                _LOCK_RETRY_BASE_DELAY * (2**attempt),
+            ) + random.uniform(0, _LOCK_RETRY_BASE_DELAY)
+            logger.warning(
+                f"SQLite locked; retrying in {delay:.2f}s "
+                f"(attempt {attempt + 1}/{attempts})"
+            )
+            time.sleep(delay)
+
+
+class RetryConnection(sqlite3.Connection):
+    """SQLite connection that retries on database-locked errors."""
+
+    def execute(self, sql, parameters=(), /):
+        return _execute_with_retry(lambda: super().execute(sql, parameters))
+
+    def executemany(self, sql, seq_of_parameters, /):
+        return _execute_with_retry(lambda: super().executemany(sql, seq_of_parameters))
+
+    def executescript(self, sql_script, /):
+        return _execute_with_retry(lambda: super().executescript(sql_script))
+
+    def commit(self):
+        return _execute_with_retry(lambda: super().commit())
 
 
 def parse_timestamp_naive(timestamp_str: str) -> datetime:
@@ -50,7 +104,11 @@ class ConnectionPool:
 
     def _create_connection(self) -> sqlite3.Connection:
         """Create a new database connection with optimal settings."""
-        conn = sqlite3.connect(self._db_path, check_same_thread=False)
+        conn = sqlite3.connect(
+            self._db_path,
+            check_same_thread=False,
+            factory=RetryConnection,
+        )
         conn.row_factory = sqlite3.Row
 
         # Performance optimizations
