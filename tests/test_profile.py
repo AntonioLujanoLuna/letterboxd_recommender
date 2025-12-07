@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 
 
 def test_profile_weights_lists_and_interactions(fresh_recommender_modules):
@@ -167,3 +167,64 @@ def test_weighting_modes_normalized_and_blended(fresh_recommender_modules):
     )
     assert blended_profile.genres["top-genre"] > blended_profile.genres["low-genre"]
 
+
+def test_preference_momentum_detects_recent_shift(fresh_recommender_modules):
+    _, profile, _ = fresh_recommender_modules
+
+    now = datetime.now()
+    recent = now - timedelta(days=10)
+    older = now - timedelta(days=400)
+    film_metadata = {
+        "old1": {"slug": "old1", "genres": ["horror"], "directors": [], "cast": [], "themes": [], "languages": [], "writers": [], "cinematographers": [], "composers": [], "countries": [], "year": 2010},
+        "old2": {"slug": "old2", "genres": ["horror"], "directors": [], "cast": [], "themes": [], "languages": [], "writers": [], "cinematographers": [], "composers": [], "countries": [], "year": 2011},
+        "new1": {"slug": "new1", "genres": ["horror"], "directors": [], "cast": [], "themes": [], "languages": [], "writers": [], "cinematographers": [], "composers": [], "countries": [], "year": 2024},
+        "new2": {"slug": "new2", "genres": ["horror"], "directors": [], "cast": [], "themes": [], "languages": [], "writers": [], "cinematographers": [], "composers": [], "countries": [], "year": 2024},
+    }
+
+    user_films = [
+        {"slug": "old1", "rating": 2.0, "watched": True, "scraped_at": older.isoformat()},
+        {"slug": "old2", "rating": 2.5, "watched": True, "scraped_at": (older + timedelta(days=20)).isoformat()},
+        {"slug": "new1", "rating": 5.0, "watched": True, "scraped_at": recent.isoformat()},
+        {"slug": "new2", "rating": 4.5, "watched": True, "scraped_at": (recent + timedelta(days=1)).isoformat()},
+    ]
+
+    profile_obj = profile.build_profile(
+        user_films,
+        film_metadata,
+        use_temporal_decay=False,
+    )
+
+    momentum = profile_obj.preference_momentum.get("genre:horror")
+    assert momentum is not None
+    assert momentum >= 0  # recent ratings should not decrease momentum
+
+
+def test_genre_interactions_capture_combo_penalty(fresh_recommender_modules):
+    _, profile, _ = fresh_recommender_modules
+
+    film_metadata = {
+        "pair": {"slug": "pair", "genres": ["horror", "comedy"], "directors": [], "cast": [], "themes": [], "languages": [], "writers": [], "cinematographers": [], "composers": [], "countries": [], "year": 2020},
+        "pair2": {"slug": "pair2", "genres": ["horror", "comedy"], "directors": [], "cast": [], "themes": [], "languages": [], "writers": [], "cinematographers": [], "composers": [], "countries": [], "year": 2020},
+        "pair3": {"slug": "pair3", "genres": ["horror", "comedy"], "directors": [], "cast": [], "themes": [], "languages": [], "writers": [], "cinematographers": [], "composers": [], "countries": [], "year": 2020},
+        "horror": {"slug": "horror", "genres": ["horror"], "directors": [], "cast": [], "themes": [], "languages": [], "writers": [], "cinematographers": [], "composers": [], "countries": [], "year": 2020},
+        "comedy": {"slug": "comedy", "genres": ["comedy"], "directors": [], "cast": [], "themes": [], "languages": [], "writers": [], "cinematographers": [], "composers": [], "countries": [], "year": 2020},
+    }
+
+    user_films = [
+        {"slug": "pair", "rating": 2.0, "watched": True},
+        {"slug": "pair2", "rating": 2.5, "watched": True},
+        {"slug": "pair3", "rating": 1.5, "watched": True},
+        {"slug": "horror", "rating": 4.0, "watched": True},
+        {"slug": "comedy", "rating": 4.0, "watched": True},
+    ]
+
+    profile_obj = profile.build_profile(
+        user_films,
+        film_metadata,
+        use_temporal_decay=False,
+    )
+
+    interactions = profile_obj.genre_interactions
+    combo_key = "comedy|horror"
+    assert combo_key in interactions
+    assert interactions[combo_key] < 0  # disliked combo compared to singles

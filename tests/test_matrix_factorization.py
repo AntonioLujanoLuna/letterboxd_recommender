@@ -54,3 +54,14 @@ def test_svd_load_rejects_mismatched_fingerprint(tmp_path):
     wrong_fp = {"n_users": 99, "n_items": 1, "n_ratings": 2}
     assert SVDRecommender.load(cache_path, expected_fingerprint=wrong_fp) is None
 
+
+def test_svd_recommend_handles_unfitted_and_missing_cache(tmp_path):
+    svd = SVDRecommender(n_factors=1)
+
+    # Unfitted recommend should return empty without raising
+    recs = svd.recommend("alice", seen_slugs=set(), n=3)
+    assert recs == []
+
+    # load gracefully returns None when cache missing
+    missing_path = tmp_path / "does_not_exist.npz"
+    assert SVDRecommender.load(missing_path) is None

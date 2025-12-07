@@ -14,6 +14,7 @@ from .database import (
     get_pending_users, remove_pending_user, get_pending_queue_stats,
     compute_and_store_idf, populate_normalized_tables_batch, close_pool, run_maintenance,
     create_scrape_session, update_session_progress, complete_session, get_session_history,
+    load_films_by_attribute, update_idf_incremental,
 )
 from .config import (
     DISCOVERY_PRIORITY_MAP,
@@ -32,7 +33,7 @@ from .config import (
 from .scraper import LetterboxdScraper, AsyncLetterboxdScraper
 from .recommender import MetadataRecommender, CollaborativeRecommender, Recommendation, _fuse_normalized
 from .matrix_factorization import SVDRecommender
-from .profile import build_profile
+from .profile import build_profile, UserProfile
 from .group_recommender import recommend_for_group
 from tqdm import tqdm
 import asyncio
@@ -241,6 +242,10 @@ def _scrape_film_metadata(
 
         logger.info(f"Saved {len(metadata_list)} films")
 
+        # Incrementally update IDF scores for new films
+        new_slugs = [m.slug for m in metadata_list]
+        update_idf_incremental(new_slugs)
+
 
 async def _scrape_film_metadata_async(
     async_scraper: 'AsyncLetterboxdScraper',
@@ -278,8 +283,42 @@ async def _scrape_film_metadata_async(
             ) for m in metadata_list])
             populate_normalized_tables_batch(conn, metadata_list)
 
+        # Incrementally update IDF scores
+        new_slugs = [m.slug for m in metadata_list]
+        update_idf_incremental(new_slugs)
+
     await asyncio.to_thread(_persist)
     logger.info(f"Saved {len(metadata_list)} films")
+
+
+def cmd_explore(args: argparse.Namespace) -> None:
+    """Explore films by attribute (director, genre, actor)."""
+    init_db()
+    
+    results = load_films_by_attribute(
+        args.attribute_type,
+        [args.value],
+        limit_per_value=args.limit
+    )
+    
+    films = results.get(args.value, [])
+    if not films:
+        logger.info(f"No films found for {args.attribute_type}: {args.value}")
+        return
+    
+    logger.info(f"\nTop {len(films)} films for {args.attribute_type} '{args.value}':")
+    logger.info("-" * 50)
+    
+    for i, film in enumerate(films, 1):
+        title = film.get('title', film.get('slug', 'Unknown'))
+        year = film.get('year', '?')
+        rating = film.get('avg_rating') or 0
+        rating_count = film.get('rating_count') or 0
+        
+        rating_str = f"{rating:.1f}★" if rating else "N/A"
+        count_str = f"({rating_count:,} ratings)" if rating_count else ""
+        
+        logger.info(f"  {i:2}. {title} ({year}) - {rating_str} {count_str}")
 
 def cmd_scrape(args: argparse.Namespace) -> None:
     """Scrape a user's Letterboxd data."""
@@ -582,7 +621,15 @@ def cmd_discover(args: argparse.Namespace) -> None:
 
         for username in tqdm(usernames_to_scrape, desc="Users"):
             try:
-                interactions = scraper.scrape_user(username)
+                # Use smart scraping when we have activity info
+                activity = scraper.check_user_activity(username)
+                if activity and activity.get('film_count'):
+                    interactions = scraper.scrape_user_smart(
+                        username, 
+                        known_film_count=activity['film_count']
+                    )
+                else:
+                    interactions = scraper.scrape_user(username)
 
                 if not interactions:
                     logger.warning(f"No interactions found for {username}")
@@ -1314,15 +1361,21 @@ def _output_recommendations(
     args: argparse.Namespace,
     username: str,
     strategy: str,
+    recommender: 'MetadataRecommender | None' = None,
+    profile: 'UserProfile | None' = None,
+    user_films: list[dict] | None = None,
 ) -> None:
     """Format and log recommendations in the requested format."""
     recs = recs or []
     output_format = getattr(args, 'format', 'text')
+    explain_mode = getattr(args, 'explain', False)
+    diversity_report = getattr(args, 'diversity_report', False)
+    
     if output_format == 'json':
         output = []
         for r in recs:
             film = all_films.get(r.slug, {})
-            output.append({
+            rec_data = {
                 "title": r.title,
                 "year": r.year,
                 "slug": r.slug,
@@ -1336,24 +1389,124 @@ def _output_recommendations(
                 "countries": load_json(film.get('countries', [])),
                 "avg_rating": film.get('avg_rating'),
                 "rating_count": film.get('rating_count')
-            })
-        logger.info(json.dumps(output, indent=2))
+            }
+            
+            # Add explanation if requested and available
+            if explain_mode and recommender and profile and user_films:
+                explanation = recommender.explain_recommendation_detailed(film, profile, user_films)
+                rec_data["explanation"] = {
+                    "summary": explanation["summary"],
+                    "confidence": explanation["confidence"],
+                    "discovery_potential": explanation["discovery_potential"],
+                    "similar_films_you_liked": explanation["similar_films_you_liked"],
+                    "contribution_breakdown": explanation.get("contribution_breakdown", {}),
+                }
+            
+            output.append(rec_data)
+        
+        # Add diversity metrics if requested
+        if diversity_report and recommender:
+            metrics = recommender.compute_recommendation_diversity(recs)
+            logger.info(json.dumps({"recommendations": output, "diversity": metrics}, indent=2))
+        else:
+            logger.info(json.dumps(output, indent=2))
+            
     elif output_format == 'csv':
         logger.info("Title,Year,URL,Score,Reasons")
         for r in recs:
             reasons = "; ".join(r.reasons).replace('"', '""')
             logger.info(f'"{r.title}",{r.year},https://letterboxd.com/film/{r.slug}/,{r.score:.2f},"{reasons}"')
+            
     elif output_format == 'markdown':
         logger.info(f"\n# Top {len(recs)} recommendations for {username} ({strategy})\n")
         for i, r in enumerate(recs, 1):
             logger.info(f"## {i}. [{r.title} ({r.year})](https://letterboxd.com/film/{r.slug}/)")
             logger.info(f"**Score**: {r.score:.1f}  ")
             logger.info(f"**Why**: {', '.join(r.reasons)}\n")
-    else:
+            
+    else:  # text format
         logger.info(f"\nTop {len(recs)} recommendations for {username} ({strategy}):")
+        
         for i, r in enumerate(recs, 1):
             logger.info(f"{i}. {r.title} ({r.year}) - Score: {r.score:.1f}")
             logger.info(f"   Why: {', '.join(r.reasons)}")
+            
+            # Detailed explanation if requested
+            if explain_mode and recommender and profile and user_films:
+                film = all_films.get(r.slug, {})
+                explanation = recommender.explain_recommendation_detailed(film, profile, user_films)
+                
+                logger.info(f"   Confidence: {explanation['confidence']:.0%}")
+                logger.info(f"   Discovery: {explanation['discovery_potential']}")
+                
+                if explanation['similar_films_you_liked']:
+                    similar = explanation['similar_films_you_liked'][0]
+                    rating_str = f" (you rated {similar['your_rating']}★)" if similar.get('your_rating') else ""
+                    logger.info(f"   Because you liked: {similar['title']}{rating_str} - {similar['connection']}")
+                
+                if explanation.get('counterfactuals'):
+                    logger.info(f"   Note: {explanation['counterfactuals'][0]}")
+                
+                logger.info("")  # Blank line between detailed entries
+    
+    # Diversity report at the end
+    if diversity_report and recommender and output_format != 'json':
+        metrics = recommender.compute_recommendation_diversity(recs)
+        logger.info(f"\n{'=' * 50}")
+        logger.info("Diversity Report:")
+        logger.info(f"  Overall diversity: {metrics['diversity_score']:.0%}")
+        logger.info(f"  Genres: {metrics['unique_genres']} unique ({metrics['genre_diversity']:.0%} entropy)")
+        logger.info(f"  Directors: {metrics['unique_directors']} unique ({metrics['director_diversity']:.0%} entropy)")
+        logger.info(f"  Countries: {metrics['unique_countries']} unique ({metrics['country_diversity']:.0%} entropy)")
+        if metrics['decade_range']:
+            logger.info(f"  Decades: {metrics['decade_range'][0]}s to {metrics['decade_range'][1]}s ({metrics['decade_diversity']:.0%} entropy)")
+
+
+def cmd_similar_users(args: argparse.Namespace) -> None:
+    """Find users with similar taste (influencers and followers)."""
+    init_db()
+    username = _validate_username(args.username)
+    
+    with get_db(read_only=True) as conn:
+        all_user_films = _load_all_user_films(conn)
+        all_films = {r['slug']: dict(r) for r in conn.execute("SELECT * FROM films")}
+    
+    if username not in all_user_films:
+        logger.error(f"No data for '{username}'. Run: python main.py scrape {username}")
+        return
+    
+    recommender = CollaborativeRecommender(all_user_films, all_films)
+    influencers, followers = recommender._find_neighbors_asymmetric(username, k=args.limit)
+    
+    if influencers:
+        logger.info(f"\nInfluencers (users whose taste predicts yours):")
+        logger.info("-" * 50)
+        for user, score in influencers:
+            film_count = len(all_user_films.get(user, []))
+            logger.info(f"  {user}: {score:.2f} similarity ({film_count} films)")
+    else:
+        logger.info("\nNo influencers found with sufficient overlap.")
+    
+    if followers:
+        logger.info(f"\nFollowers (users who share your taste):")
+        logger.info("-" * 50)
+        for user, score in followers:
+            film_count = len(all_user_films.get(user, []))
+            logger.info(f"  {user}: {score:.2f} similarity ({film_count} films)")
+    else:
+        logger.info("\nNo followers found with sufficient overlap.")
+    
+    # Optionally show taste compatibility summary
+    if args.verbose and (influencers or followers):
+        logger.info(f"\nTaste Network Summary for {username}:")
+        logger.info(f"  Total users in database: {len(all_user_films)}")
+        logger.info(f"  Influencers found: {len(influencers)}")
+        logger.info(f"  Followers found: {len(followers)}")
+        
+        if influencers:
+            top_influencer = influencers[0][0]
+            logger.info(f"  Closest influencer: {top_influencer}")
+            logger.info(f"  Tip: Check what {top_influencer} has rated highly that you haven't seen!")
 
 
 def cmd_jam(args: argparse.Namespace) -> None:
@@ -1477,7 +1630,25 @@ def cmd_recommend(args: argparse.Namespace) -> None:
     handler = strategy_handlers[strategy]
     recs = handler(user_films, all_films, args, username, user_lists, all_user_films)
 
-    _output_recommendations(recs, all_films, args, username, strategy)
+    # Build recommender and profile for explanations if needed
+    recommender = None
+    profile = None
+    if getattr(args, 'explain', False) or getattr(args, 'diversity_report', False):
+        recommender = MetadataRecommender(list(all_films.values()))
+        profile = build_profile(
+            user_films,
+            all_films,
+            user_lists=user_lists,
+            username=username,
+            weighting_mode=args.weighting_mode,
+        )
+
+    _output_recommendations(
+        recs, all_films, args, username, strategy,
+        recommender=recommender,
+        profile=profile,
+        user_films=user_films,
+    )
 
 
 def cmd_stats(args: argparse.Namespace) -> None:
@@ -2023,7 +2194,30 @@ def main():
     rec_parser.add_argument("--hybrid-diversity", action="store_true", help="Apply diversity constraint to hybrid output")
     rec_parser.add_argument("--format", choices=['text', 'json', 'markdown', 'csv'], default='text',
                             help="Output format")
+    rec_parser.add_argument("--explain", action="store_true",
+                            help="Show detailed explanation for each recommendation")
+    rec_parser.add_argument("--diversity-report", action="store_true",
+                            help="Show diversity metrics for the recommendation set")
     rec_parser.set_defaults(func=cmd_recommend)
+    
+    # Explore command
+    explore_parser = subparsers.add_parser("explore", help="Explore films by attribute")
+    explore_parser.add_argument("attribute_type", choices=["director", "genre", "actor"],
+                                 help="Type of attribute to explore")
+    explore_parser.add_argument("value", help="Attribute value (e.g., 'Bong Joon-ho' for director)")
+    explore_parser.add_argument("--limit", type=int, default=20,
+                                 help="Number of films to show (default: 20)")
+    explore_parser.set_defaults(func=cmd_explore)
+
+    # Similar users command
+    similar_users_parser = subparsers.add_parser("similar-users",
+                                                   help="Find users with similar taste")
+    similar_users_parser.add_argument("username", help="Your Letterboxd username")
+    similar_users_parser.add_argument("--limit", type=int, default=10,
+                                       help="Number of similar users to find")
+    similar_users_parser.add_argument("--verbose", "-v", action="store_true",
+                                       help="Show additional statistics")
+    similar_users_parser.set_defaults(func=cmd_similar_users)
     
     # Group recommendation command
     setup_jam_parser(subparsers)

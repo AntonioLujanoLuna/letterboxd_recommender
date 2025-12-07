@@ -217,3 +217,69 @@ def test_check_user_activity_parses_profile(monkeypatch):
         "has_ratings": True,
         "recent_activity": True,
     }
+
+
+def test_check_user_activity_handles_missing_page(monkeypatch):
+    lb_scraper = scraper.LetterboxdScraper(delay=0.0)
+    monkeypatch.setattr(lb_scraper, "_get_with_soft_block_recovery", lambda url: None)
+    try:
+        assert lb_scraper.check_user_activity("ghost") is None
+    finally:
+        lb_scraper.close()
+
+
+def test_scrape_favorites_collects_showcase(monkeypatch):
+    lb_scraper = scraper.LetterboxdScraper(delay=0.0)
+    sample_html = """
+    <html>
+      <section class="profile-favorites">
+        <li class="poster-container">
+          <div class="react-component" data-film-slug="fav-react"></div>
+        </li>
+        <li class="poster-container">
+          <div data-film-slug="fav-data"></div>
+        </li>
+      </section>
+    </html>
+    """
+    monkeypatch.setattr(lb_scraper, "_get_with_soft_block_recovery", lambda url: HTMLParser(sample_html))
+
+    try:
+        favs = lb_scraper.scrape_favorites("alice")
+    finally:
+        lb_scraper.close()
+
+    assert favs == ["fav-react", "fav-data"]
+
+
+def test_scrape_user_lists_parses_ranked_and_unranked(monkeypatch):
+    lb_scraper = scraper.LetterboxdScraper(delay=0.0)
+
+    page_html = """
+    <html>
+      <section class="list-summary">
+        <h2><a href="/alice/list/best-of-2020/">Best of 2020</a></h2>
+        <span class="icon-numbered"></span>
+      </section>
+      <section class="list-summary">
+        <h3><a href="/alice/list/watchlist/">Watchlist</a></h3>
+      </section>
+    </html>
+    """
+
+    def fake_get(url):
+        if "/lists/page/1/" in url:
+            return HTMLParser(page_html)
+        return None
+
+    monkeypatch.setattr(lb_scraper, "_get_with_soft_block_recovery", fake_get)
+
+    try:
+        lists = lb_scraper.scrape_user_lists("alice", limit=5)
+    finally:
+        lb_scraper.close()
+
+    assert lists[0]["list_slug"] == "best-of-2020"
+    assert lists[0]["is_ranked"] is True
+    assert lists[1]["list_slug"] == "watchlist"
+    assert lists[1]["is_ranked"] is False

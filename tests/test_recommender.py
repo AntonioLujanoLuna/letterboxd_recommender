@@ -250,3 +250,89 @@ def test_negative_penalty_multiplier_by_attribute(fresh_recommender_modules):
     assert score == pytest.approx(expected)
     assert any("Director" in warning for warning in warnings)
 
+
+def test_recommend_from_candidates_uses_tfidf_for_cold_start(fresh_recommender_modules):
+    rec_mod, _, _ = fresh_recommender_modules
+
+    films = [
+        _film("anchor", "Anchor", genres=["sci-fi"], directors=["DirA"]),
+        _film("candidate", "Candidate", genres=["sci-fi"], directors=["DirB"]),
+        _film("other", "Other", genres=["drama"], directors=["DirC"]),
+    ]
+
+    metadata_rec = rec_mod.MetadataRecommender(films, use_idf=False)
+    user_films = [{"slug": "anchor", "watched": True}]
+
+    recs = metadata_rec.recommend_from_candidates(
+        user_films, ["candidate", "other"], n=1, weighting_mode="absolute"
+    )
+
+    assert recs
+    assert recs[0].slug == "candidate"
+    assert "Metadata similarity" in recs[0].reasons[0]
+
+
+def test_find_gaps_returns_essential_missing_films(fresh_recommender_modules):
+    rec_mod, _, _ = fresh_recommender_modules
+
+    films = [
+        _film("seen", "Seen", directors=["DirFav"], avg_rating=4.6, rating_count=5000),
+        _film("gap-main", "Gap Main", directors=["DirFav"], avg_rating=4.8, rating_count=15000),
+        _film("gap-side", "Gap Side", directors=["DirFav"], avg_rating=4.0, rating_count=2000),
+    ]
+
+    metadata_rec = rec_mod.MetadataRecommender(films, use_idf=False)
+    user_films = [{"slug": "seen", "rating": 5.0, "watched": True}]
+
+    gaps = metadata_rec.find_gaps(user_films, min_director_score=1.0, limit_per_director=2)
+
+    assert "DirFav" in gaps
+    rec_slugs = [r.slug for r in gaps["DirFav"]]
+    assert "gap-main" in rec_slugs
+    assert "seen" not in rec_slugs
+    assert rec_slugs[0] == "gap-main"
+
+
+def test_explain_recommendation_detailed_includes_similarity(fresh_recommender_modules):
+    rec_mod, _, _ = fresh_recommender_modules
+
+    films = [
+        _film("liked", "Liked", genres=["drama", "thriller"], directors=["Fav"]),
+        _film("candidate", "Candidate", genres=["drama", "thriller"], directors=["Fav"]),
+    ]
+
+    metadata_rec = rec_mod.MetadataRecommender(films, use_idf=False)
+    user_films = [{"slug": "liked", "rating": 4.5, "watched": True, "liked": True}]
+    profile = rec_mod.build_profile(user_films, metadata_rec.films)
+
+    explanation = metadata_rec.explain_recommendation_detailed(
+        metadata_rec.films["candidate"], profile, user_films
+    )
+
+    assert explanation["similar_films_you_liked"]
+    assert explanation["positive_factors"]
+    assert explanation["confidence"] > 0
+    assert explanation["summary"]
+
+
+def test_compute_recommendation_diversity_reports_spread(fresh_recommender_modules):
+    rec_mod, _, _ = fresh_recommender_modules
+
+    films = {
+        "a": _film("a", "A", genres=["g1"], directors=["d1"], countries=["USA"]),
+        "b": _film("b", "B", genres=["g2"], directors=["d2"], countries=["UK"]),
+        "c": _film("c", "C", genres=["g3"], directors=["d1"], countries=["France"]),
+    }
+
+    metadata_rec = rec_mod.MetadataRecommender(list(films.values()), use_idf=False)
+    recs = [
+        rec_mod.Recommendation(slug="a", title="A", year=2020, score=1.0, reasons=[]),
+        rec_mod.Recommendation(slug="b", title="B", year=2020, score=0.9, reasons=[]),
+        rec_mod.Recommendation(slug="c", title="C", year=2020, score=0.8, reasons=[]),
+    ]
+
+    diversity = metadata_rec.compute_recommendation_diversity(recs)
+
+    assert diversity["diversity_score"] > 0
+    assert diversity["unique_genres"] == 3
+    assert diversity["unique_directors"] == 2

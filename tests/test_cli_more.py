@@ -125,3 +125,32 @@ def test_cli_discover_continue(monkeypatch):
     assert called[0].continue_mode is True
     assert called[0].limit == 3
 
+
+def test_cli_scrape_parses_flags(monkeypatch):
+    called = []
+    _run_cli(
+        monkeypatch,
+        ["prog", "scrape", "alice", "--refresh", "7", "--no-include-lists", "--incremental"],
+        (cli, "cmd_scrape"),
+        called,
+    )
+    args = called[0]
+    assert args.username == "alice"
+    assert args.refresh == 7
+    assert args.include_lists is False
+    assert args.incremental is True
+
+
+def test_cli_discover_followers(monkeypatch):
+    called = []
+    _run_cli(
+        monkeypatch,
+        ["prog", "discover", "followers", "--username", "bob", "--limit", "4"],
+        (cli, "cmd_discover"),
+        called,
+    )
+    args = called[0]
+    assert args.source == "followers"
+    assert args.username == "bob"
+    assert args.limit == 4
+    assert args.continue_mode is False

@@ -43,6 +43,10 @@ from .config import (
     ATTRIBUTE_CAPS,
     LONG_TAIL_BOOST,
     LONG_TAIL_RATING_COUNT,
+    MOMENTUM_THRESHOLD_POSITIVE,
+    MOMENTUM_THRESHOLD_NEGATIVE,
+    MOMENTUM_WEIGHT_DIRECTOR,
+    MOMENTUM_WEIGHT_GENRE,
     TFIDF_FIELDS,
     TFIDF_MIN_DF,
     TFIDF_MAX_FEATURES,
@@ -334,6 +338,54 @@ def _popularity_rule(
     return score, popularity_reasons, []
 
 
+def _momentum_rule(
+    recommender: "MetadataRecommender",
+    film: dict,
+    profile: UserProfile,
+    reasons: list[str],
+    warnings: list[str],
+) -> tuple[float, list[str], list[str]]:
+    """
+    Boost films matching strengthening preferences, penalize waning ones.
+
+    Uses preference_momentum from profile to detect evolving taste.
+    """
+    momentum_data = getattr(profile, "preference_momentum", {})
+    if not momentum_data:
+        return 0.0, [], []
+
+    score_delta = 0.0
+    momentum_reasons: list[str] = []
+    momentum_warnings: list[str] = []
+
+    # Check directors
+    for director in recommender._get_list(film, 'directors'):
+        key = f"director:{director}"
+        if key in momentum_data:
+            momentum = momentum_data[key]
+            if momentum > MOMENTUM_THRESHOLD_POSITIVE:
+                score_delta += momentum * MOMENTUM_WEIGHT_DIRECTOR
+                momentum_reasons.append(f"Rising interest: {director}")
+            elif momentum < MOMENTUM_THRESHOLD_NEGATIVE:
+                # Negative momentum penalizes matching films
+                score_delta += momentum * 0.3
+                momentum_warnings.append(f"Waning interest: {director}")
+
+    # Check genres
+    for genre in recommender._get_list(film, 'genres'):
+        key = f"genre:{genre}"
+        if key in momentum_data:
+            momentum = momentum_data[key]
+            if momentum > MOMENTUM_THRESHOLD_POSITIVE:
+                score_delta += momentum * MOMENTUM_WEIGHT_GENRE
+                if not momentum_reasons:
+                    momentum_reasons.append(f"Growing {genre} interest")
+            elif momentum < MOMENTUM_THRESHOLD_NEGATIVE:
+                score_delta += momentum * 0.2
+
+    return score_delta, momentum_reasons[:1], momentum_warnings[:1]
+
+
 DEFAULT_SCORING_RULES: list[RuleFunc] = [
     _director_confidence_rule,
     _genre_pair_rule,
@@ -341,6 +393,7 @@ DEFAULT_SCORING_RULES: list[RuleFunc] = [
     _country_rule,
     _community_rating_rule,
     _popularity_rule,
+    _momentum_rule,
 ]
 
 
@@ -1980,8 +2033,8 @@ class CollaborativeRecommender:
         Find neighbors with asymmetric similarity.
 
         Returns:
-            influencers: Users whose taste predicts yours (they rated first, you agreed)
-            followers: Users who tend to agree with your ratings
+            influencers: Users whose taste predicts yours (more experienced, you tend to agree)
+            followers: Users who tend to agree with your ratings (less experienced, follow your taste)
         """
         if username not in self._user_index:
             return [], []
@@ -1989,7 +2042,11 @@ class CollaborativeRecommender:
         target_films = self.all_user_films[username]
         target_ratings = {f['slug']: f.get('rating') for f in target_films if f.get('rating') is not None}
 
+        if not target_ratings:
+            return [], []
+
         influencer_scores: dict[str, float] = {}
+        follower_scores: dict[str, float] = {}
 
         for other_username, other_films in self.all_user_films.items():
             if other_username == username:
@@ -2002,21 +2059,33 @@ class CollaborativeRecommender:
             if len(common) < 1:
                 continue
 
+            # Compute agreement score
             agreements = []
             for slug in common:
                 diff = abs(target_ratings[slug] - other_ratings[slug])
                 agreements.append(1.0 - (diff / 4.5))  # Normalize to 0-1
 
             agreement_score = sum(agreements) / len(agreements)
+            overlap_factor = len(common) / 20  # Scale by overlap size
 
-            # Weight by how many more films they've seen (experience)
-            experience_ratio = len(other_ratings) / max(len(target_ratings), 1)
-            influencer_weight = min(experience_ratio, 2.0)  # Cap at 2x
+            # Experience ratio determines influencer vs follower
+            target_experience = len(target_ratings)
+            other_experience = len(other_ratings)
+            experience_ratio = other_experience / max(target_experience, 1)
 
-            influencer_scores[other_username] = agreement_score * influencer_weight * (len(common) / 20)
+            if experience_ratio > 1.0:
+                # They have more experience -> potential influencer
+                influencer_weight = min(experience_ratio, 2.0)
+                influencer_scores[other_username] = agreement_score * influencer_weight * overlap_factor
+            else:
+                # They have less experience -> potential follower
+                follower_weight = min(1.0 / max(experience_ratio, 0.1), 2.0)
+                follower_scores[other_username] = agreement_score * follower_weight * overlap_factor
 
         sorted_influencers = sorted(influencer_scores.items(), key=lambda x: -x[1])[:k]
-        return sorted_influencers, []
+        sorted_followers = sorted(follower_scores.items(), key=lambda x: -x[1])[:k]
+
+        return sorted_influencers, sorted_followers
 
 @dataclass
 class ExplainedRecommendation(Recommendation):

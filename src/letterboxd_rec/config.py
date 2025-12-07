@@ -152,6 +152,12 @@ WEIGHTS = {
     'genre_pair': 0.6,  # Genre co-occurrence (supplementary signal)
 }
 
+# Momentum scoring (for preference_momentum)
+MOMENTUM_THRESHOLD_POSITIVE = 0.3  # Minimum momentum to consider "rising"
+MOMENTUM_THRESHOLD_NEGATIVE = -0.3  # Threshold for "waning" interest
+MOMENTUM_WEIGHT_DIRECTOR = 0.5
+MOMENTUM_WEIGHT_GENRE = 0.3
+
 # Serendipity Configuration
 SERENDIPITY_FACTOR = 0.15
 SERENDIPITY_MIN_RATING = 3.5

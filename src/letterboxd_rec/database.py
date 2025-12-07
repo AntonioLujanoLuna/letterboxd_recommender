@@ -426,39 +426,14 @@ def populate_normalized_tables(conn, film_metadata):
     """
     Populate normalized tables from film metadata for a single film.
 
-    Note: For batch operations with multiple films, prefer populate_normalized_tables_batch
-    for better performance.
+    This is a convenience wrapper around populate_normalized_tables_batch
+    for single-film operations.
 
     Args:
         conn: Database connection
         film_metadata: FilmMetadata object or dict with slug and attribute lists
     """
-    slug = film_metadata.slug if hasattr(film_metadata, 'slug') else film_metadata['slug']
-
-    # Clear existing entries for this film
-    conn.execute("DELETE FROM film_directors WHERE film_slug = ?", (slug,))
-    conn.execute("DELETE FROM film_genres WHERE film_slug = ?", (slug,))
-    conn.execute("DELETE FROM film_cast WHERE film_slug = ?", (slug,))
-    conn.execute("DELETE FROM film_themes WHERE film_slug = ?", (slug,))
-
-    # Get attributes (handle both dataclass and dict)
-    directors = film_metadata.directors if hasattr(film_metadata, 'directors') else load_json(film_metadata.get('directors', []))
-    genres = film_metadata.genres if hasattr(film_metadata, 'genres') else load_json(film_metadata.get('genres', []))
-    cast = film_metadata.cast if hasattr(film_metadata, 'cast') else load_json(film_metadata.get('cast', []))
-    themes = film_metadata.themes if hasattr(film_metadata, 'themes') else load_json(film_metadata.get('themes', []))
-
-    # Insert into normalized tables
-    for director in directors:
-        conn.execute("INSERT OR IGNORE INTO film_directors (film_slug, director) VALUES (?, ?)", (slug, director))
-
-    for genre in genres:
-        conn.execute("INSERT OR IGNORE INTO film_genres (film_slug, genre) VALUES (?, ?)", (slug, genre))
-
-    for actor in cast:
-        conn.execute("INSERT OR IGNORE INTO film_cast (film_slug, actor) VALUES (?, ?)", (slug, actor))
-
-    for theme in themes:
-        conn.execute("INSERT OR IGNORE INTO film_themes (film_slug, theme) VALUES (?, ?)", (slug, theme))
+    populate_normalized_tables_batch(conn, [film_metadata])
 
 
 def populate_normalized_tables_batch(conn, film_metadata_list: list) -> None:
