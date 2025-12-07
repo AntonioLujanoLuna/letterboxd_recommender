@@ -8,6 +8,7 @@ from letterboxd_rec import cli
 
 def test_validate_slug_and_username():
     assert cli._validate_slug("valid-slug") == "valid-slug"
+    assert cli._validate_slug("film:482919") == "film:482919"
     with pytest.raises(ValueError):
         cli._validate_slug("Invalid slug!")
 

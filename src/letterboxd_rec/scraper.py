@@ -30,25 +30,34 @@ def validate_slug(slug: str | None) -> str | None:
     Validate film slug format to prevent injection or malformed data.
 
     Returns cleaned slug or None if invalid.
-    Letterboxd slugs should be lowercase alphanumeric with hyphens only.
+    Letterboxd slugs are typically lowercase alphanumeric with hyphens, but
+    some endpoints now emit a namespaced format like 'film:482919'. We allow
+    that prefix while still validating the core slug characters.
     """
     if not slug:
         return None
 
-    # Remove any whitespace
-    slug = slug.strip()
+    cleaned = slug.strip().lower()
 
-    # Check format: lowercase alphanumeric and hyphens only
-    if not re.match(r'^[a-z0-9-]+$', slug.lower()):
+    prefix = ""
+    core = cleaned
+    if core.startswith("film:"):
+        prefix = "film:"
+        core = core.split(":", 1)[1]
+
+    # Require alphanumeric/hyphen core even when prefixed with "film:"
+    if not core or not re.match(r'^[a-z0-9-]+$', core):
         logger.warning(f"Invalid slug format (contains disallowed characters): '{slug}'")
         return None
 
+    full_slug = prefix + core
+
     # Additional safety: reject excessively long slugs (Letterboxd slugs are typically < 100 chars)
-    if len(slug) > 200:
+    if len(full_slug) > 200:
         logger.warning(f"Slug exceeds maximum length: '{slug[:50]}...'")
         return None
 
-    return slug.lower()
+    return full_slug
 
 
 def _parse_rating_count(text: str) -> int | None:

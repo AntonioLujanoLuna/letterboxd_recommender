@@ -68,9 +68,19 @@ def _validate_slug(slug: str) -> str:
     Returns lowercased valid slug.
     """
     import re
-    if not re.match(r'^[a-z0-9-]+$', slug.lower()):
+
+    cleaned = slug.strip().lower()
+
+    prefix = ""
+    core = cleaned
+    if core.startswith("film:"):
+        prefix = "film:"
+        core = core.split(":", 1)[1]
+
+    if not core or not re.match(r'^[a-z0-9-]+$', core):
         raise ValueError(f"Invalid slug: {slug}")
-    return slug.lower()
+
+    return prefix + core
 
 
 def _validate_username(username: str) -> str:

@@ -7,6 +7,8 @@ from letterboxd_rec import scraper
 
 def test_validate_slug_and_rating_count():
     assert scraper.validate_slug("the-matrix") == "the-matrix"
+    assert scraper.validate_slug("film:482919") == "film:482919"
+    assert scraper.validate_slug("Film:482919") == "film:482919"
     assert scraper.validate_slug("The Matrix") is None
 
     assert scraper._parse_rating_count("1.5M") == 1_500_000
