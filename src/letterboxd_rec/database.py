@@ -53,16 +53,16 @@ class RetryConnection(sqlite3.Connection):
     """SQLite connection that retries on database-locked errors."""
 
     def execute(self, sql, parameters=(), /):
-        return _execute_with_retry(lambda: super().execute(sql, parameters))
+        return _execute_with_retry(lambda: super(RetryConnection, self).execute(sql, parameters))
 
     def executemany(self, sql, seq_of_parameters, /):
-        return _execute_with_retry(lambda: super().executemany(sql, seq_of_parameters))
+        return _execute_with_retry(lambda: super(RetryConnection, self).executemany(sql, seq_of_parameters))
 
     def executescript(self, sql_script, /):
-        return _execute_with_retry(lambda: super().executescript(sql_script))
+        return _execute_with_retry(lambda: super(RetryConnection, self).executescript(sql_script))
 
     def commit(self):
-        return _execute_with_retry(lambda: super().commit())
+        return _execute_with_retry(lambda: super(RetryConnection, self).commit())
 
 
 def parse_timestamp_naive(timestamp_str: str) -> datetime:
