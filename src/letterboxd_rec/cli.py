@@ -291,6 +291,85 @@ async def _scrape_film_metadata_async(
     logger.info(f"Saved {len(metadata_list)} films")
 
 
+async def _scrape_users_parallel(
+    usernames: list[str],
+    args: argparse.Namespace,
+) -> None:
+    """
+    Parallel user scraping using the AsyncLetterboxdScraper.
+
+    Mirrors the scrape-daemon flow but scoped to a fixed list of users discovered
+    by the current command.
+    """
+    if not usernames:
+        return
+
+    # Guard against accidental duplicates in the pending queue
+    usernames = list(dict.fromkeys(usernames))
+
+    # Load known film slugs once (threaded to keep event loop free)
+    def _load_known_slugs():
+        with get_db(read_only=True) as conn:
+            return {r['slug'] for r in conn.execute("SELECT slug FROM films")}
+
+    known_film_slugs: set[str] = await asyncio.to_thread(_load_known_slugs)
+    known_slugs_lock = asyncio.Lock()
+    user_semaphore = asyncio.Semaphore(getattr(args, "parallel_users", 1))
+
+    async def _persist_user_films(username: str, interactions):
+        def _persist():
+            with get_db() as conn:
+                scraped_at = datetime.now().isoformat()
+                conn.executemany(
+                    """
+                    INSERT OR REPLACE INTO user_films
+                    (username, film_slug, rating, watched, watchlisted, liked, scraped_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (username, i.film_slug, i.rating, i.watched, i.watchlisted, i.liked, scraped_at)
+                        for i in interactions
+                    ],
+                )
+
+        await asyncio.to_thread(_persist)
+
+    async with AsyncLetterboxdScraper(
+        delay=getattr(args, "async_delay", DEFAULT_ASYNC_DELAY),
+        max_concurrent=getattr(args, "max_concurrent_requests", DEFAULT_MAX_CONCURRENT),
+    ) as async_scraper:
+
+        async def _process(username: str):
+            async with user_semaphore:
+                try:
+                    interactions = await async_scraper.scrape_user(username)
+
+                    if interactions:
+                        await _persist_user_films(username, interactions)
+
+                        async with known_slugs_lock:
+                            new_slugs = [i.film_slug for i in interactions if i.film_slug not in known_film_slugs]
+                            known_film_slugs.update(new_slugs)
+
+                        if new_slugs:
+                            await _scrape_film_metadata_async(
+                                async_scraper,
+                                new_slugs,
+                                max_per_batch=getattr(args, "batch", DEFAULT_MAX_PER_BATCH),
+                            )
+
+                        logger.info(f"{username}: {len(interactions)} films (parallel)")
+                    else:
+                        logger.warning(f"No interactions found for {username}")
+
+                except Exception as exc:  # noqa: BLE001
+                    logger.error(f"Error scraping {username}: {exc}")
+                finally:
+                    await asyncio.to_thread(remove_pending_user, username)
+
+        await asyncio.gather(*[asyncio.create_task(_process(u)) for u in usernames])
+
+
 def cmd_explore(args: argparse.Namespace) -> None:
     """Explore films by attribute (director, genre, actor)."""
     init_db()
@@ -616,49 +695,54 @@ def cmd_discover(args: argparse.Namespace) -> None:
             return
 
         # Scrape each user
-        with get_db() as conn:
-            existing_film_slugs = {r['slug'] for r in conn.execute("SELECT slug FROM films")}
+        if getattr(args, "parallel_users", 1) > 1:
+            asyncio.run(_scrape_users_parallel(usernames_to_scrape, args))
+        else:
+            # Defensive dedupe in serial path too
+            usernames_to_scrape = list(dict.fromkeys(usernames_to_scrape))
+            with get_db() as conn:
+                existing_film_slugs = {r['slug'] for r in conn.execute("SELECT slug FROM films")}
 
-        for username in tqdm(usernames_to_scrape, desc="Users"):
-            try:
-                # Use smart scraping when we have activity info
-                activity = scraper.check_user_activity(username)
-                if activity and activity.get('film_count'):
-                    interactions = scraper.scrape_user_smart(
-                        username, 
-                        known_film_count=activity['film_count']
-                    )
-                else:
-                    interactions = scraper.scrape_user(username)
+            for username in tqdm(usernames_to_scrape, desc="Users"):
+                try:
+                    # Use smart scraping when we have activity info
+                    activity = scraper.check_user_activity(username)
+                    if activity and activity.get('film_count'):
+                        interactions = scraper.scrape_user_smart(
+                            username, 
+                            known_film_count=activity['film_count']
+                        )
+                    else:
+                        interactions = scraper.scrape_user(username)
 
-                if not interactions:
-                    logger.warning(f"No interactions found for {username}")
+                    if not interactions:
+                        logger.warning(f"No interactions found for {username}")
+                        remove_pending_user(username)
+                        continue
+
+                    with get_db() as conn:
+                        scraped_at = datetime.now().isoformat()
+                        conn.executemany("""
+                            INSERT OR REPLACE INTO user_films
+                            (username, film_slug, rating, watched, watchlisted, liked, scraped_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """, [(username, i.film_slug, i.rating, i.watched, i.watchlisted, i.liked, scraped_at)
+                              for i in interactions])
+
+                        existing_film_slugs.update(
+                            r['slug'] for r in conn.execute("SELECT slug FROM films")
+                        )
+
+                    # Remove from pending queue after successful scrape
                     remove_pending_user(username)
-                    continue
 
-                with get_db() as conn:
-                    scraped_at = datetime.now().isoformat()
-                    conn.executemany("""
-                        INSERT OR REPLACE INTO user_films
-                        (username, film_slug, rating, watched, watchlisted, liked, scraped_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """, [(username, i.film_slug, i.rating, i.watched, i.watchlisted, i.liked, scraped_at)
-                          for i in interactions])
+                    # Scrape missing film metadata
+                    new_slugs = [i.film_slug for i in interactions if i.film_slug not in existing_film_slugs]
+                    _scrape_film_metadata(scraper, new_slugs, max_per_batch=args.batch)
+                    existing_film_slugs.update(new_slugs)
 
-                    existing_film_slugs.update(
-                        r['slug'] for r in conn.execute("SELECT slug FROM films")
-                    )
-
-                # Remove from pending queue after successful scrape
-                remove_pending_user(username)
-
-                # Scrape missing film metadata
-                new_slugs = [i.film_slug for i in interactions if i.film_slug not in existing_film_slugs]
-                _scrape_film_metadata(scraper, new_slugs, max_per_batch=100)
-                existing_film_slugs.update(new_slugs)
-
-            except Exception as e:
-                logger.error(f"Error scraping {username}: {e}")
+                except Exception as e:
+                    logger.error(f"Error scraping {username}: {e}")
 
         logger.info(f"\nDone! Scraped {len(usernames_to_scrape)} users.")
 
@@ -769,6 +853,8 @@ async def _cmd_scrape_daemon_async(args: argparse.Namespace) -> None:
                     if not next_batch:
                         break
                     uname = next_batch[0]['username']
+                    # Remove immediately to avoid multiple concurrent claims of the same user
+                    await asyncio.to_thread(remove_pending_user, uname)
                     tasks.add(asyncio.create_task(_process_user(uname)))
 
                 if not tasks:
@@ -2147,6 +2233,14 @@ def main():
                                   help="Minimum film count for activity pre-filtering (default: 50)")
     discover_parser.add_argument("--maintenance", action="store_true", default=False,
                                   help="Run VACUUM/ANALYZE after scraping batch")
+    discover_parser.add_argument("--parallel-users", type=int, default=1,
+                                  help="Scrape discovered users in parallel (async) with this many users at once")
+    discover_parser.add_argument("--max-concurrent-requests", type=int, default=DEFAULT_MAX_CONCURRENT,
+                                  help="Max concurrent HTTP requests when using --parallel-users")
+    discover_parser.add_argument("--async-delay", type=float, default=DEFAULT_ASYNC_DELAY,
+                                  help="Base async delay between requests when using --parallel-users")
+    discover_parser.add_argument("--batch", type=int, default=DEFAULT_MAX_PER_BATCH,
+                                  help="Batch size for film metadata fetches (parallel or serial)")
     discover_parser.add_argument("--queue-only", action="store_true",
                                  help="Only add discovered users to queue without scraping")
     discover_parser.set_defaults(func=cmd_discover)
