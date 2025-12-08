@@ -24,6 +24,8 @@ def test_cli_parses_recommend_args(monkeypatch):
         captured["strategy"] = args.strategy
         captured["limit"] = args.limit
         captured["genres"] = args.genres
+        captured["graph_alpha"] = args.graph_alpha
+        captured["like_weight"] = args.like_weight
 
     monkeypatch.setattr(cli, "cmd_recommend", fake_recommend)
     monkeypatch.setattr(
@@ -34,9 +36,13 @@ def test_cli_parses_recommend_args(monkeypatch):
             "recommend",
             "alice",
             "--strategy",
-            "collaborative",
+            "graph",
             "--limit",
             "5",
+            "--graph-alpha",
+            "0.2",
+            "--like-weight",
+            "0.9",
             "--genres",
             "Horror",
             "Drama",
@@ -46,7 +52,9 @@ def test_cli_parses_recommend_args(monkeypatch):
     cli.main()
 
     assert captured["username"] == "alice"
-    assert captured["strategy"] == "collaborative"
+    assert captured["strategy"] == "graph"
     assert captured["limit"] == 5
     assert captured["genres"] == ["Horror", "Drama"]
+    assert captured["graph_alpha"] == 0.2
+    assert captured["like_weight"] == 0.9
 

@@ -36,6 +36,8 @@ from .recommender import MetadataRecommender, CollaborativeRecommender, Recommen
 from .matrix_factorization import SVDRecommender
 from .profile import build_profile, UserProfile
 from .group_recommender import recommend_for_group
+from .graph_config import GraphConfig
+from .graph_recommender import GraphRecommender
 from tqdm import tqdm
 import asyncio
 
@@ -1060,7 +1062,7 @@ def cmd_discover_refill(args: argparse.Namespace) -> None:
             filtered = []
             for username in users:
                 activity = scraper.check_user_activity(username)
-                if activity and activity['film_count'] >= args.min_films: # and activity['has_ratings']:
+                if activity and activity['film_count'] >= args.min_films and activity['has_ratings']:
                     filtered.append(username)
 
             added = add_pending_users(filtered, source_type, source_id, priority)
@@ -1174,7 +1176,7 @@ def _load_recommendation_data(
         min_rating=args.min_rating
     )
 
-    if strategy in ('hybrid', 'collaborative'):
+    if strategy in ('hybrid', 'collaborative', 'graph', 'svd'):
         all_films = {r['slug']: dict(r) for r in conn.execute("SELECT * FROM films")}
     else:
         all_films = all_films_filtered
@@ -1347,6 +1349,43 @@ def _run_hybrid_strategy(
             break
 
     return recs
+
+
+def _run_graph_strategy(
+    user_films: list[dict],
+    all_films: dict[str, dict],
+    args: argparse.Namespace,
+    username: str,
+    user_lists: list[dict] | None,
+    all_user_films: dict[str, list[dict]] | None = None,
+) -> list[Recommendation]:
+    """Graph-based recommendation strategy."""
+    config = GraphConfig(
+        alpha=getattr(args, "graph_alpha", GraphConfig().alpha),
+    )
+    overrides = {}
+    if getattr(args, "like_weight", None) is not None:
+        overrides["liked"] = args.like_weight
+    if getattr(args, "watch_weight", None) is not None:
+        overrides["watched"] = args.watch_weight
+    if getattr(args, "watchlist_weight", None) is not None:
+        overrides["watchlisted"] = args.watchlist_weight
+    if overrides:
+        config.restart_weights = {**config.restart_weights, **overrides}
+    if getattr(args, "graph_cache", None):
+        config.cache_path = Path(args.graph_cache)
+
+    graph_rec = GraphRecommender(config=config, rebuild=getattr(args, "rebuild_graph", False))
+    return graph_rec.recommend(
+        username,
+        n=args.limit,
+        min_year=args.min_year,
+        max_year=args.max_year,
+        genres=args.genres,
+        exclude_genres=args.exclude_genres,
+        min_rating=args.min_rating,
+        explain=getattr(args, "explain", False),
+    )
 
 
 def _run_svd_strategy(
@@ -1730,6 +1769,7 @@ def cmd_recommend(args: argparse.Namespace) -> None:
         'collaborative': _run_collaborative_strategy,
         'hybrid': _run_hybrid_strategy,
         'svd': _run_svd_strategy,
+        'graph': _run_graph_strategy,
     }
 
     handler = strategy_handlers[strategy]
@@ -2301,7 +2341,7 @@ def main():
     # Recommend command
     rec_parser = subparsers.add_parser("recommend", help="Generate recommendations")
     rec_parser.add_argument("username", help="Letterboxd username")
-    rec_parser.add_argument("--strategy", choices=['metadata', 'collaborative', 'hybrid', 'svd'], 
+    rec_parser.add_argument("--strategy", choices=['metadata', 'collaborative', 'hybrid', 'svd', 'graph'],
                             default='metadata', help="Recommendation strategy")
     rec_parser.add_argument("--limit", type=int, default=20, help="Number of recommendations")
     rec_parser.add_argument("--min-year", type=int, help="Minimum release year")
@@ -2322,6 +2362,13 @@ def main():
     rec_parser.add_argument("--hybrid-meta-weight", type=float, help="Weight for metadata component in hybrid fusion")
     rec_parser.add_argument("--hybrid-collab-weight", type=float, help="Weight for collaborative component in hybrid fusion")
     rec_parser.add_argument("--hybrid-diversity", action="store_true", help="Apply diversity constraint to hybrid output")
+    rec_parser.add_argument("--graph-alpha", type=float, default=0.15,
+                            help="PPR restart probability for graph strategy")
+    rec_parser.add_argument("--like-weight", type=float, help="Restart weight for liked films (graph)")
+    rec_parser.add_argument("--watch-weight", type=float, help="Restart weight for watched-only films (graph)")
+    rec_parser.add_argument("--watchlist-weight", type=float, help="Restart weight for watchlisted films (graph)")
+    rec_parser.add_argument("--graph-cache", type=str, help="Override graph cache path")
+    rec_parser.add_argument("--rebuild-graph", action="store_true", help="Force rebuild of graph cache")
     rec_parser.add_argument("--format", choices=['text', 'json', 'markdown', 'csv'], default='text',
                             help="Output format")
     rec_parser.add_argument("--explain", action="store_true",
