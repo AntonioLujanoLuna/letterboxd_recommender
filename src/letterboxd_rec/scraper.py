@@ -117,14 +117,29 @@ def parse_film_page(tree: HTMLParser, slug: str) -> FilmMetadata:
     title_el = tree.css_first("h1.headline-1")
     title = title_el.text(strip=True) if title_el else slug
 
-    # Year
+    # Year (Letterboxd markup drifts; try several fallbacks)
     year = None
     year_el = tree.css_first("small.number a, div.releaseyear a")
     if year_el:
         try:
             year = int(year_el.text(strip=True))
         except ValueError:
-            pass
+            year = None
+    if year is None:
+        alt_year = tree.css_first("a[href*='/films/year/']")
+        if alt_year:
+            text = alt_year.text(strip=True)
+            m = re.search(r"(19|20|21)\d{2}", text)
+            if m:
+                year = int(m.group(0))
+    if year is None:
+        # As a last resort, try to parse from og:title like "Barbie (2023)"
+        og_title = tree.css_first("meta[property='og:title']")
+        if og_title:
+            content = og_title.attributes.get("content", "")
+            m = re.search(r"(19|20|21)\d{2}", content)
+            if m:
+                year = int(m.group(0))
 
     # Directors
     directors = list(dict.fromkeys([a.text(strip=True) for a in tree.css("a[href*='/director/']") if a.text(strip=True)]))
