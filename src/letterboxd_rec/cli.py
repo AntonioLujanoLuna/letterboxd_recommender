@@ -27,6 +27,7 @@ from .config import (
     DEFAULT_MAX_CONCURRENT,
     DEFAULT_MAX_CONCURRENT_USERS,
     DEFAULT_ASYNC_DELAY,
+    DEFAULT_SCRAPER_DELAY,
     NOTIFICATION_WEBHOOK_URL,
     NOTIFICATION_INTERVAL,
 )
@@ -534,7 +535,7 @@ def cmd_scrape(args: argparse.Namespace) -> None:
 def cmd_discover(args: argparse.Namespace) -> None:
     """Discover and scrape other users with caching and pending queue support."""
     init_db()
-    scraper = LetterboxdScraper(delay=1.0)
+    scraper = LetterboxdScraper(delay=getattr(args, "discover_delay", DEFAULT_SCRAPER_DELAY))
 
     try:
         # Check if we're in continue mode (drain pending queue only)
@@ -602,12 +603,13 @@ def cmd_discover(args: argparse.Namespace) -> None:
             # Discover users
             logger.info(f"Discovering users from {source}:{source_id}...")
             all_discovered = []
+            total_added = 0  # track users actually enqueued as we stream inserts
             page = start_page
             priority = DISCOVERY_PRIORITY_MAP.get(source, 50)
             min_films = getattr(args, 'min_films', 50)
 
             # Calculate how many to discover (more than limit to account for duplicates)
-            discover_limit = args.limit * 3
+            discover_limit = args.limit * getattr(args, "discover_overfetch", 3)
 
             # Apply activity pre-filtering
             filtered_count = 0
@@ -638,41 +640,48 @@ def cmd_discover(args: argparse.Namespace) -> None:
                 if not usernames:
                     break
 
-                # Apply activity pre-filtering for all sources
-                filtered_usernames = []
-                for username in usernames:
-                    activity = scraper.check_user_activity(username)
-                    activity_checked += 1
+                # Apply activity pre-filtering for all sources (can be skipped for speed)
+                if getattr(args, "skip_activity_checks", False):
+                    filtered_usernames = usernames
+                else:
+                    filtered_usernames = []
+                    for username in usernames:
+                        activity = scraper.check_user_activity(username)
+                        activity_checked += 1
 
-                    if not activity:
-                        logger.debug(f"Skipping {username} (profile not accessible)")
-                        filtered_count += 1
-                        continue
+                        if not activity:
+                            logger.debug(f"Skipping {username} (profile not accessible)")
+                            filtered_count += 1
+                            continue
 
-                    # Filter by minimum film count
-                    if activity['film_count'] < min_films:
-                        logger.debug(f"Skipping {username} (only {activity['film_count']} films < {min_films})")
-                        filtered_count += 1
-                        continue
+                        # Filter by minimum film count
+                        if activity['film_count'] < min_films:
+                            logger.debug(f"Skipping {username} (only {activity['film_count']} films < {min_films})")
+                            filtered_count += 1
+                            continue
 
-                    # Require ratings (they actually rate, not just log)
-                    if not activity['has_ratings']:
-                        logger.debug(f"Skipping {username} (no ratings)")
-                        filtered_count += 1
-                        continue
+                        # Require ratings (they actually rate, not just log)
+                        if not activity['has_ratings']:
+                            logger.debug(f"Skipping {username} (no ratings)")
+                            filtered_count += 1
+                            continue
 
-                    filtered_usernames.append(username)
+                        filtered_usernames.append(username)
 
                 all_discovered.extend(filtered_usernames)
+
+                if filtered_usernames:
+                    added = add_pending_users(filtered_usernames, source, source_id, priority)
+                    total_added += added
+                    logger.info(f"  Enqueued {added} users this page (total enqueued: {total_added})")
+
                 page += 1
 
                 logger.info(f"  Page {page-1}: found {len(usernames)} users, {len(filtered_usernames)} passed filters (total: {len(all_discovered)})")
 
             logger.info(f"\nActivity filtering: {activity_checked} checked, {filtered_count} filtered out, {len(all_discovered)} passed")
 
-            # Add discovered users to pending queue
-            new_pending = add_pending_users(all_discovered, source, source_id, priority)
-            logger.info(f"Added {new_pending} new users to pending queue")
+            logger.info(f"Added {total_added} new users to pending queue (discovered {len(all_discovered)})")
 
             # Update discovery source cache
             update_discovery_source(source, source_id, page - 1, len(all_discovered))
@@ -1051,7 +1060,7 @@ def cmd_discover_refill(args: argparse.Namespace) -> None:
             filtered = []
             for username in users:
                 activity = scraper.check_user_activity(username)
-                if activity and activity['film_count'] >= args.min_films and activity['has_ratings']:
+                if activity and activity['film_count'] >= args.min_films: # and activity['has_ratings']:
                     filtered.append(username)
 
             added = add_pending_users(filtered, source_type, source_id, priority)
@@ -2249,6 +2258,23 @@ def main():
                                   help="Max concurrent HTTP requests when using --parallel-users")
     discover_parser.add_argument("--async-delay", type=float, default=DEFAULT_ASYNC_DELAY,
                                   help="Base async delay between requests when using --parallel-users")
+    discover_parser.add_argument(
+        "--discover-delay",
+        type=float,
+        default=DEFAULT_SCRAPER_DELAY,
+        help="Delay between discovery HTTP requests (seconds); lower with care to go faster",
+    )
+    discover_parser.add_argument(
+        "--discover-overfetch",
+        type=int,
+        default=3,
+        help="Multiplier for discovery pagination to offset duplicates (default: 3)",
+    )
+    discover_parser.add_argument(
+        "--skip-activity-checks",
+        action="store_true",
+        help="Skip per-user activity checks (much faster; may enqueue low-activity profiles)",
+    )
     discover_parser.add_argument("--batch", type=int, default=DEFAULT_MAX_PER_BATCH,
                                   help="Batch size for film metadata fetches (parallel or serial)")
     discover_parser.add_argument("--queue-only", action="store_true",
