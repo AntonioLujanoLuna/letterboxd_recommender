@@ -15,6 +15,7 @@ from .database import (
     compute_and_store_idf, populate_normalized_tables_batch, close_pool, run_maintenance,
     create_scrape_session, update_session_progress, complete_session, get_session_history,
     load_films_by_attribute, update_idf_incremental,
+    save_user_follows, save_user_followers, get_social_graph_stats,
 )
 from .config import (
     DISCOVERY_PRIORITY_MAP,
@@ -31,7 +32,7 @@ from .config import (
     NOTIFICATION_WEBHOOK_URL,
     NOTIFICATION_INTERVAL,
 )
-from .scraper import LetterboxdScraper, AsyncLetterboxdScraper
+from .scraper import LetterboxdScraper, AsyncLetterboxdScraper, validate_slug
 from .recommender import MetadataRecommender, CollaborativeRecommender, Recommendation, _fuse_normalized
 from .matrix_factorization import SVDRecommender
 from .profile import build_profile, UserProfile
@@ -64,26 +65,17 @@ def send_notification(message: str) -> None:
         logger.warning(f"Failed to send notification: {exc}")
 
 
-def _validate_slug(slug: str) -> str:
-    """
-    Validate a film slug to prevent injection or invalid characters.
-    Raises ValueError if slug contains invalid characters.
-    Returns lowercased valid slug.
-    """
-    import re
-
-    cleaned = slug.strip().lower()
-
-    prefix = ""
-    core = cleaned
-    if core.startswith("film:"):
-        prefix = "film:"
-        core = core.split(":", 1)[1]
-
-    if not core or not re.match(r'^[a-z0-9-]+$', core):
+def _require_slug(slug: str) -> str:
+    """Validate a film slug and raise if invalid (CLI-friendly wrapper)."""
+    cleaned = validate_slug(slug)
+    if not cleaned:
         raise ValueError(f"Invalid slug: {slug}")
+    return cleaned
 
-    return prefix + core
+
+# Backward-compat for tests and callers expecting the old name
+def _validate_slug(slug: str) -> str:
+    return _require_slug(slug)
 
 
 def _validate_username(username: str) -> str:
@@ -231,35 +223,39 @@ def _scrape_film_metadata(
             meta = scraper.scrape_film(slug)
             if meta:
                 metadata_list.append(meta)
-    
-    # Batch insert all metadata
-    if metadata_list:
-        with get_db() as conn:
-            conn.executemany("""
-                INSERT OR REPLACE INTO films
-                (slug, title, year, directors, genres, cast, themes, runtime, avg_rating, rating_count,
-                 fan_count, is_short, is_animation,
-                 countries, languages, writers, cinematographers, composers)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, [(
-                m.slug, m.title, m.year,
-                json.dumps(m.directors), json.dumps(m.genres),
-                json.dumps(m.cast), json.dumps(m.themes),
-                m.runtime, m.avg_rating, m.rating_count,
-                m.fan_count, int(m.is_short), int(m.is_animation),
-                json.dumps(m.countries), json.dumps(m.languages),
-                json.dumps(m.writers), json.dumps(m.cinematographers),
-                json.dumps(m.composers)
-            ) for m in metadata_list])
 
-            # Populate normalized tables for fast queries (batch operation)
-            populate_normalized_tables_batch(conn, metadata_list)
+    _persist_metadata_batch(metadata_list)
 
-        logger.info(f"Saved {len(metadata_list)} films")
 
-        # Incrementally update IDF scores for new films
-        new_slugs = [m.slug for m in metadata_list]
-        update_idf_incremental(new_slugs)
+def _persist_metadata_batch(metadata_list: list) -> None:
+    """Persist scraped film metadata and keep normalized tables/idf in sync."""
+    if not metadata_list:
+        return
+
+    with get_db() as conn:
+        conn.executemany("""
+            INSERT OR REPLACE INTO films
+            (slug, title, year, directors, genres, cast, themes, runtime, avg_rating, rating_count,
+             fan_count, is_short, is_animation,
+             countries, languages, writers, cinematographers, composers)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, [(
+            m.slug, m.title, m.year,
+            json.dumps(m.directors), json.dumps(m.genres),
+            json.dumps(m.cast), json.dumps(m.themes),
+            m.runtime, m.avg_rating, m.rating_count,
+            m.fan_count, int(m.is_short), int(m.is_animation),
+            json.dumps(m.countries), json.dumps(m.languages),
+            json.dumps(m.writers), json.dumps(m.cinematographers),
+            json.dumps(m.composers)
+        ) for m in metadata_list])
+
+        # Populate normalized tables for fast queries (batch operation)
+        populate_normalized_tables_batch(conn, metadata_list)
+
+    # Incrementally update IDF scores for new films
+    new_slugs = [m.slug for m in metadata_list]
+    update_idf_incremental(new_slugs)
 
 
 async def _scrape_film_metadata_async(
@@ -280,31 +276,7 @@ async def _scrape_film_metadata_async(
     if not metadata_list:
         return
 
-    def _persist():
-        with get_db() as conn:
-            conn.executemany("""
-                INSERT OR REPLACE INTO films
-                (slug, title, year, directors, genres, cast, themes, runtime, avg_rating, rating_count,
-                 fan_count, is_short, is_animation,
-                 countries, languages, writers, cinematographers, composers)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, [(
-                m.slug, m.title, m.year,
-                json.dumps(m.directors), json.dumps(m.genres),
-                json.dumps(m.cast), json.dumps(m.themes),
-                m.runtime, m.avg_rating, m.rating_count,
-                m.fan_count, int(m.is_short), int(m.is_animation),
-                json.dumps(m.countries), json.dumps(m.languages),
-                json.dumps(m.writers), json.dumps(m.cinematographers),
-                json.dumps(m.composers)
-            ) for m in metadata_list])
-            populate_normalized_tables_batch(conn, metadata_list)
-
-        # Incrementally update IDF scores
-        new_slugs = [m.slug for m in metadata_list]
-        update_idf_incremental(new_slugs)
-
-    await asyncio.to_thread(_persist)
+    await asyncio.to_thread(_persist_metadata_batch, metadata_list)
     logger.info(f"Saved {len(metadata_list)} films")
 
 
@@ -359,7 +331,7 @@ async def _scrape_users_parallel(
         async def _process(username: str):
             async with user_semaphore:
                 try:
-                    interactions = await async_scraper.scrape_user(username)
+                    interactions = await async_scraper.scrape_user_smart(username)
 
                     if interactions:
                         await _persist_user_films(username, interactions)
@@ -532,10 +504,107 @@ def cmd_scrape(args: argparse.Namespace) -> None:
                 
                 logger.info(f"    {len(films)} films")
 
+        # Scrape social graph if enabled
+        if getattr(args, "include_social", False):
+            logger.info(f"\nScraping {username}'s social graph...")
+
+            following = scraper.scrape_following(username, limit=args.social_limit)
+            if following:
+                save_user_follows(username, following)
+                logger.info(f"  Saved {len(following)} following")
+
+            followers = scraper.scrape_followers(username, limit=args.social_limit)
+            if followers:
+                save_user_followers(username, followers)
+                logger.info(f"  Saved {len(followers)} followers")
+
         logger.info(f"\nDone! {len(interactions)} films for {username}")
         
     finally:
         scraper.close()
+
+
+def cmd_scrape_social(args: argparse.Namespace) -> None:
+    """Scrape and store social graph (following/followers) for a user."""
+    init_db()
+    username = _validate_username(args.username)
+    scraper = LetterboxdScraper(delay=1.0)
+    
+    try:
+        total_saved = 0
+        
+        if args.following or args.both:
+            logger.info(f"Scraping who {username} follows...")
+            following = scraper.scrape_following(username, limit=args.limit)
+            saved = save_user_follows(username, following)
+            logger.info(f"  Saved {saved} following relationships")
+            total_saved += saved
+        
+        if args.followers or args.both:
+            logger.info(f"Scraping who follows {username}...")
+            followers = scraper.scrape_followers(username, limit=args.limit)
+            saved = save_user_followers(username, followers)
+            logger.info(f"  Saved {saved} follower relationships")
+            total_saved += saved
+        
+        logger.info(f"\nTotal: {total_saved} social edges saved")
+        
+        # Show current graph stats
+        stats = get_social_graph_stats()
+        logger.info(f"\nSocial graph now has:")
+        logger.info(f"  {stats['total_edges']} total edges")
+        logger.info(f"  {stats['unique_followers']} unique users following others")
+        logger.info(f"  {stats['unique_followees']} unique users being followed")
+        
+    finally:
+        scraper.close()
+
+
+def cmd_backfill_social(args: argparse.Namespace) -> None:
+    """Backfill social graph for users already in the database."""
+    init_db()
+
+    with get_db(read_only=True) as conn:
+        users_with_social: set[str] = set()
+        for row in conn.execute("SELECT DISTINCT follower FROM user_follows"):
+            users_with_social.add(row["follower"])
+        for row in conn.execute("SELECT DISTINCT followee FROM user_follows"):
+            users_with_social.add(row["followee"])
+
+        all_users = {row["username"] for row in conn.execute("SELECT DISTINCT username FROM user_films")}
+
+    users_needing_social = all_users - users_with_social
+
+    if not users_needing_social:
+        logger.info("All users already have social data")
+        return
+
+    logger.info(f"Found {len(users_needing_social)} users without social data")
+
+    if args.dry_run:
+        sample = list(users_needing_social)[:20]
+        for u in sample:
+            logger.info(f"  Would scrape: {u}")
+        if len(users_needing_social) > len(sample):
+            logger.info(f"  ... and {len(users_needing_social) - len(sample)} more")
+        return
+
+    scraper = LetterboxdScraper(delay=1.0)
+    try:
+        for username in tqdm(list(users_needing_social)[: args.limit], desc="Social"):
+            following = scraper.scrape_following(username, limit=args.social_limit)
+            if following:
+                save_user_follows(username, following)
+
+            followers = scraper.scrape_followers(username, limit=args.social_limit)
+            if followers:
+                save_user_followers(username, followers)
+    finally:
+        scraper.close()
+
+    stats = get_social_graph_stats()
+    logger.info(f"\nSocial graph now has {stats['total_edges']} edges")
+    logger.info(f"Unique followers: {stats['unique_followers']}, unique followees: {stats['unique_followees']}")
 
 
 def cmd_discover(args: argparse.Namespace) -> None:
@@ -584,7 +653,7 @@ def cmd_discover(args: argparse.Namespace) -> None:
                 if not args.film_slug:
                     logger.error(f"--film-slug is required for '{source}' source")
                     return
-                source_id = _validate_slug(args.film_slug)
+                source_id = _require_slug(args.film_slug)
             elif source == 'popular':
                 source_id = 'members'  # Popular members endpoint
             else:
@@ -626,9 +695,15 @@ def cmd_discover(args: argparse.Namespace) -> None:
                 if source == 'following':
                     usernames = scraper.scrape_following(source_id, limit=page * 50)
                     usernames = usernames[(page-1)*50:page*50] if len(usernames) > (page-1)*50 else []
+                    # Store social graph: source_id follows these usernames
+                    if usernames:
+                        save_user_follows(source_id, usernames)
                 elif source == 'followers':
                     usernames = scraper.scrape_followers(source_id, limit=page * 50)
                     usernames = usernames[(page-1)*50:page*50] if len(usernames) > (page-1)*50 else []
+                    # Store social graph: these usernames follow source_id
+                    if usernames:
+                        save_user_followers(source_id, usernames)
                 elif source == 'popular':
                     usernames = scraper.scrape_popular_members(limit=page * 50)
                     usernames = usernames[(page-1)*50:page*50] if len(usernames) > (page-1)*50 else []
@@ -837,6 +912,18 @@ async def _cmd_scrape_daemon_async(args: argparse.Namespace) -> None:
         max_concurrent=getattr(args, "max_concurrent_requests", DEFAULT_MAX_CONCURRENT),
     ) as async_scraper:
 
+        async def _scrape_social_async(username: str):
+            """Async helper to scrape and persist social graph edges."""
+            following = await async_scraper.scrape_following_async(username, limit=getattr(args, "social_limit", 200))
+            if following:
+                await asyncio.to_thread(save_user_follows, username, following)
+                logger.info(f"  Saved {len(following)} following edges for {username}")
+
+            followers = await async_scraper.scrape_followers_async(username, limit=getattr(args, "social_limit", 200))
+            if followers:
+                await asyncio.to_thread(save_user_followers, username, followers)
+                logger.info(f"  Saved {len(followers)} follower edges for {username}")
+
         async def _process_user(username: str):
             nonlocal films_added, scraped_count, known_film_slugs
             async with user_semaphore:
@@ -848,6 +935,9 @@ async def _cmd_scrape_daemon_async(args: argparse.Namespace) -> None:
                         new_slugs = [i.film_slug for i in interactions if i.film_slug not in known_film_slugs]
                         await _scrape_film_metadata_async(async_scraper, new_slugs, max_per_batch=args.batch)
                         known_film_slugs.update(new_slugs)
+
+                        if getattr(args, "include_social", False):
+                            await _scrape_social_async(username)
 
                         scraped_count += 1
                         films_added += len(interactions)
@@ -1366,6 +1456,9 @@ def _run_graph_strategy(
     """Graph-based recommendation strategy."""
     config = GraphConfig(
         alpha=getattr(args, "graph_alpha", GraphConfig().alpha),
+        relation_preset=getattr(args, "relation_preset", None),
+        relation_weights_path=getattr(args, "relation_weights_path", None),
+        use_idf=not getattr(args, "no_graph_idf", False),
     )
     overrides = {}
     if getattr(args, "like_weight", None) is not None:
@@ -1378,6 +1471,10 @@ def _run_graph_strategy(
         config.restart_weights = {**config.restart_weights, **overrides}
     if getattr(args, "graph_cache", None):
         config.cache_path = Path(args.graph_cache)
+    if getattr(args, "graph_idf_floor", None) is not None:
+        config.idf_floor = args.graph_idf_floor
+    if getattr(args, "graph_idf_ceiling", None) is not None:
+        config.idf_ceiling = args.graph_idf_ceiling
 
     graph_rec = GraphRecommender(config=config, rebuild=getattr(args, "rebuild_graph", False))
     return graph_rec.recommend(
@@ -1679,6 +1776,7 @@ def cmd_jam(args: argparse.Namespace) -> None:
             genres=args.genres,
             exclude_divisive=not args.include_divisive,
             weights=weights,
+            triage_watchlist=getattr(args, "triage_watchlist", False),
         )
     except ValueError as exc:  # e.g., not enough valid users
         logger.error(str(exc))
@@ -1730,7 +1828,10 @@ def cmd_jam(args: argparse.Namespace) -> None:
         )
 
     logger.info(f"\n{'=' * 60}")
-    logger.info(f"Top {len(recs)} Films for Your Group:")
+    if getattr(args, "triage_watchlist", False):
+        logger.info(f"Top {len(recs)} Shared Watchlist Picks:")
+    else:
+        logger.info(f"Top {len(recs)} Films for Your Group:")
     logger.info(f"{'=' * 60}\n")
 
     for i, rec in enumerate(recs, 1):
@@ -2005,7 +2106,7 @@ def cmd_profile(args: argparse.Namespace) -> None:
 def cmd_similar(args: argparse.Namespace) -> None:
     """Find films similar to a specific film."""
     # Validate slug
-    slug = _validate_slug(args.slug)
+    slug = _require_slug(args.slug)
     
     with get_db() as conn:
         all_films = [dict(r) for r in conn.execute("SELECT * FROM films")]
@@ -2254,6 +2355,11 @@ def setup_jam_parser(subparsers):
         nargs="+",
         help="User weights as user:weight pairs (e.g., alex:2.0 for birthday person)",
     )
+    jam_parser.add_argument(
+        "--triage-watchlist",
+        action="store_true",
+        help="Rank films that appear on multiple watchlists (triage mode)",
+    )
     jam_parser.set_defaults(func=cmd_jam)
 
 
@@ -2275,6 +2381,10 @@ def main():
                                 help="Maximum number of lists to scrape per user (default: 50)")
     scrape_parser.add_argument("--incremental", action="store_true",
                                 help="Stop pagination when hitting already-scraped films (faster for updates)")
+    scrape_parser.add_argument("--include-social", action="store_true",
+                                help="Also scrape following/followers")
+    scrape_parser.add_argument("--social-limit", type=int, default=200,
+                                help="Max following/followers to scrape (default: 200)")
     scrape_parser.set_defaults(func=cmd_scrape)
     
     # Discover command
@@ -2325,6 +2435,22 @@ def main():
                                  help="Only add discovered users to queue without scraping")
     discover_parser.set_defaults(func=cmd_discover)
 
+    # Scrape social graph command
+    social_parser = subparsers.add_parser("scrape-social", help="Scrape user's social graph (following/followers)")
+    social_parser.add_argument("username", help="Letterboxd username")
+    social_parser.add_argument("--following", action="store_true", help="Scrape who they follow")
+    social_parser.add_argument("--followers", action="store_true", help="Scrape who follows them")
+    social_parser.add_argument("--both", action="store_true", default=True, help="Scrape both (default)")
+    social_parser.add_argument("--limit", type=int, default=500, help="Max relationships to scrape per direction")
+    social_parser.set_defaults(func=cmd_scrape_social)
+
+    # Backfill social graph command
+    backfill_social_parser = subparsers.add_parser("backfill-social", help="Backfill social graph for existing users")
+    backfill_social_parser.add_argument("--limit", type=int, default=100, help="Max users to process")
+    backfill_social_parser.add_argument("--social-limit", type=int, default=200, help="Max following/followers per user")
+    backfill_social_parser.add_argument("--dry-run", action="store_true", help="Show which users would be processed")
+    backfill_social_parser.set_defaults(func=cmd_backfill_social)
+
     # Scrape daemon command
     daemon_parser = subparsers.add_parser("scrape-daemon", help="Continuously scrape from pending queue")
     daemon_parser.add_argument("--target", type=int, help="Stop after scraping N users")
@@ -2340,6 +2466,8 @@ def main():
                                help="Max concurrent HTTP requests across tasks (async)")
     daemon_parser.add_argument("--async-delay", type=float, default=DEFAULT_ASYNC_DELAY,
                                help="Base async delay between requests (seconds)")
+    daemon_parser.add_argument("--include-social", action="store_true", help="Also scrape following/followers for each user")
+    daemon_parser.add_argument("--social-limit", type=int, default=200, help="Max following/followers to scrape per user")
     daemon_parser.set_defaults(func=cmd_scrape_daemon)
     
     # Recommend command
@@ -2371,6 +2499,31 @@ def main():
     rec_parser.add_argument("--like-weight", type=float, help="Restart weight for liked films (graph)")
     rec_parser.add_argument("--watch-weight", type=float, help="Restart weight for watched-only films (graph)")
     rec_parser.add_argument("--watchlist-weight", type=float, help="Restart weight for watchlisted films (graph)")
+    rec_parser.add_argument(
+        "--relation-preset",
+        choices=["balanced", "genre_heavy", "people_heavy", "social", "recent"],
+        help="Graph relation-weight preset"
+    )
+    rec_parser.add_argument(
+        "--relation-weights-path",
+        type=str,
+        help="Path to JSON file with custom graph relation weights",
+    )
+    rec_parser.add_argument(
+        "--no-graph-idf",
+        action="store_true",
+        help="Disable IDF weighting for graph strategy",
+    )
+    rec_parser.add_argument(
+        "--graph-idf-floor",
+        type=float,
+        help="Minimum IDF weight for graph attributes",
+    )
+    rec_parser.add_argument(
+        "--graph-idf-ceiling",
+        type=float,
+        help="Maximum IDF weight for graph attributes",
+    )
     rec_parser.add_argument("--graph-cache", type=str, help="Override graph cache path")
     rec_parser.add_argument("--rebuild-graph", action="store_true", help="Force rebuild of graph cache")
     rec_parser.add_argument("--format", choices=['text', 'json', 'markdown', 'csv'], default='text',

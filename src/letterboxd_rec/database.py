@@ -355,6 +355,17 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_pending_priority ON pending_users(priority DESC, discovered_at ASC);
 
+            -- Optional social graph edges (used when follow scraping is enabled)
+            CREATE TABLE IF NOT EXISTS user_relationships (
+                follower TEXT NOT NULL,
+                followee TEXT NOT NULL,
+                scraped_at TEXT,
+                source TEXT,
+                PRIMARY KEY (follower, followee)
+            );
+            CREATE INDEX IF NOT EXISTS idx_user_relationships_follower ON user_relationships(follower);
+            CREATE INDEX IF NOT EXISTS idx_user_relationships_followee ON user_relationships(followee);
+
             -- IDF (Inverse Document Frequency) table for rarity weighting
             CREATE TABLE IF NOT EXISTS attribute_idf (
                 attribute_type TEXT NOT NULL,
@@ -376,15 +387,46 @@ def init_db() -> None:
                 films_added INTEGER DEFAULT 0,
                 last_activity TEXT
             );
+
+            -- Social graph: who follows whom
+            CREATE TABLE IF NOT EXISTS user_follows (
+                follower TEXT NOT NULL,
+                followee TEXT NOT NULL,
+                scraped_at TEXT,
+                PRIMARY KEY (follower, followee)
+            );
+            CREATE INDEX IF NOT EXISTS idx_follows_follower ON user_follows(follower);
+            CREATE INDEX IF NOT EXISTS idx_follows_followee ON user_follows(followee);
         """)
 
-        # Migration: Add new columns to existing films table if they don't exist
-        _migrate_films_table(conn)
-        _migrate_user_profiles_table(conn)
         _record_baseline_migration(conn)
 
     # Apply any versioned migrations that are newer than baseline
     run_versioned_migrations()
+
+
+def _ensure_migration_table(conn):
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS {MIGRATION_VERSION_TABLE} (
+            version TEXT PRIMARY KEY,
+            applied_at TEXT NOT NULL
+        )
+    """)
+
+
+def _record_baseline_migration(conn):
+    """Mark baseline schema as applied to align with versioned migrations."""
+    baseline = "0000_baseline"
+    cursor = conn.execute(
+        f"SELECT version FROM {MIGRATION_VERSION_TABLE} WHERE version = ?",
+        (baseline,)
+    )
+    if cursor.fetchone():
+        return
+    conn.execute(
+        f"INSERT INTO {MIGRATION_VERSION_TABLE} (version, applied_at) VALUES (?, ?)",
+        (baseline, datetime.now().isoformat())
+    )
 
 
 def _migrate_films_table(conn):
@@ -427,27 +469,20 @@ def _migrate_user_profiles_table(conn):
             logger.warning(f"Could not add column 'schema_version': {e}")
 
 
-def _ensure_migration_table(conn):
-    conn.execute(f"""
-        CREATE TABLE IF NOT EXISTS {MIGRATION_VERSION_TABLE} (
-            version TEXT PRIMARY KEY,
-            applied_at TEXT NOT NULL
-        )
-    """)
-
-
-def _record_baseline_migration(conn):
-    """Mark baseline schema as applied to align with versioned migrations."""
-    baseline = "0000_baseline"
-    cursor = conn.execute(
-        f"SELECT version FROM {MIGRATION_VERSION_TABLE} WHERE version = ?",
-        (baseline,)
-    )
-    if cursor.fetchone():
-        return
-    conn.execute(
-        f"INSERT INTO {MIGRATION_VERSION_TABLE} (version, applied_at) VALUES (?, ?)",
-        (baseline, datetime.now().isoformat())
+def _ensure_user_relationships_table(conn):
+    """Ensure the social edges table exists for follow-based graph edges."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS user_relationships (
+            follower TEXT NOT NULL,
+            followee TEXT NOT NULL,
+            scraped_at TEXT,
+            source TEXT,
+            PRIMARY KEY (follower, followee)
+        );
+        CREATE INDEX IF NOT EXISTS idx_user_relationships_follower ON user_relationships(follower);
+        CREATE INDEX IF NOT EXISTS idx_user_relationships_followee ON user_relationships(followee);
+        """
     )
 
 
@@ -457,8 +492,6 @@ def run_versioned_migrations() -> int:
     Files are applied in lexicographic order and tracked in MIGRATION_VERSION_TABLE.
     """
     versions_dir = MIGRATIONS_PATH / "versions"
-    if not versions_dir.exists():
-        return 0
 
     applied = set()
     with get_db(read_only=True) as conn:
@@ -466,8 +499,26 @@ def run_versioned_migrations() -> int:
         rows = conn.execute(f"SELECT version FROM {MIGRATION_VERSION_TABLE}").fetchall()
         applied = {r['version'] for r in rows}
 
-    migration_files = sorted(p for p in versions_dir.glob("*.sql"))
+    migration_files = sorted(p for p in versions_dir.glob("*.sql")) if versions_dir.exists() else []
     applied_count = 0
+
+    # Apply lightweight Python migrations (idempotent/conditional) first
+    python_migrations = [
+        ("0001_add_film_columns", _migrate_films_table),
+        ("0002_add_user_profile_schema_version", _migrate_user_profiles_table),
+        ("0003_ensure_user_relationships_table", _ensure_user_relationships_table),
+    ]
+
+    for version, fn in python_migrations:
+        if version in applied:
+            continue
+        with get_db() as conn:
+            fn(conn)
+            conn.execute(
+                f"INSERT OR REPLACE INTO {MIGRATION_VERSION_TABLE} (version, applied_at) VALUES (?, ?)",
+                (version, datetime.now().isoformat())
+            )
+        applied_count += 1
 
     for path in migration_files:
         version = path.stem
@@ -484,20 +535,6 @@ def run_versioned_migrations() -> int:
         logger.info(f"Applied migration {version}")
 
     return applied_count
-
-
-def populate_normalized_tables(conn, film_metadata):
-    """
-    Populate normalized tables from film metadata for a single film.
-
-    This is a convenience wrapper around populate_normalized_tables_batch
-    for single-film operations.
-
-    Args:
-        conn: Database connection
-        film_metadata: FilmMetadata object or dict with slug and attribute lists
-    """
-    populate_normalized_tables_batch(conn, [film_metadata])
 
 
 def populate_normalized_tables_batch(conn, film_metadata_list: list) -> None:
@@ -1199,3 +1236,74 @@ def update_idf_incremental(new_film_slugs: list[str]) -> None:
                     (attribute_type, attribute_value, doc_count, idf_score)
                     VALUES (?, ?, ?, ?)
                 """, (attr_type, value, new_doc_count, new_idf))
+
+
+def save_user_follows(follower: str, followees: list[str]) -> int:
+    """
+    Save follow relationships for a user.
+
+    Args:
+        follower: The username doing the following
+        followees: List of usernames they follow
+
+    Returns:
+        Number of new relationships saved
+    """
+    if not followees:
+        return 0
+
+    with get_db() as conn:
+        scraped_at = datetime.now().isoformat()
+        conn.executemany(
+            """
+            INSERT OR IGNORE INTO user_follows (follower, followee, scraped_at)
+            VALUES (?, ?, ?)
+            """,
+            [(follower, followee, scraped_at) for followee in followees]
+        )
+        # Return approximate count (executemany doesn't give per-row info)
+        return len(followees)
+
+
+def save_user_followers(followee: str, followers: list[str]) -> int:
+    """
+    Save follow relationships where others follow this user.
+
+    Args:
+        followee: The username being followed
+        followers: List of usernames who follow them
+
+    Returns:
+        Number of new relationships saved
+    """
+    if not followers:
+        return 0
+
+    with get_db() as conn:
+        scraped_at = datetime.now().isoformat()
+        conn.executemany(
+            """
+            INSERT OR IGNORE INTO user_follows (follower, followee, scraped_at)
+            VALUES (?, ?, ?)
+            """,
+            [(follower, followee, scraped_at) for follower in followers]
+        )
+        return len(followers)
+
+
+def get_social_graph_stats() -> dict:
+    """Get statistics about the social graph."""
+    with get_db(read_only=True) as conn:
+        total = conn.execute("SELECT COUNT(*) FROM user_follows").fetchone()[0]
+        unique_followers = conn.execute(
+            "SELECT COUNT(DISTINCT follower) FROM user_follows"
+        ).fetchone()[0]
+        unique_followees = conn.execute(
+            "SELECT COUNT(DISTINCT followee) FROM user_follows"
+        ).fetchone()[0]
+
+        return {
+            "total_edges": total,
+            "unique_followers": unique_followers,
+            "unique_followees": unique_followees,
+        }

@@ -146,7 +146,7 @@ def test_populate_normalized_tables_batch_replaces_entries(fresh_db):
     }
 
     with db.get_db() as conn:
-        db.populate_normalized_tables(conn, film)
+        db.populate_normalized_tables_batch(conn, [film])
         # Update attributes and ensure old ones are replaced
         film_updated = {
             "slug": "film-a",
@@ -155,7 +155,7 @@ def test_populate_normalized_tables_batch_replaces_entries(fresh_db):
             "cast": ["ActorB"],
             "themes": ["ThemeB"],
         }
-        db.populate_normalized_tables(conn, film_updated)
+        db.populate_normalized_tables_batch(conn, [film_updated])
 
     with db.get_db(read_only=True) as conn:
         director = conn.execute(

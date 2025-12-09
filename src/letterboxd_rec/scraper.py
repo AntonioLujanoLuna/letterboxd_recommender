@@ -82,6 +82,30 @@ def validate_slug(slug: str | None) -> str | None:
     return full_slug
 
 
+def _parse_rating_span(span) -> float | None:
+    """
+    Parse a rating from a span element with a class like 'rated-8' (4.0 stars).
+
+    Shared by sync and async scrapers to avoid duplicated logic.
+    """
+    classes = span.attributes.get("class", "")
+    for cls in classes.split():
+        if cls.startswith("rated-"):
+            try:
+                val = int(cls.replace("rated-", "")) / 2
+                if 0.5 <= val <= 5.0:
+                    return val
+                logger.warning(f"Rating value outside range [0.5-5.0]: {val} from class '{cls}'")
+                return None
+            except ValueError as exc:
+                logger.warning(f"Unexpected rating format in class '{cls}': {exc}")
+                return None
+
+    if classes:
+        logger.debug(f"No 'rated-*' class found in span classes: {classes}")
+    return None
+
+
 def _parse_rating_count(text: str) -> int | None:
     """
     Parse rating count from text like '1.5M', '500K', '1.2B', or '12,345'.
@@ -647,32 +671,8 @@ class LetterboxdScraper:
         return meta
     
     def _parse_rating(self, span) -> float | None:
-        """
-        Parse rating from span element with class like 'rated-8' (representing 4.0 stars).
-
-        Returns rating float or None if parsing fails.
-        Logs warning if unexpected format detected to catch Letterboxd HTML changes.
-        """
-        classes = span.attributes.get("class", "")
-        for cls in classes.split():
-            if cls.startswith("rated-"):
-                try:
-                    val = int(cls.replace("rated-", "")) / 2
-                    if 0.5 <= val <= 5.0:
-                        return val
-                    else:
-                        # Rating outside expected range - log for investigation
-                        logger.warning(f"Rating value outside range [0.5-5.0]: {val} from class '{cls}'")
-                        return None
-                except ValueError as e:
-                    # Non-integer after "rated-" prefix - unexpected format
-                    logger.warning(f"Unexpected rating format in class '{cls}': {e}")
-                    return None
-
-        # No 'rated-*' class found - might indicate HTML structure change
-        if classes:
-            logger.debug(f"No 'rated-*' class found in span classes: {classes}")
-        return None
+        """Thin wrapper around shared rating parser for backward compatibility."""
+        return _parse_rating_span(span)
     
     def scrape_following(self, username: str, limit: int = 100) -> list[str]:
         """Scrape usernames that the target user follows."""
@@ -1050,27 +1050,8 @@ class AsyncLetterboxdScraper:
 
     @staticmethod
     def _parse_rating(span) -> float | None:
-        """
-        Parse rating from span element with class like 'rated-8' (representing 4.0 stars).
-
-        Mirrors the synchronous scraper's logic so async user scraping can share the same format handling.
-        """
-        classes = span.attributes.get("class", "")
-        for cls in classes.split():
-            if cls.startswith("rated-"):
-                try:
-                    val = int(cls.replace("rated-", "")) / 2
-                    if 0.5 <= val <= 5.0:
-                        return val
-                    logger.warning(f"Rating value outside range [0.5-5.0]: {val} from class '{cls}'")
-                    return None
-                except ValueError as exc:
-                    logger.warning(f"Unexpected rating format in class '{cls}': {exc}")
-                    return None
-
-        if classes:
-            logger.debug(f"No 'rated-*' class found in span classes: {classes}")
-        return None
+        """Reuse the shared rating parser."""
+        return _parse_rating_span(span)
 
     @staticmethod
     def _detect_soft_block(tree: HTMLParser | None) -> bool:
@@ -1276,6 +1257,163 @@ class AsyncLetterboxdScraper:
         n_liked = sum(1 for f in films.values() if f.liked)
         logger.info(f"Total: {len(films)} films ({n_rated} rated, {n_liked} liked)")
         return list(films.values())
+
+    async def scrape_user_smart(
+        self,
+        username: str,
+        known_film_count: int | None = None,
+    ) -> list[FilmInteraction]:
+        """
+        Async smart scraping variant with adaptive paging/early stop.
+        Mirrors the synchronous scrape_user_smart but keeps everything async-friendly.
+        """
+        films: dict[str, FilmInteraction] = {}
+
+        estimated_pages = None
+        if known_film_count:
+            estimated_pages = (known_film_count // SCRAPER_PAGE_SIZE) + 1
+            if estimated_pages > 10:
+                logger.info(f"Large profile detected ({known_film_count} films, ~{estimated_pages} pages)")
+
+        page = 1
+        empty_pages = 0
+
+        while True:
+            tree = await self._get_with_soft_block_recovery(f"{self.BASE}/{username}/films/page/{page}/")
+            if not tree:
+                break
+
+            items = tree.css("li.griditem")
+            if not items:
+                empty_pages += 1
+                if empty_pages >= 2:
+                    break
+                page += 1
+                continue
+
+            empty_pages = 0
+            stop_after_page = len(items) < SCRAPER_PAGE_SIZE * 0.8
+
+            for item in items:
+                react_comp = item.css_first("div.react-component")
+                if not react_comp:
+                    continue
+
+                slug = validate_slug(react_comp.attributes.get("data-item-slug"))
+                if not slug:
+                    continue
+
+                rating = None
+                liked = False
+
+                viewing_data = item.css_first("p.poster-viewingdata")
+                if viewing_data:
+                    rating_span = viewing_data.css_first("span.rating")
+                    if rating_span:
+                        rating = _parse_rating_span(rating_span)
+
+                    liked = viewing_data.css_first("span.like") is not None
+
+                films[slug] = FilmInteraction(slug, rating, True, False, liked)
+
+            page += 1
+            if stop_after_page:
+                break
+            if estimated_pages and page > estimated_pages + 2:
+                break
+
+        # Watchlist sweep (reuse standard logic with smart requests)
+        page = 1
+        while True:
+            tree = await self._get_with_soft_block_recovery(f"{self.BASE}/{username}/watchlist/page/{page}/")
+            if not tree:
+                break
+
+            items = tree.css("li.griditem")
+            if not items:
+                break
+
+            stop_after_page = len(items) < SCRAPER_PAGE_SIZE
+            for item in items:
+                react_comp = item.css_first("div.react-component")
+                if not react_comp:
+                    continue
+
+                slug = validate_slug(react_comp.attributes.get("data-item-slug"))
+                if not slug:
+                    continue
+
+                if slug in films:
+                    films[slug].watchlisted = True
+                else:
+                    films[slug] = FilmInteraction(slug, None, False, True, False)
+
+            page += 1
+            if stop_after_page:
+                break
+
+        n_rated = sum(1 for f in films.values() if f.rating)
+        n_liked = sum(1 for f in films.values() if f.liked)
+        logger.info(f"Smart scrape total (async): {len(films)} films ({n_rated} rated, {n_liked} liked)")
+        return list(films.values())
+    
+    async def scrape_following_async(self, username: str, limit: int = 100) -> list[str]:
+        """Scrape usernames that the target user follows (async)."""
+        usernames: list[str] = []
+        page = 1
+
+        logger.info(f"Scraping {username}'s following (async)...")
+        while len(usernames) < limit:
+            tree = await self._get_with_soft_block_recovery(f"{self.BASE}/{username}/following/page/{page}/")
+            if not tree:
+                break
+
+            links = tree.css("a.name")
+            if not links:
+                break
+
+            for link in links:
+                href = link.attributes.get("href", "")
+                if href.startswith("/") and href.endswith("/"):
+                    user = href.strip("/")
+                    if user and user not in usernames:
+                        usernames.append(user)
+                        if len(usernames) >= limit:
+                            break
+
+            page += 1
+
+        logger.info(f"  Found {len(usernames)} following")
+        return usernames
+
+    async def scrape_followers_async(self, username: str, limit: int = 100) -> list[str]:
+        """Scrape usernames that follow the target user (async)."""
+        usernames: list[str] = []
+        page = 1
+
+        logger.info(f"Scraping {username}'s followers (async)...")
+        while len(usernames) < limit:
+            tree = await self._get_with_soft_block_recovery(f"{self.BASE}/{username}/followers/page/{page}/")
+            if not tree:
+                break
+
+            links = tree.css("a.name")
+            if not links:
+                break
+
+            for link in links:
+                href = link.attributes.get("href", "")
+                if href.startswith("/") and href.endswith("/"):
+                    user = href.strip("/")
+                    if user and user not in usernames:
+                        usernames.append(user)
+                        if len(usernames) >= limit:
+                            break
+
+            page += 1
+
+        logger.info(f"  Found {len(usernames)} followers")
+        return usernames
     
     async def scrape_films_batch(self, slugs: list[str]) -> list[FilmMetadata]:
         """

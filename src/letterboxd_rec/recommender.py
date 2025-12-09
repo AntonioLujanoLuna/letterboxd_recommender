@@ -48,6 +48,7 @@ from .config import (
     MOMENTUM_THRESHOLD_NEGATIVE,
     MOMENTUM_WEIGHT_DIRECTOR,
     MOMENTUM_WEIGHT_GENRE,
+    SECONDARY_COUNTRY_WEIGHT,
     TFIDF_FIELDS,
     TFIDF_MIN_DF,
     TFIDF_MAX_FEATURES,
@@ -131,6 +132,7 @@ class AttributeConfig:
     reason_template: str               # e.g., "Genre: {}" or "Director: {}"
     warning_template: str              # e.g., "⚠️ Genre: {} (disliked)"
     distinctive_reason_template: str   # e.g., "Genre: {} (distinctive taste)"
+    secondary_weight: Optional[float] = None  # Optional multiplier for secondary values (e.g., countries)
 
 
 RuleFunc = Callable[
@@ -230,8 +232,7 @@ def _genre_pair_rule(
         for g2 in film_genres[i + 1:]:
             pair = "|".join(sorted([g1, g2]))
             pair_value = None
-            # Prefer interaction effects when available, otherwise fall back to co-occurrence counts
-            if hasattr(profile, "genre_interactions") and pair in getattr(profile, "genre_interactions", {}):
+            if pair in getattr(profile, "genre_interactions", {}):
                 pair_value = profile.genre_interactions[pair]
             elif pair in profile.genre_pairs:
                 pair_value = profile.genre_pairs[pair]
@@ -274,32 +275,6 @@ def _decade_rule(
         )
         return profile.decades[decade] * WEIGHTS['decade'] * learned_weight, [], []
     return 0.0, [], []
-
-
-def _country_rule(
-    recommender: "MetadataRecommender",
-    film: dict,
-    profile: UserProfile,
-    reasons: list[str],
-    warnings: list[str],
-) -> tuple[float, list[str], list[str]]:
-    """Country affinity with primary/secondary weighting and confidence."""
-    film_countries = recommender._get_list(film, 'countries')
-    country_reasons: list[str] = []
-    country_score_total = 0.0
-
-    for i, country in enumerate(film_countries):
-        if country in profile.countries:
-            country_score = profile.countries[country]
-            count = profile.country_counts.get(country, 1)
-            confidence = _confidence_weight(count, CONFIDENCE_MIN_SAMPLES['country'])
-
-            country_weight = WEIGHTS['country'] if i == 0 else WEIGHTS['country'] * recommender.COUNTRY_SECONDARY_WEIGHT
-            country_score_total += country_score * country_weight * confidence
-            if i == 0 and country_score > 0.5:
-                country_reasons.append(f"Country: {country}")
-
-    return country_score_total, country_reasons, []
 
 
 def _community_rating_rule(
@@ -370,11 +345,10 @@ def _momentum_rule(
         if key in momentum_data:
             momentum = momentum_data[key]
             if momentum > MOMENTUM_THRESHOLD_POSITIVE:
-                score_delta += momentum * MOMENTUM_WEIGHT_DIRECTOR
+                score_delta += momentum * (MOMENTUM_WEIGHT_DIRECTOR * 1.5)
                 momentum_reasons.append(f"Rising interest: {director}")
             elif momentum < MOMENTUM_THRESHOLD_NEGATIVE:
-                # Negative momentum penalizes matching films
-                score_delta += momentum * 0.3
+                score_delta += momentum * max(MOMENTUM_WEIGHT_DIRECTOR, 0.5)
                 momentum_warnings.append(f"Waning interest: {director}")
 
     # Check genres
@@ -383,20 +357,18 @@ def _momentum_rule(
         if key in momentum_data:
             momentum = momentum_data[key]
             if momentum > MOMENTUM_THRESHOLD_POSITIVE:
-                score_delta += momentum * MOMENTUM_WEIGHT_GENRE
-                if not momentum_reasons:
-                    momentum_reasons.append(f"Growing {genre} interest")
+                score_delta += momentum * (MOMENTUM_WEIGHT_GENRE * 1.3)
+                momentum_reasons.append(f"Growing {genre} interest")
             elif momentum < MOMENTUM_THRESHOLD_NEGATIVE:
-                score_delta += momentum * 0.2
+                score_delta += momentum * max(MOMENTUM_WEIGHT_GENRE, 0.4)
 
-    return score_delta, momentum_reasons[:1], momentum_warnings[:1]
+    return score_delta, momentum_reasons[:2], momentum_warnings[:2]
 
 
 DEFAULT_SCORING_RULES: list[RuleFunc] = [
     _director_confidence_rule,
     _genre_pair_rule,
     _decade_rule,
-    _country_rule,
     _community_rating_rule,
     _popularity_rule,
     _momentum_rule,
@@ -598,6 +570,21 @@ ATTRIBUTE_CONFIGS = [
         distinctive_reason_template='Language: {}'
     ),
     AttributeConfig(
+        name='country',
+        film_field='countries',
+        profile_attr='countries',
+        counts_attr='country_counts',
+        weight=WEIGHTS['country'],
+        match_threshold=0.2,
+        negative_threshold=0.0,
+        max_items=3,
+        idf_type='country',
+        reason_template='Country: {}',
+        warning_template='⚠️ Country: {} (disliked)',
+        distinctive_reason_template='Country: {}',
+        secondary_weight=SECONDARY_COUNTRY_WEIGHT,
+    ),
+    AttributeConfig(
         name='writer',
         film_field='writers',
         profile_attr='writers',
@@ -734,10 +721,9 @@ class MetadataRecommender:
         distinctive_items = []
         warnings = []
 
-        for value in film_values:
+        for idx, value in enumerate(film_values):
             if value not in profile_scores:
                 continue
-
             value_score = profile_scores[value]
             count = profile_counts.get(value, 1)
             learned_weight = (
@@ -745,7 +731,10 @@ class MetadataRecommender:
                 if self.feature_weights
                 else 1.0
             )
-            adjusted_score = value_score * learned_weight
+            item_weight = (
+                config.secondary_weight if config.secondary_weight is not None and idx > 0 else 1.0
+            )
+            adjusted_score = value_score * learned_weight * item_weight
 
             # Apply confidence weighting
             confidence = _confidence_weight(count, CONFIDENCE_MIN_SAMPLES.get(config.name, 5))
@@ -2105,70 +2094,4 @@ class CollaborativeRecommender:
         sorted_followers = sorted(follower_scores.items(), key=lambda x: -x[1])[:k]
 
         return sorted_influencers, sorted_followers
-
-@dataclass
-class ExplainedRecommendation(Recommendation):
-    """Extended recommendation with interpretable explanations."""
-    contribution_breakdown: dict[str, float] = field(default_factory=dict)
-    counterfactuals: list[str] = field(default_factory=list)
-    confidence: float = 0.0
-
-    @staticmethod
-    def explain_recommendation(
-        recommender: "MetadataRecommender",
-        film: dict,
-        profile: UserProfile,
-        seen_films: set[str] | None = None,
-    ) -> "ExplainedRecommendation":
-        """Generate detailed explanation for a single film recommendation."""
-
-        _ = seen_films  # reserved for future counterfactual comparisons
-        score, reasons, warnings = recommender._score_film(film, profile)
-
-        # Decompose score by attribute type
-        contributions = {}
-        for config in ATTRIBUTE_CONFIGS:
-            attr_score, _, _ = recommender._score_attribute(film, profile, config)
-            if abs(attr_score) > 0.01:
-                contributions[config.name] = round(attr_score, 2)
-
-        # Generate counterfactuals
-        counterfactuals = []
-
-        # "If you hadn't liked X director..."
-        film_directors = load_json(film.get('directors'))
-        for director in film_directors:
-            if director in profile.directors and profile.directors[director] > 1.0:
-                learned_weight = (
-                    recommender.feature_weights.factor("director", director)
-                    if getattr(recommender, "feature_weights", None)
-                    else 1.0
-                )
-                hypothetical_score = score - (
-                    profile.directors[director] * WEIGHTS['director'] * learned_weight
-                )
-                if hypothetical_score < score * 0.5:
-                    counterfactuals.append(
-                        f"Without your {director} affinity, score would drop to {hypothetical_score:.1f}"
-                    )
-
-        # Confidence based on profile observation counts
-        relevant_counts = []
-        for director in film_directors:
-            if director in profile.director_counts:
-                relevant_counts.append(profile.director_counts[director])
-
-        confidence = min(1.0, sum(relevant_counts) / 10) if relevant_counts else 0.3
-
-        return ExplainedRecommendation(
-            slug=film['slug'],
-            title=film.get('title', film['slug']),
-            year=film.get('year'),
-            score=score,
-            reasons=reasons[:3],
-            warnings=warnings[:2],
-            contribution_breakdown=contributions,
-            counterfactuals=counterfactuals[:2],
-            confidence=confidence
-        )
 

@@ -471,6 +471,7 @@ class GroupRecommender:
             return []
 
         logger.info("Found %s films on multiple watchlists", len(watchlist_films))
+        # Delegate to standard recommend flow but force shared watchlist prioritization
         return self.recommend(group, n=n, prioritize_shared_watchlist=True)
 
     def explain_group(self, group: GroupProfile) -> dict:
@@ -530,6 +531,7 @@ def recommend_for_group(
     strategy: str = "fairness",
     weights: dict[str, float] | None = None,
     feature_weights_path: str | Path | None = None,
+    triage_watchlist: bool = False,
     **filters,
 ) -> tuple[list[GroupRecommendation], dict]:
     """
@@ -549,7 +551,10 @@ def recommend_for_group(
 
     group = recommender.create_group(usernames, weights=weights)
     group_info = recommender.explain_group(group)
-    recommendations = recommender.recommend(group, n=n, **filters)
+    if triage_watchlist:
+        recommendations = recommender.triage_watchlists(group, n=n)
+    else:
+        recommendations = recommender.recommend(group, n=n, **filters)
 
     return recommendations, group_info
 

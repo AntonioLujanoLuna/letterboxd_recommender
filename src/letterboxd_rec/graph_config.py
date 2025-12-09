@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .config import ITEM_SIM_CACHE_PATH
+
 
 @dataclass
 class GraphConfig:
@@ -107,12 +109,12 @@ class GraphConfig:
 
     # Item similarity edges
     use_item_similarity_edges: bool = True
-    item_similarity_path: Path = Path("data/item_similarity.npz")
+    item_similarity_path: Path = ITEM_SIM_CACHE_PATH
     item_similarity_top_k: int = 30
     item_similarity_weight: float = 1.0
 
     # User social edges (follows). Safe no-op if table/data unavailable.
-    use_follow_edges: bool = False
+    use_follow_edges: bool = True
     follow_edge_weight: float = 0.3
 
     # IDF weighting toggle
