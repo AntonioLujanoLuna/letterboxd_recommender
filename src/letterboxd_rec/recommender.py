@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from .profile import UserProfile, build_profile
 from .database import load_json
+from .feature_weights import FeatureWeights, load_feature_weights
 from .config import (
     WEIGHTS,
     MATCH_THRESHOLD_GENRE,
@@ -266,7 +267,12 @@ def _decade_rule(
 
     decade = (year // 10) * 10
     if decade in profile.decades:
-        return profile.decades[decade] * WEIGHTS['decade'], [], []
+        learned_weight = (
+            recommender.feature_weights.factor("decade", decade)
+            if getattr(recommender, "feature_weights", None)
+            else 1.0
+        )
+        return profile.decades[decade] * WEIGHTS['decade'] * learned_weight, [], []
     return 0.0, [], []
 
 
@@ -653,7 +659,13 @@ class MetadataRecommender:
 
     COUNTRY_SECONDARY_WEIGHT = 0.3
 
-    def __init__(self, all_films: list[dict], use_idf: bool = USE_IDF_WEIGHTING):
+    def __init__(
+        self,
+        all_films: list[dict],
+        use_idf: bool = USE_IDF_WEIGHTING,
+        feature_weights: FeatureWeights | None = None,
+        feature_weights_path: str | Path | None = None,
+    ):
         # Pre-parse JSON fields once to avoid repeated load_json calls during scoring
         self.films = {f['slug']: f for f in all_films}
         for film in self.films.values():
@@ -678,6 +690,7 @@ class MetadataRecommender:
         else:
             self.idf = {}
         self._tfidf: TfidfEmbedder | None = None
+        self.feature_weights = feature_weights or load_feature_weights(feature_weights_path)
         self.scoring_engine = ScoringEngine(ATTRIBUTE_CONFIGS, DEFAULT_SCORING_RULES)
 
     def _get_list(self, film: dict, field: str, limit: int | None = None) -> list:
@@ -727,6 +740,12 @@ class MetadataRecommender:
 
             value_score = profile_scores[value]
             count = profile_counts.get(value, 1)
+            learned_weight = (
+                self.feature_weights.factor(config.name, value)
+                if self.feature_weights
+                else 1.0
+            )
+            adjusted_score = value_score * learned_weight
 
             # Apply confidence weighting
             confidence = _confidence_weight(count, CONFIDENCE_MIN_SAMPLES.get(config.name, 5))
@@ -737,16 +756,16 @@ class MetadataRecommender:
                 idf_weight = self.idf[config.idf_type].get(value, 1.0)
 
             # Handle negative scores with amplified penalty
-            if value_score < 0:
+            if adjusted_score < 0:
                 penalty_multiplier = NEGATIVE_PENALTY_MULTIPLIERS.get(config.name, NEGATIVE_PENALTY_MULTIPLIER)
-                total_score += value_score * penalty_multiplier * confidence * idf_weight
-                if config.negative_threshold != 0.0 and value_score < config.negative_threshold:
+                total_score += adjusted_score * penalty_multiplier * confidence * idf_weight
+                if config.negative_threshold != 0.0 and adjusted_score < config.negative_threshold:
                     warnings.append(config.warning_template.format(value))
             else:
-                total_score += value_score * confidence * idf_weight
+                total_score += adjusted_score * confidence * idf_weight
 
                 # Track positive matches for reasons
-                if value_score > config.match_threshold:
+                if adjusted_score > config.match_threshold:
                     # Check if distinctive (high IDF)
                     if self.use_idf and config.idf_type and idf_weight > IDF_DISTINCTIVE_THRESHOLD:
                         distinctive_items.append(value)
@@ -2120,7 +2139,14 @@ class ExplainedRecommendation(Recommendation):
         film_directors = load_json(film.get('directors'))
         for director in film_directors:
             if director in profile.directors and profile.directors[director] > 1.0:
-                hypothetical_score = score - (profile.directors[director] * WEIGHTS['director'])
+                learned_weight = (
+                    recommender.feature_weights.factor("director", director)
+                    if getattr(recommender, "feature_weights", None)
+                    else 1.0
+                )
+                hypothetical_score = score - (
+                    profile.directors[director] * WEIGHTS['director'] * learned_weight
+                )
                 if hypothetical_score < score * 0.5:
                     counterfactuals.append(
                         f"Without your {director} affinity, score would drop to {hypothetical_score:.1f}"

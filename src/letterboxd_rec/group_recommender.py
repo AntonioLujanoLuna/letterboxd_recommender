@@ -12,7 +12,9 @@ import math
 from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from .database import get_db, load_json, load_user_lists
+from .feature_weights import FeatureWeights, load_feature_weights
 from .profile import UserProfile, build_profile
 from .recommender import MetadataRecommender
 
@@ -109,11 +111,24 @@ class GroupRecommender:
         all_films: dict[str, dict],
         strategy: AggregationStrategy = AggregationStrategy.FAIRNESS,
         approval_threshold: float = 2.0,
+        feature_weights: FeatureWeights | None = None,
+        feature_weights_path: str | Path | None = None,
+        metadata_recommender_cls=None,
     ):
         self.all_films = all_films
         self.strategy = strategy
         self.approval_threshold = approval_threshold
-        self._recommender = MetadataRecommender(list(all_films.values()))
+        self.feature_weights = feature_weights or load_feature_weights(feature_weights_path)
+        recommender_cls = metadata_recommender_cls or MetadataRecommender
+        try:
+            self._recommender = recommender_cls(
+                list(all_films.values()),
+                feature_weights=self.feature_weights,
+                feature_weights_path=feature_weights_path,
+            )
+        except TypeError:
+            # Backward/stub compatibility for tests that inject simpler constructors
+            self._recommender = recommender_cls(list(all_films.values()))
 
     def create_group(
         self,
@@ -514,6 +529,7 @@ def recommend_for_group(
     n: int = 20,
     strategy: str = "fairness",
     weights: dict[str, float] | None = None,
+    feature_weights_path: str | Path | None = None,
     **filters,
 ) -> tuple[list[GroupRecommendation], dict]:
     """
@@ -525,7 +541,11 @@ def recommend_for_group(
         all_films = {row["slug"]: dict(row) for row in conn.execute("SELECT * FROM films")}
 
     strategy_enum = AggregationStrategy(strategy)
-    recommender = GroupRecommender(all_films, strategy=strategy_enum)
+    recommender = GroupRecommender(
+        all_films,
+        strategy=strategy_enum,
+        feature_weights_path=feature_weights_path,
+    )
 
     group = recommender.create_group(usernames, weights=weights)
     group_info = recommender.explain_group(group)

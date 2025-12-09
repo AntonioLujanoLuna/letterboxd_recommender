@@ -1,4 +1,5 @@
 import pytest
+from letterboxd_rec.feature_weights import FeatureWeights
 
 
 def _film(
@@ -69,6 +70,34 @@ def test_metadata_recommender_diversity_limits_director_concentration(fresh_reco
         if metadata_rec.films.get(r.slug)
     ]
     assert len(set(directors)) == len(directors)
+
+
+def test_feature_weights_adjust_attribute_scores(fresh_recommender_modules):
+    rec_mod, _, _ = fresh_recommender_modules
+
+    films = [
+        _film("seed", "Seed", genres=["horror", "comedy"]),
+        _film("horror-pick", "Horror Pick", genres=["horror"]),
+        _film("comedy-pick", "Comedy Pick", genres=["comedy"]),
+    ]
+
+    weights = FeatureWeights(genre={"horror": 0.2, "comedy": 2.0})
+    metadata_rec = rec_mod.MetadataRecommender(
+        films, use_idf=False, feature_weights=weights
+    )
+
+    profile = rec_mod.UserProfile()
+    profile.genres = {"horror": 1.0, "comedy": 1.0}
+    profile.genre_counts = {"horror": 5, "comedy": 5}
+
+    horror_score, _, _ = metadata_rec._score_film(
+        metadata_rec.films["horror-pick"], profile
+    )
+    comedy_score, _, _ = metadata_rec._score_film(
+        metadata_rec.films["comedy-pick"], profile
+    )
+
+    assert comedy_score > horror_score
 
 
 def test_collaborative_recommender_surfaces_neighbor_favorite(fresh_recommender_modules):

@@ -20,9 +20,31 @@ from .config import (
     SCRAPER_429_BACKOFF,
     SCRAPER_429_JITTER,
     SCRAPER_PAGE_SIZE,
+    LETTERBOXD_COOKIE,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_cookie_header(cookie_header: str | None) -> dict[str, str]:
+    """
+    Convert a raw Cookie header string into a dict for httpx.
+
+    Accepts the full "key=value; key2=value2" header; ignores malformed pairs.
+    """
+    if not cookie_header:
+        return {}
+
+    cookie_jar: dict[str, str] = {}
+    for part in cookie_header.split(";"):
+        if "=" not in part:
+            continue
+        name, value = part.split("=", 1)
+        name = name.strip()
+        value = value.strip()
+        if name:
+            cookie_jar[name] = value
+    return cookie_jar
 
 
 def validate_slug(slug: str | None) -> str | None:
@@ -81,6 +103,19 @@ def _parse_rating_count(text: str) -> int | None:
         return None
 
 
+def _parse_fan_count_from_html(html: str) -> int | None:
+    """
+    Extract fan count from the ratings-summary CSI snippet.
+    Looks for patterns like '26K fans' or '4,876,723 fans'.
+    """
+    match = re.search(r"([0-9][0-9,.\u202fKMB]+)\s+fans", html, re.IGNORECASE)
+    if not match:
+        return None
+    raw = match.group(1)
+    cleaned = raw.replace("\u202f", "").replace(" ", "")
+    return _parse_rating_count(cleaned)
+
+
 @dataclass
 class FilmInteraction:
     film_slug: str
@@ -101,11 +136,14 @@ class FilmMetadata:
     runtime: int | None
     avg_rating: float | None
     rating_count: int | None
+    fan_count: int | None
     countries: list[str]
     languages: list[str]
     writers: list[str]
     cinematographers: list[str]
     composers: list[str]
+    is_short: bool
+    is_animation: bool
 
 
 def parse_film_page(tree: HTMLParser, slug: str) -> FilmMetadata:
@@ -113,6 +151,38 @@ def parse_film_page(tree: HTMLParser, slug: str) -> FilmMetadata:
     Shared parsing logic for film pages.
     Used by both sync and async scrapers to avoid code duplication.
     """
+    # Structured data (used for stable rating_count / avg_rating parsing)
+    aggregate_rating: dict = {}
+    ldjson = tree.css_first("script[type='application/ld+json']")
+    if ldjson:
+        raw = ldjson.text()
+        # Remove comment wrappers defensively (Letterboxd wraps JSON in /* <![CDATA[ */ ... /* ]]> */)
+        cleaned = re.sub(r"/\*.*?\*/", "", raw, flags=re.S).strip()
+
+        parsed_obj = None
+        for candidate in (raw.strip(), cleaned):
+            try:
+                parsed_obj = json.loads(candidate)
+            except json.JSONDecodeError as exc:  # noqa: PERF203 (clarity)
+                logger.debug(f"Failed to parse ld+json for {slug}: {exc}")
+                continue
+
+            if isinstance(parsed_obj, list):
+                parsed_obj = parsed_obj[0] if parsed_obj else {}
+            if isinstance(parsed_obj, dict):
+                aggregate_rating = parsed_obj.get("aggregateRating") or {}
+                break
+
+        if not aggregate_rating:
+            rating_value_match = re.search(r'"ratingValue"\s*:\s*([0-9.]+)', raw)
+            rating_count_match = re.search(r'"ratingCount"\s*:\s*([\d,]+)', raw)
+            if rating_value_match or rating_count_match:
+                aggregate_rating = {}
+                if rating_value_match:
+                    aggregate_rating["ratingValue"] = rating_value_match.group(1)
+                if rating_count_match:
+                    aggregate_rating["ratingCount"] = rating_count_match.group(1).replace(",", "")
+
     # Title
     title_el = tree.css_first("h1.headline-1")
     title = title_el.text(strip=True) if title_el else slug
@@ -162,6 +232,13 @@ def parse_film_page(tree: HTMLParser, slug: str) -> FilmMetadata:
         except (ValueError, IndexError):
             pass
 
+    is_animation = "animation" in genres
+    is_short = False
+    if runtime is not None:
+        is_short = runtime <= 40
+    if not is_short and "short" in genres:
+        is_short = True
+
     # Average rating
     avg_rating = None
     meta = tree.css_first("meta[name='twitter:data2']")
@@ -171,11 +248,23 @@ def parse_film_page(tree: HTMLParser, slug: str) -> FilmMetadata:
         except (ValueError, IndexError):
             pass
 
+    if avg_rating is None and aggregate_rating:
+        try:
+            avg_rating = float(aggregate_rating.get("ratingValue"))
+        except (TypeError, ValueError):
+            pass
+
     # Rating count
     rating_count = None
     ratings_el = tree.css_first("a[href*='/ratings/']")
     if ratings_el:
         rating_count = _parse_rating_count(ratings_el.text(strip=True))
+
+    if rating_count is None and aggregate_rating:
+        try:
+            rating_count = int(aggregate_rating.get("ratingCount"))
+        except (TypeError, ValueError):
+            rating_count = None
 
     # Countries
     countries = list(dict.fromkeys([a.text(strip=True) for a in tree.css("a[href*='/films/country/']") if a.text(strip=True)]))
@@ -196,8 +285,10 @@ def parse_film_page(tree: HTMLParser, slug: str) -> FilmMetadata:
         slug=slug, title=title, year=year, directors=directors,
         genres=genres, cast=cast, themes=themes,
         runtime=runtime, avg_rating=avg_rating, rating_count=rating_count,
+        fan_count=None,
         countries=countries, languages=languages, writers=writers,
-        cinematographers=cinematographers, composers=composers
+        cinematographers=cinematographers, composers=composers,
+        is_short=is_short, is_animation=is_animation,
     )
 
 
@@ -205,11 +296,13 @@ class LetterboxdScraper:
     BASE = "https://letterboxd.com"
     
     def __init__(self, delay: float = 1.0):
+        self.cookies = _parse_cookie_header(LETTERBOXD_COOKIE)
         self.client = httpx.Client(
             headers={"User-Agent": "Mozilla/5.0 (compatible; film-rec/0.1)"},
             follow_redirects=True,
             timeout=HTTP_TIMEOUT,
             http2=SCRAPER_HTTP2,
+            cookies=self.cookies or None,
         )
         self.delay = delay
         self._current_delay = max(delay, SCRAPER_ADAPTIVE_DELAY_MIN)
@@ -317,6 +410,19 @@ class LetterboxdScraper:
             return None
 
         return tree
+    
+    def _fetch_fan_count(self, slug: str) -> int | None:
+        """
+        Fetch fan count from the ratings-summary CSI endpoint.
+        """
+        try:
+            resp = self.client.get(f"{self.BASE}/csi/film/{slug}/ratings-summary/")
+            if resp.status_code != 200:
+                return None
+            return _parse_fan_count_from_html(resp.text)
+        except httpx.HTTPError as exc:
+            logger.debug(f"Fan count fetch failed for {slug}: {exc}")
+            return None
     
     def scrape_user(self, username: str, existing_slugs: set[str] | None = None, stop_on_existing: bool = False) -> list[FilmInteraction]:
         """
@@ -536,7 +642,9 @@ class LetterboxdScraper:
         tree = self._get_with_soft_block_recovery(f"{self.BASE}/film/{slug}/")
         if not tree:
             return None
-        return parse_film_page(tree, slug)
+        meta = parse_film_page(tree, slug)
+        meta.fan_count = self._fetch_fan_count(slug)
+        return meta
     
     def _parse_rating(self, span) -> float | None:
         """
@@ -935,6 +1043,7 @@ class AsyncLetterboxdScraper:
         self.delay = delay
         self.semaphore = asyncio.Semaphore(max_concurrent)
         self.client = None
+        self.cookies = _parse_cookie_header(LETTERBOXD_COOKIE)
         # Coordinated rate limiting: when one task hits 429, all tasks pause
         self._rate_limit_event = asyncio.Event()
         self._rate_limit_event.set()  # Start in "not rate limited" state
@@ -989,6 +1098,7 @@ class AsyncLetterboxdScraper:
             follow_redirects=True,
             timeout=HTTP_TIMEOUT,
             http2=SCRAPER_HTTP2,
+            cookies=self.cookies or None,
         )
         return self
     
@@ -1185,6 +1295,7 @@ class AsyncLetterboxdScraper:
             follow_redirects=True,
             timeout=HTTP_TIMEOUT,
             http2=SCRAPER_HTTP2,
+            cookies=self.cookies or None,
         ) as temp_client:
             return await self._scrape_batch_with_client(temp_client, slugs)
     
@@ -1233,6 +1344,17 @@ class AsyncLetterboxdScraper:
 
         return successful
     
+    async def _fetch_fan_count_async(self, client: httpx.AsyncClient, slug: str) -> int | None:
+        """Async helper to fetch fan count from ratings-summary CSI endpoint."""
+        try:
+            resp = await client.get(f"{self.BASE}/csi/film/{slug}/ratings-summary/")
+            if resp.status_code != 200:
+                return None
+            return _parse_fan_count_from_html(resp.text)
+        except httpx.HTTPError as exc:
+            logger.debug(f"Fan count fetch failed for {slug}: {exc}")
+            return None
+    
     async def _scrape_film_async(self, client: httpx.AsyncClient, slug: str) -> FilmMetadata | None:
         """Scrape a single film asynchronously with proper retry logic and coordinated rate limiting."""
         async with self.semaphore:
@@ -1272,7 +1394,9 @@ class AsyncLetterboxdScraper:
 
                     resp.raise_for_status()
                     tree = HTMLParser(resp.text)
-                    return parse_film_page(tree, slug)
+                    meta = parse_film_page(tree, slug)
+                    meta.fan_count = await self._fetch_fan_count_async(client, slug)
+                    return meta
 
                 except httpx.TimeoutException:
                     wait_time = 2**attempt

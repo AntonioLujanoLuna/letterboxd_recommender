@@ -18,7 +18,7 @@ def stub_metadata_recommender(monkeypatch):
     """Avoid hitting the real recommender/DB when constructing GroupRecommender."""
 
     class _StubMetadataRecommender:
-        def __init__(self, films):
+        def __init__(self, films, **_kwargs):
             if isinstance(films, list):
                 self.films = {f.get("slug", f"film-{idx}"): f for idx, f in enumerate(films)}
             else:

@@ -8,6 +8,14 @@ import os
 import logging
 from pathlib import Path
 
+# Optional: load .env if python-dotenv is available
+try:  # pragma: no cover - optional dependency
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except Exception:
+    pass
+
 logger = logging.getLogger(__name__)
 
 
@@ -65,6 +73,7 @@ DEFAULT_SCRAPER_DELAY = _get_float_env("LETTERBOXD_SCRAPER_DELAY", 1.0, min_val=
 DEFAULT_ASYNC_DELAY = _get_float_env("LETTERBOXD_ASYNC_DELAY", 0.2, min_val=0.0)
 DEFAULT_MAX_CONCURRENT = _get_int_env("LETTERBOXD_MAX_CONCURRENT", 5, min_val=1)
 DEFAULT_MAX_CONCURRENT_USERS = _get_int_env("LETTERBOXD_MAX_CONCURRENT_USERS", 2, min_val=1)
+LETTERBOXD_COOKIE = os.environ.get("LETTERBOXD_COOKIE")  # Optional authenticated scraping
 SCRAPER_ADAPTIVE_DELAY_MIN = 0.1
 SCRAPER_ADAPTIVE_DELAY_MAX = 5.0
 SCRAPER_429_BACKOFF = 1.5
@@ -262,6 +271,7 @@ TFIDF_MAX_FEATURES = 20_000
 # Cache paths
 SVD_CACHE_PATH = Path("data/svd_model.npz")
 ITEM_SIM_CACHE_PATH = Path("data/item_similarity.npz")
+FEATURE_WEIGHTS_PATH = Path(os.environ.get("LETTERBOXD_FEATURE_WEIGHTS", "data/feature_weights.json"))
 
 # Item-item similarity safeguards (controls compute cost)
 ITEM_SIM_MIN_RATINGS = 2        # skip items with fewer than this many ratings

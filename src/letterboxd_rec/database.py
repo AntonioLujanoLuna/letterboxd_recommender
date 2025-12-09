@@ -262,6 +262,9 @@ def init_db() -> None:
                 runtime INTEGER,
                 avg_rating REAL,
                 rating_count INTEGER,
+                fan_count INTEGER,
+                is_short INTEGER,
+                is_animation INTEGER,
                 countries TEXT,     -- JSON list
                 languages TEXT,     -- JSON list
                 writers TEXT,       -- JSON list
@@ -395,7 +398,10 @@ def _migrate_films_table(conn):
         'languages': 'TEXT',
         'writers': 'TEXT',
         'cinematographers': 'TEXT',
-        'composers': 'TEXT'
+        'composers': 'TEXT',
+        'fan_count': 'INTEGER',
+        'is_short': 'INTEGER',
+        'is_animation': 'INTEGER',
     }
 
     for col_name, col_type in new_columns.items():

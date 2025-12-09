@@ -24,9 +24,10 @@ def test_parse_film_page_extracts_metadata():
       <small class="number"><a>2023</a></small>
       <a href="/director/someone/">Director One</a>
       <a href="/films/genre/horror/">Horror</a>
+      <a href="/films/genre/short/">Short</a>
       <a href="/actor/lead/">Lead Actor</a>
       <a href="/films/theme/ghosts/">Ghosts</a>
-      <p class="text-link text-footer">120 mins</p>
+      <p class="text-link text-footer">35 mins</p>
       <meta name="twitter:data2" content="4.2 average rating" />
       <a href="/film/test/ratings/">1,234</a>
       <a href="/films/country/usa/">USA</a>
@@ -43,7 +44,9 @@ def test_parse_film_page_extracts_metadata():
     assert meta.year == 2023
     assert "Director One" in meta.directors
     assert "horror" in meta.genres
-    assert meta.runtime == 120
+    assert meta.runtime == 35
+    assert meta.is_short is True
+    assert meta.is_animation is False
     assert meta.avg_rating == 4.2
     assert meta.rating_count == 1234
     assert meta.countries == ["USA"]
@@ -51,6 +54,40 @@ def test_parse_film_page_extracts_metadata():
     assert meta.writers == ["Scribe"]
     assert meta.cinematographers == ["Cine"]
     assert meta.composers == ["Music"]
+
+
+def test_parse_film_page_uses_ldjson_for_rating_count():
+    html = """
+    <html>
+      <h1 class="headline-1">LD JSON Film</h1>
+      <meta property="og:title" content="LD JSON Film (2024)" />
+      <script type="application/ld+json">
+      /* <![CDATA[ */
+      {
+        "aggregateRating": {
+          "ratingValue": 4.5,
+          "ratingCount": 999
+        }
+      }
+      /* ]]> */
+      </script>
+    </html>
+    """
+    tree = HTMLParser(html)
+    meta = scraper.parse_film_page(tree, "ld-json-film")
+
+    assert meta.avg_rating == 4.5
+    assert meta.rating_count == 999
+
+
+def test_parse_fan_count_from_html():
+    html = """
+    <section class="section ratings-histogram-chart">
+      <a href="/film/test/ratings/" class="all-link more-link"> 26K fans</a>
+    </section>
+    """
+    fan_count = scraper._parse_fan_count_from_html(html)
+    assert fan_count == 26_000
 
 
 @pytest.mark.asyncio
@@ -118,11 +155,14 @@ async def test_async_scraper_batch_summarizes_failures(monkeypatch):
                 runtime=None,
                 avg_rating=None,
                 rating_count=None,
+                    fan_count=None,
                 countries=[],
                 languages=[],
                 writers=[],
                 cinematographers=[],
-                composers=[],
+                    composers=[],
+                    is_short=False,
+                    is_animation=False,
             )
         if slug == "missing":
             return None

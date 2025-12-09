@@ -238,13 +238,15 @@ def _scrape_film_metadata(
             conn.executemany("""
                 INSERT OR REPLACE INTO films
                 (slug, title, year, directors, genres, cast, themes, runtime, avg_rating, rating_count,
+                 fan_count, is_short, is_animation,
                  countries, languages, writers, cinematographers, composers)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, [(
                 m.slug, m.title, m.year,
                 json.dumps(m.directors), json.dumps(m.genres),
                 json.dumps(m.cast), json.dumps(m.themes),
                 m.runtime, m.avg_rating, m.rating_count,
+                m.fan_count, int(m.is_short), int(m.is_animation),
                 json.dumps(m.countries), json.dumps(m.languages),
                 json.dumps(m.writers), json.dumps(m.cinematographers),
                 json.dumps(m.composers)
@@ -283,13 +285,15 @@ async def _scrape_film_metadata_async(
             conn.executemany("""
                 INSERT OR REPLACE INTO films
                 (slug, title, year, directors, genres, cast, themes, runtime, avg_rating, rating_count,
+                 fan_count, is_short, is_animation,
                  countries, languages, writers, cinematographers, composers)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, [(
                 m.slug, m.title, m.year,
                 json.dumps(m.directors), json.dumps(m.genres),
                 json.dumps(m.cast), json.dumps(m.themes),
                 m.runtime, m.avg_rating, m.rating_count,
+                m.fan_count, int(m.is_short), int(m.is_animation),
                 json.dumps(m.countries), json.dumps(m.languages),
                 json.dumps(m.writers), json.dumps(m.cinematographers),
                 json.dumps(m.composers)
