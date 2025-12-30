@@ -29,6 +29,12 @@ from .recommenders import (
     CollaborativeRecommender,
 )
 
+# Re-export from profile for backward compatibility
+from .profile import UserProfile, build_profile
+
+# Re-export from config for backward compatibility
+from .config import NEGATIVE_PENALTY_MULTIPLIER, NEGATIVE_PENALTY_MULTIPLIERS, WEIGHTS
+
 __all__ = [
     # Core types
     "Recommendation",
@@ -52,4 +58,11 @@ __all__ = [
     # Recommenders
     "MetadataRecommender",
     "CollaborativeRecommender",
+    # Profile (backward compatibility)
+    "UserProfile",
+    "build_profile",
+    # Config (backward compatibility)
+    "NEGATIVE_PENALTY_MULTIPLIER",
+    "NEGATIVE_PENALTY_MULTIPLIERS",
+    "WEIGHTS",
 ]

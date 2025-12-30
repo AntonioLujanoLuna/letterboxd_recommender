@@ -4,7 +4,16 @@ import argparse
 import atexit
 import logging
 
-from ..database import init_db, close_pool
+from ..database import (
+    init_db,
+    close_pool,
+    get_db,
+    get_pending_queue_stats,
+    get_pending_users,
+    add_pending_users,
+    get_discovery_source,
+    update_discovery_source,
+)
 from ..config import (
     DEFAULT_MAX_PER_BATCH,
     DEFAULT_MAX_CONCURRENT,
@@ -13,7 +22,10 @@ from ..config import (
     DEFAULT_SCRAPER_DELAY,
     PENDING_STALE_DAYS,
     RUN_VACUUM_ANALYZE_DEFAULT,
+    NOTIFICATION_WEBHOOK_URL,
+    DISCOVERY_PRIORITY_MAP,
 )
+from ..scraper import LetterboxdScraper
 
 from .commands import (
     cmd_scrape,
@@ -435,6 +447,19 @@ def main():
 __all__ = [
     'main',
     'setup_jam_parser',
+    # Database re-exports for backward compatibility
+    'init_db',
+    'get_db',
+    'get_pending_queue_stats',
+    'get_pending_users',
+    'add_pending_users',
+    'get_discovery_source',
+    'update_discovery_source',
+    # Config re-exports for backward compatibility
+    'NOTIFICATION_WEBHOOK_URL',
+    'DISCOVERY_PRIORITY_MAP',
+    # Scraper re-exports for backward compatibility
+    'LetterboxdScraper',
     # Commands
     'cmd_scrape',
     'cmd_scrape_social',
