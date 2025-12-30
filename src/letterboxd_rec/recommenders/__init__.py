@@ -1,16 +1,12 @@
-"""Recommender module - thin wrapper for backward compatibility.
+"""Recommenders package for film recommendations.
 
-All functionality has been moved to the recommenders/ package.
-Import from recommenders directly for new code.
+This package provides metadata-based and collaborative filtering recommenders.
 """
 
-from .recommenders import (
-    # Core types
-    Recommendation,
+from .recommendation import Recommendation
+from .scoring import (
     AttributeConfig,
     RuleFunc,
-    # Scoring
-    ScoringEngine,
     ATTRIBUTE_CONFIGS,
     DEFAULT_SCORING_RULES,
     _confidence_weight,
@@ -20,14 +16,12 @@ from .recommenders import (
     _community_rating_rule,
     _popularity_rule,
     _momentum_rule,
-    # Vectorization
-    TfidfEmbedder,
-    # Fusion
-    _fuse_normalized,
-    # Recommenders
-    MetadataRecommender,
-    CollaborativeRecommender,
 )
+from .engine import ScoringEngine
+from .vectorization import TfidfEmbedder
+from .fusion import _fuse_normalized
+from .metadata import MetadataRecommender
+from .collaborative import CollaborativeRecommender
 
 __all__ = [
     # Core types

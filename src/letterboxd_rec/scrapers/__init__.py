@@ -1,29 +1,26 @@
-"""Scraper module - thin wrapper for backward compatibility.
+"""Scrapers package for Letterboxd data collection.
 
-All functionality has been moved to the scrapers/ package.
-Import from scrapers directly for new code.
+This package provides synchronous and asynchronous scrapers for
+fetching user data and film metadata from Letterboxd.
 """
 
-from .scrapers import (
-    # Types
-    FilmInteraction,
-    FilmMetadata,
-    # Utilities
+from .types import FilmInteraction, FilmMetadata
+from .utils import (
     parse_cookie_header,
     validate_slug,
     parse_rating_span,
     parse_rating_count,
     parse_fan_count_from_html,
     parse_film_page,
-    # Backward compatibility aliases with underscore prefix
-    _parse_cookie_header,
-    _parse_rating_span,
-    _parse_rating_count,
-    _parse_fan_count_from_html,
-    # Scrapers
-    LetterboxdScraper,
-    AsyncLetterboxdScraper,
 )
+from .sync import LetterboxdScraper
+from .async_scraper import AsyncLetterboxdScraper
+
+# Backward compatibility aliases
+_parse_cookie_header = parse_cookie_header
+_parse_rating_span = parse_rating_span
+_parse_rating_count = parse_rating_count
+_parse_fan_count_from_html = parse_fan_count_from_html
 
 __all__ = [
     # Types
