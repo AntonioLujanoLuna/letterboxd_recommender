@@ -9,22 +9,13 @@ from pathlib import Path
 from tqdm import tqdm
 
 from ...database import (
-    init_db,
-    get_db,
     parse_timestamp_naive,
-    get_discovery_source,
-    update_discovery_source,
-    add_pending_users,
-    get_pending_users,
     remove_pending_user,
-    get_pending_queue_stats,
     run_maintenance,
     save_user_follows,
     save_user_followers,
 )
-from ...scraper import LetterboxdScraper
 from ...config import (
-    DISCOVERY_PRIORITY_MAP,
     DEFAULT_MAX_PER_BATCH,
     DEFAULT_MAX_CONCURRENT,
     DEFAULT_ASYNC_DELAY,
@@ -36,10 +27,17 @@ from ..utils.scrapers import _scrape_film_metadata, _scrape_users_parallel
 logger = logging.getLogger(__name__)
 
 
+def _get_cli():
+    """Late import cli module to support monkeypatching in tests."""
+    from letterboxd_rec import cli
+    return cli
+
+
 def cmd_discover(args: argparse.Namespace) -> None:
     """Discover and scrape other users with caching and pending queue support."""
-    init_db()
-    scraper = LetterboxdScraper(delay=getattr(args, "discover_delay", DEFAULT_SCRAPER_DELAY))
+    cli = _get_cli()
+    cli.init_db()
+    scraper = cli.LetterboxdScraper(delay=getattr(args, "discover_delay", DEFAULT_SCRAPER_DELAY))
 
     try:
         # Check if we're in continue mode (drain pending queue only)
@@ -48,7 +46,7 @@ def cmd_discover(args: argparse.Namespace) -> None:
 
         if continue_mode:
             # Drain pending queue only
-            queue_stats = get_pending_queue_stats()
+            queue_stats = cli.get_pending_queue_stats()
             logger.info(f"\nPending queue stats:")
             logger.info(f"  Total pending users: {queue_stats['total']}")
             if queue_stats['breakdown']:
@@ -60,7 +58,7 @@ def cmd_discover(args: argparse.Namespace) -> None:
                 logger.info("\nNo pending users to scrape!")
                 return
 
-            pending = get_pending_users(limit=args.limit)
+            pending = cli.get_pending_users(limit=args.limit)
             usernames_to_scrape = [p['username'] for p in pending]
             logger.info(f"\nProcessing {len(usernames_to_scrape)} users from pending queue...")
 
@@ -90,7 +88,7 @@ def cmd_discover(args: argparse.Namespace) -> None:
                 return
 
             # Check for cached discovery source
-            cached_source = get_discovery_source(source, source_id)
+            cached_source = cli.get_discovery_source(source, source_id)
             start_page = 1
 
             if cached_source:
@@ -109,7 +107,7 @@ def cmd_discover(args: argparse.Namespace) -> None:
             all_discovered = []
             total_added = 0  # track users actually enqueued as we stream inserts
             page = start_page
-            priority = DISCOVERY_PRIORITY_MAP.get(source, 50)
+            priority = cli.DISCOVERY_PRIORITY_MAP.get(source, 50)
             min_films = getattr(args, 'min_films', 50)
 
             # Calculate how many to discover (more than limit to account for duplicates)
@@ -181,7 +179,7 @@ def cmd_discover(args: argparse.Namespace) -> None:
                 all_discovered.extend(filtered_usernames)
 
                 if filtered_usernames:
-                    added = add_pending_users(filtered_usernames, source, source_id, priority)
+                    added = cli.add_pending_users(filtered_usernames, source, source_id, priority)
                     total_added += added
                     logger.info(f"  Enqueued {added} users this page (total enqueued: {total_added})")
 
@@ -194,17 +192,17 @@ def cmd_discover(args: argparse.Namespace) -> None:
             logger.info(f"Added {total_added} new users to pending queue (discovered {len(all_discovered)})")
 
             # Update discovery source cache
-            update_discovery_source(source, source_id, page - 1, len(all_discovered))
+            cli.update_discovery_source(source, source_id, page - 1, len(all_discovered))
 
             # Queue-only mode: stop after enqueuing
             if getattr(args, 'queue_only', False):
-                queue_stats = get_pending_queue_stats()
+                queue_stats = cli.get_pending_queue_stats()
                 logger.info(f"\nQueue now has {queue_stats['total']} pending users")
                 logger.info("Run 'scrape-daemon' to process the queue")
                 return
 
             # Now get users to scrape from pending queue
-            pending = get_pending_users(limit=args.limit)
+            pending = cli.get_pending_users(limit=args.limit)
             usernames_to_scrape = [p['username'] for p in pending]
 
             if not usernames_to_scrape:
@@ -229,7 +227,7 @@ def cmd_discover(args: argparse.Namespace) -> None:
         else:
             # Defensive dedupe in serial path too
             usernames_to_scrape = list(dict.fromkeys(usernames_to_scrape))
-            with get_db() as conn:
+            with cli.get_db() as conn:
                 existing_film_slugs = {r['slug'] for r in conn.execute("SELECT slug FROM films")}
 
             for username in tqdm(usernames_to_scrape, desc="Users"):
@@ -249,7 +247,7 @@ def cmd_discover(args: argparse.Namespace) -> None:
                         remove_pending_user(username)
                         continue
 
-                    with get_db() as conn:
+                    with cli.get_db() as conn:
                         scraped_at = datetime.now().isoformat()
                         conn.executemany("""
                             INSERT OR REPLACE INTO user_films
@@ -276,7 +274,7 @@ def cmd_discover(args: argparse.Namespace) -> None:
         logger.info(f"\nDone! Scraped {len(usernames_to_scrape)} users.")
 
         # Show remaining pending queue stats
-        queue_stats = get_pending_queue_stats()
+        queue_stats = cli.get_pending_queue_stats()
         if queue_stats['total'] > 0:
             logger.info(f"\nRemaining in pending queue: {queue_stats['total']} users")
             logger.info("Run with --continue to scrape more from the queue")
@@ -290,8 +288,9 @@ def cmd_discover(args: argparse.Namespace) -> None:
 
 def cmd_discover_refill(args: argparse.Namespace) -> None:
     """Auto-refill queue from multiple sources when it runs low."""
-    init_db()
-    stats = get_pending_queue_stats()
+    cli = _get_cli()
+    cli.init_db()
+    stats = cli.get_pending_queue_stats()
 
     if stats['total'] >= args.min_queue:
         logger.info(f"Queue has {stats['total']} users (>= {args.min_queue}), skipping refill")
@@ -326,7 +325,7 @@ def cmd_discover_refill(args: argparse.Namespace) -> None:
                 normalized_sources.append(tuple(item))
         sources = normalized_sources
 
-    scraper = LetterboxdScraper(delay=1.0)
+    scraper = cli.LetterboxdScraper(delay=1.0)
     total_added = 0
 
     try:
@@ -346,7 +345,7 @@ def cmd_discover_refill(args: argparse.Namespace) -> None:
 
             limit = min(int(50 * weight), target_add - total_added)
 
-            cached = get_discovery_source(source_type, source_id)
+            cached = cli.get_discovery_source(source_type, source_id)
             if cached and cached.get('scraped_at'):
                 age_days = (datetime.now() - parse_timestamp_naive(cached['scraped_at'])).days
                 if age_days < args.source_refresh_days:
@@ -370,11 +369,11 @@ def cmd_discover_refill(args: argparse.Namespace) -> None:
                 if activity and activity['film_count'] >= args.min_films and activity['has_ratings']:
                     filtered.append(username)
 
-            added = add_pending_users(filtered, source_type, source_id, priority)
+            added = cli.add_pending_users(filtered, source_type, source_id, priority)
             total_added += added
             logger.info(f"  Added {added} users")
 
-            update_discovery_source(source_type, source_id, 1, len(filtered))
+            cli.update_discovery_source(source_type, source_id, 1, len(filtered))
 
     finally:
         scraper.close()
@@ -384,10 +383,11 @@ def cmd_discover_refill(args: argparse.Namespace) -> None:
 
 def cmd_discover_from_taste(args: argparse.Namespace) -> None:
     """Discover users who reviewed films similar to your taste."""
-    init_db()
+    cli = _get_cli()
+    cli.init_db()
     username = _validate_username(args.username)
 
-    with get_db(read_only=True) as conn:
+    with cli.get_db(read_only=True) as conn:
         rows = conn.execute("""
             SELECT film_slug FROM user_films
             WHERE username = ? AND rating >= ?
@@ -402,7 +402,7 @@ def cmd_discover_from_taste(args: argparse.Namespace) -> None:
     film_slugs = [r['film_slug'] for r in rows]
     logger.info(f"Discovering reviewers from {len(film_slugs)} of {username}'s top films...")
 
-    scraper = LetterboxdScraper(delay=1.0)
+    scraper = cli.LetterboxdScraper(delay=1.0)
     total_added = 0
 
     try:
@@ -416,7 +416,7 @@ def cmd_discover_from_taste(args: argparse.Namespace) -> None:
                 if activity and activity['film_count'] >= args.min_films and activity['has_ratings']:
                     filtered.append(user)
 
-            added = add_pending_users(filtered, "taste_match", slug, priority=90)
+            added = cli.add_pending_users(filtered, "taste_match", slug, priority=90)
             total_added += added
             logger.info(f"  {slug}: +{added} users")
 

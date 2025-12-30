@@ -4,25 +4,24 @@ import argparse
 import logging
 from pathlib import Path
 
-from ...database import (
-    init_db,
-    get_db,
-    parse_timestamp_naive,
-    add_pending_users,
-    get_pending_users,
-    get_pending_queue_stats,
-    get_session_history,
-)
+from ...database import parse_timestamp_naive, get_session_history
 from ...config import PENDING_STALE_DAYS
 from ..utils.helpers import _validate_username
 
 logger = logging.getLogger(__name__)
 
 
+def _get_cli():
+    """Late import cli module to support monkeypatching in tests."""
+    from letterboxd_rec import cli
+    return cli
+
+
 def cmd_queue_status(args: argparse.Namespace) -> None:
     """Show pending queue statistics."""
-    init_db()
-    stats = get_pending_queue_stats()
+    cli = _get_cli()
+    cli.init_db()
+    stats = cli.get_pending_queue_stats()
 
     logger.info("\nPending Queue Status")
     logger.info("-" * 30)
@@ -40,7 +39,7 @@ def cmd_queue_status(args: argparse.Namespace) -> None:
         logger.info(f"\nEstimated time to drain: {est_hours:.1f} hours")
 
     if args.verbose:
-        pending = get_pending_users(limit=args.limit)
+        pending = cli.get_pending_users(limit=args.limit)
         if pending:
             logger.info("\nNext in queue:")
             for p in pending:
@@ -49,7 +48,8 @@ def cmd_queue_status(args: argparse.Namespace) -> None:
 
 def cmd_queue_add(args: argparse.Namespace) -> None:
     """Manually add usernames to the pending queue."""
-    init_db()
+    cli = _get_cli()
+    cli.init_db()
 
     usernames: list[str] = []
     if args.file:
@@ -66,15 +66,16 @@ def cmd_queue_add(args: argparse.Namespace) -> None:
         logger.error("No usernames provided.")
         return
 
-    added = add_pending_users(sanitized, "manual", "cli", priority=args.priority)
+    added = cli.add_pending_users(sanitized, "manual", "cli", priority=args.priority)
     skipped = len(sanitized) - added
     logger.info(f"Added {added} users to queue ({skipped} already existed)")
 
 
 def cmd_queue_clear(args: argparse.Namespace) -> None:
     """Clear pending queue (optionally by source type)."""
-    init_db()
-    with get_db() as conn:
+    cli = _get_cli()
+    cli.init_db()
+    with cli.get_db() as conn:
         if args.source:
             count = conn.execute(
                 "DELETE FROM pending_users WHERE discovered_from_type = ?",
@@ -87,10 +88,11 @@ def cmd_queue_clear(args: argparse.Namespace) -> None:
 
 def cmd_prune_pending(args: argparse.Namespace) -> None:
     """Prune stale or low-priority pending users."""
-    init_db()
+    cli = _get_cli()
+    cli.init_db()
     cutoff = f"-{args.older_than} days"
     removed = 0
-    with get_db() as conn:
+    with cli.get_db() as conn:
         removed += conn.execute(
             "DELETE FROM pending_users WHERE discovered_at < datetime('now', ?)",
             (cutoff,),
@@ -105,7 +107,8 @@ def cmd_prune_pending(args: argparse.Namespace) -> None:
 
 def cmd_session_history(args: argparse.Namespace) -> None:
     """Show scraping session history."""
-    init_db()
+    cli = _get_cli()
+    cli.init_db()
     sessions = get_session_history(limit=args.limit)
     if not sessions:
         logger.info("No scraping sessions recorded yet.")

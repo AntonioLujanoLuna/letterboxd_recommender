@@ -4,21 +4,23 @@ import logging
 import re
 
 from ...scraper import validate_slug
-from ...config import NOTIFICATION_WEBHOOK_URL
 
 logger = logging.getLogger(__name__)
 
 
 def send_notification(message: str) -> None:
     """Send a notification to a configured webhook (Discord/Slack-style)."""
-    if not NOTIFICATION_WEBHOOK_URL:
+    # Late import to support monkeypatching cli.NOTIFICATION_WEBHOOK_URL in tests
+    from letterboxd_rec import cli
+
+    if not cli.NOTIFICATION_WEBHOOK_URL:
         return
 
     try:
         import httpx
 
         httpx.post(
-            NOTIFICATION_WEBHOOK_URL,
+            cli.NOTIFICATION_WEBHOOK_URL,
             json={"content": message},
             timeout=10,
         )

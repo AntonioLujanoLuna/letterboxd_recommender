@@ -8,8 +8,6 @@ from datetime import datetime
 from tqdm import tqdm
 
 from ...database import (
-    init_db,
-    get_db,
     parse_timestamp_naive,
     remove_pending_user,
     create_scrape_session,
@@ -19,7 +17,7 @@ from ...database import (
     save_user_follows,
     save_user_followers,
 )
-from ...scraper import LetterboxdScraper, AsyncLetterboxdScraper
+from ...scraper import AsyncLetterboxdScraper
 from ...config import (
     DEFAULT_MAX_PER_BATCH,
     DEFAULT_MAX_CONCURRENT,
@@ -33,20 +31,27 @@ from ..utils.scrapers import _scrape_film_metadata, _scrape_film_metadata_async
 logger = logging.getLogger(__name__)
 
 
+def _get_cli():
+    """Late import cli module to support monkeypatching in tests."""
+    from letterboxd_rec import cli
+    return cli
+
+
 def cmd_scrape(args: argparse.Namespace) -> None:
     """Scrape a user's Letterboxd data."""
-    init_db()
+    cli = _get_cli()
+    cli.init_db()
 
     # Validate and sanitize username
     username = _validate_username(args.username)
 
-    scraper = LetterboxdScraper(delay=1.0)
+    scraper = cli.LetterboxdScraper(delay=1.0)
 
     try:
         # Check if refresh is needed
         refresh = getattr(args, 'refresh', None)
         if refresh:
-            with get_db() as conn:
+            with cli.get_db() as conn:
                 result = conn.execute("""
                     SELECT MAX(scraped_at) as last_scrape
                     FROM user_films
@@ -68,7 +73,7 @@ def cmd_scrape(args: argparse.Namespace) -> None:
         existing_slugs = set()
 
         if incremental:
-            with get_db() as conn:
+            with cli.get_db() as conn:
                 existing_slugs = {
                     r['film_slug'] for r in conn.execute("""
                         SELECT film_slug FROM user_films WHERE username = ?
@@ -78,8 +83,8 @@ def cmd_scrape(args: argparse.Namespace) -> None:
 
         interactions = scraper.scrape_user(username, existing_slugs=existing_slugs, stop_on_existing=incremental)
 
-        # Batch insert user films (get_db() context manager handles transaction)
-        with get_db() as conn:
+        # Batch insert user films (cli.get_db() context manager handles transaction)
+        with cli.get_db() as conn:
             scraped_at = datetime.now().isoformat()
             conn.executemany("""
                 INSERT OR REPLACE INTO user_films
@@ -104,7 +109,7 @@ def cmd_scrape(args: argparse.Namespace) -> None:
             favorites = scraper.scrape_favorites(username)
             if favorites:
                 logger.info(f"  Found {len(favorites)} profile favorites")
-                with get_db() as conn:
+                with cli.get_db() as conn:
                     for slug in favorites:
                         conn.execute("""
                             INSERT OR REPLACE INTO user_lists
@@ -135,7 +140,7 @@ def cmd_scrape(args: argparse.Namespace) -> None:
                     continue
 
                 # Save to database
-                with get_db() as conn:
+                with cli.get_db() as conn:
                     for film in films:
                         conn.execute("""
                             INSERT OR REPLACE INTO user_lists
@@ -171,9 +176,10 @@ def cmd_scrape(args: argparse.Namespace) -> None:
 
 def cmd_scrape_social(args: argparse.Namespace) -> None:
     """Scrape and store social graph (following/followers) for a user."""
-    init_db()
+    cli = _get_cli()
+    cli.init_db()
     username = _validate_username(args.username)
-    scraper = LetterboxdScraper(delay=1.0)
+    scraper = cli.LetterboxdScraper(delay=1.0)
 
     try:
         total_saved = 0
@@ -208,9 +214,10 @@ def cmd_scrape_social(args: argparse.Namespace) -> None:
 
 def cmd_backfill_social(args: argparse.Namespace) -> None:
     """Backfill social graph for users already in the database."""
-    init_db()
+    cli = _get_cli()
+    cli.init_db()
 
-    with get_db(read_only=True) as conn:
+    with cli.get_db(read_only=True) as conn:
         users_with_social: set[str] = set()
         for row in conn.execute("SELECT DISTINCT follower FROM user_follows"):
             users_with_social.add(row["follower"])
@@ -235,7 +242,7 @@ def cmd_backfill_social(args: argparse.Namespace) -> None:
             logger.info(f"  ... and {len(users_needing_social) - len(sample)} more")
         return
 
-    scraper = LetterboxdScraper(delay=1.0)
+    scraper = cli.LetterboxdScraper(delay=1.0)
     try:
         for username in tqdm(list(users_needing_social)[: args.limit], desc="Social"):
             following = scraper.scrape_following(username, limit=args.social_limit)
@@ -256,7 +263,8 @@ def cmd_backfill_social(args: argparse.Namespace) -> None:
 
 async def _cmd_scrape_daemon_async(args: argparse.Namespace) -> None:
     """Async daemon: drain pending queue with shared client + coordinated rate limiting."""
-    init_db()
+    cli = _get_cli()
+    cli.init_db()
 
     # Track session progress and allow resuming visibility
     session_id = create_scrape_session()
@@ -266,7 +274,7 @@ async def _cmd_scrape_daemon_async(args: argparse.Namespace) -> None:
 
     async def _load_known_slugs() -> set[str]:
         def _load():
-            with get_db(read_only=True) as conn:
+            with cli.get_db(read_only=True) as conn:
                 return {r['slug'] for r in conn.execute("SELECT slug FROM films")}
         return await asyncio.to_thread(_load)
 
@@ -276,7 +284,7 @@ async def _cmd_scrape_daemon_async(args: argparse.Namespace) -> None:
 
     async def _persist_user_films(username: str, interactions):
         def _persist():
-            with get_db() as conn:
+            with cli.get_db() as conn:
                 scraped_at = datetime.now().isoformat()
                 conn.executemany("""
                     INSERT OR REPLACE INTO user_films

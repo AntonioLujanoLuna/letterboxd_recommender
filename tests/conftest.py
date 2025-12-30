@@ -34,8 +34,17 @@ def fresh_db(monkeypatch, tmp_path):
 
     import letterboxd_rec.config as config
     import letterboxd_rec.database as database
+    import letterboxd_rec.database.connection as connection
 
+    # Close any existing pool before reloading to ensure fresh state
+    try:
+        database.close_pool()
+    except Exception:
+        pass
+
+    # Reload in dependency order: config first, then connection (which imports DB_PATH), then database
     importlib.reload(config)
+    importlib.reload(connection)
     importlib.reload(database)
 
     yield database
