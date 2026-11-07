@@ -92,7 +92,11 @@ def _read_cookie_from_dotenv(path: Path = Path(".env")) -> str | None:
     return None
 
 
-LETTERBOXD_COOKIE = os.environ.get("LETTERBOXD_COOKIE") or _read_cookie_from_dotenv()  # Optional authenticated scraping
+# LETTERBOXD_ANONYMOUS=1 ignores any configured cookie (env var or .env) so a run sends no login.
+LETTERBOXD_ANONYMOUS = os.environ.get("LETTERBOXD_ANONYMOUS", "false").lower() in {"1", "true", "yes"}
+LETTERBOXD_COOKIE = None if LETTERBOXD_ANONYMOUS else (
+    os.environ.get("LETTERBOXD_COOKIE") or _read_cookie_from_dotenv()  # Optional authenticated scraping
+)
 # Block circuit breaker (letterboxdpy backend): after this many consecutive 403 "blocked" responses,
 # pause every worker, starting at COOLDOWN seconds and doubling per repeat up to MAX_COOLDOWN.
 BLOCK_BREAKER_THRESHOLD = _get_int_env("LETTERBOXD_BLOCK_THRESHOLD", 5, min_val=1)

@@ -133,6 +133,7 @@ def _is_block(resp) -> bool:
 
 
 BREAKER = BlockBreaker()
+_announced_auth = False  # log the auth mode once per process
 
 # -- transport ---------------------------------------------------------------------------
 
@@ -143,8 +144,11 @@ class CurlClient:
     worker threads, so each thread gets its own `Scraper` subclass (hence its own session).
     """
 
-    def __init__(self, breaker: BlockBreaker | None = None):
+    def __init__(self, breaker: BlockBreaker | None = None, on_block=None):
         self._breaker = breaker or BREAKER
+        # Called for each blocked (non-private 403) attempt that gets retried. Without it a block
+        # that succeeds on retry is invisible to the adaptive rate controller.
+        self.on_block = on_block
         try:
             from letterboxdpy.core.scraper import Scraper  # noqa: F401
         except ImportError as e:
@@ -154,6 +158,10 @@ class CurlClient:
             ) from e
         self._local = threading.local()
         self._cookies = _parse_cookie_header(LETTERBOXD_COOKIE)
+        global _announced_auth
+        if not _announced_auth:
+            _announced_auth = True
+            logger.info(f"letterboxdpy transport: {'logged-in session (%d cookies)' % len(self._cookies) if self._cookies else 'anonymous (no cookie)'}")
 
     def _fetcher(self):
         fetcher = getattr(self._local, "fetcher", None)
@@ -206,6 +214,8 @@ class CurlClient:
             # A 403 may be a transient Cloudflare challenge, so retry briefly. A private/classified
             # page (also a 403) never gets better: return it immediately.
             if resp.status_code == 403 and not _looks_private(resp.text) and not last:
+                if self.on_block:
+                    self.on_block()
                 time.sleep(1.5 * (attempt + 1) + random.random() * 0.5)
                 continue
             break
@@ -256,7 +266,7 @@ class AsyncLetterboxdPyScraper(AsyncLetterboxdScraper):
     """AsyncLetterboxdScraper whose HTTP goes through letterboxdpy's fetcher (in worker threads)."""
 
     async def __aenter__(self):
-        self.client = AsyncCurlClient()
+        self.client = AsyncCurlClient(CurlClient(on_block=self._note_throttle))
         return self
 
     async def scrape_films_batch(self, slugs):

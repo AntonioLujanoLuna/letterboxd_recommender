@@ -159,7 +159,7 @@ To get it: sign in at letterboxd.com in Chrome, open DevTools (F12) → **Networ
 first `letterboxd.com` document request → **Headers** → **Request Headers** → copy the entire
 `Cookie:` value. Use this rather than `document.cookie` or the Application tab, which hide
 HttpOnly cookies, including the session cookie. Treat it like a password and re-copy it if it
-expires. Lines that python-dotenv can't parse are still read by a fallback loader.
+expires. Set `LETTERBOXD_ANONYMOUS=1` to ignore the cookie for a run (no login is sent). Lines that python-dotenv can't parse are still read by a fallback loader.
 
 ### `discover` — Find and scrape other users
 

@@ -7,6 +7,7 @@ near the highest rate Letterboxd tolerates from this IP, and backs off before th
 breaker (which costs minutes) has to trip.
 """
 import logging
+import threading
 import time
 
 logger = logging.getLogger(__name__)
@@ -25,6 +26,7 @@ class AimdRate:
         self.decrease_factor = decrease_factor
         self.debounce = debounce  # a burst of simultaneous throttles counts once
         self._clock = clock
+        self._lock = threading.Lock()  # called from the async loop and from transport threads
         self._rps = start
         now = clock()
         self._last_change = now
@@ -36,21 +38,23 @@ class AimdRate:
 
     def on_ok(self) -> None:
         """Called after each successful response."""
-        now = self._clock()
-        if (self._rps < self.ceiling
-                and now - self._last_change >= self.increase_after
-                and now - self._last_throttle >= self.increase_after):
-            self._rps = min(self.ceiling, self._rps + self.step)
-            self._last_change = now
-            logger.info(f"Auto-rate: no throttling for {self.increase_after:.0f}s, raising to {self._rps:.1f} req/s")
+        with self._lock:
+            now = self._clock()
+            if (self._rps < self.ceiling
+                    and now - self._last_change >= self.increase_after
+                    and now - self._last_throttle >= self.increase_after):
+                self._rps = min(self.ceiling, self._rps + self.step)
+                self._last_change = now
+                logger.info(f"Auto-rate: no throttling for {self.increase_after:.0f}s, raising to {self._rps:.1f} req/s")
 
     def on_throttle(self) -> None:
         """Called on a 429 or a (non-private) 403."""
-        now = self._clock()
-        if now - self._last_throttle < self.debounce:
-            return
-        before = self._rps
-        self._rps = max(self.floor, self._rps * self.decrease_factor)
-        self._last_throttle = now
-        self._last_change = now
-        logger.warning(f"Auto-rate: throttled by Letterboxd, cutting {before:.1f} -> {self._rps:.1f} req/s")
+        with self._lock:
+            now = self._clock()
+            if now - self._last_throttle < self.debounce:
+                return
+            before = self._rps
+            self._rps = max(self.floor, self._rps * self.decrease_factor)
+            self._last_throttle = now
+            self._last_change = now
+            logger.warning(f"Auto-rate: throttled by Letterboxd, cutting {before:.1f} -> {self._rps:.1f} req/s")

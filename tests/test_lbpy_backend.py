@@ -371,3 +371,47 @@ def test_every_attempt_is_recorded_in_stats_but_breaker_sees_the_outcome_once(fa
     CurlClient(breaker=b).get("https://letterboxd.com/blocked/")
     assert seen == [403, 403, 403]
     assert b._consecutive == 1  # one blocked *request*, not three
+
+
+# -- retried blocks reach the adaptive rate controller -------------------------------------
+
+def test_retried_blocks_are_reported_but_private_pages_and_successes_are_not(fake_fetch):
+    seen = []
+    client = CurlClient(on_block=lambda: seen.append(1))
+    fake_fetch["/flaky/"] = [FakeCurlResponse(403, "Access denied"), FakeCurlResponse(200, "ok")]
+    assert client.get("https://letterboxd.com/flaky/").status_code == 200
+    assert len(seen) == 1  # the hidden block is now visible
+
+    fake_fetch["/priv/"] = FakeCurlResponse(403, "<section>Falken's maze: classified</section>")
+    client.get("https://letterboxd.com/priv/")
+    fake_fetch["/ok/"] = FakeCurlResponse(200, "ok")
+    client.get("https://letterboxd.com/ok/")
+    assert len(seen) == 1
+
+    seen.clear()
+    fake_fetch["/blocked/"] = FakeCurlResponse(403, "Access denied")
+    client.get("https://letterboxd.com/blocked/")
+    # 2 retried attempts reported; the final failed attempt reaches the controller via the scraper
+    assert len(seen) == CurlClient.ATTEMPTS - 1
+
+
+def test_async_pyscraper_wires_transport_blocks_to_its_rate_controller(fake_fetch):
+    async def run():
+        s = lbpy_backend.AsyncLetterboxdPyScraper(delay=0, max_concurrent=2, max_rps=6, rps_ceiling=12)
+        async with s:
+            fake_fetch["/film/x/"] = [FakeCurlResponse(403, "Access denied"), FakeCurlResponse(200, "<html></html>")]
+            await s.client.get("https://letterboxd.com/film/x/")
+        return s._aimd.rps
+
+    assert asyncio.run(run()) == 3.0  # 6 req/s halved by the retried block
+
+
+def test_aimd_throttles_from_many_threads_count_once():
+    import threading
+    from letterboxd_rec.rate_control import AimdRate
+
+    r = AimdRate(start=8, ceiling=12, floor=1)
+    threads = [threading.Thread(target=r.on_throttle) for _ in range(20)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert r.rps == 4  # debounced: one halving, not twenty

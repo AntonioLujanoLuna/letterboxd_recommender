@@ -46,3 +46,20 @@ def test_cookie_fallback_reads_line_dotenv_rejects(tmp_path):
     assert _read_cookie_from_dotenv(tmp_path / "missing.env") is None
     env.write_text("OTHER=1\n", encoding="utf-8")
     assert _read_cookie_from_dotenv(env) is None
+
+
+def test_anonymous_flag_ignores_configured_cookie(monkeypatch, tmp_path):
+    import importlib
+    import letterboxd_rec.config as config
+
+    monkeypatch.setenv("LETTERBOXD_COOKIE", "a=1; b=2")
+    monkeypatch.setenv("LETTERBOXD_DB", str(tmp_path / "t.db"))
+    try:
+        monkeypatch.delenv("LETTERBOXD_ANONYMOUS", raising=False)
+        assert importlib.reload(config).LETTERBOXD_COOKIE == "a=1; b=2"
+        monkeypatch.setenv("LETTERBOXD_ANONYMOUS", "1")
+        assert importlib.reload(config).LETTERBOXD_COOKIE is None
+    finally:
+        monkeypatch.delenv("LETTERBOXD_ANONYMOUS", raising=False)
+        monkeypatch.delenv("LETTERBOXD_COOKIE", raising=False)
+        importlib.reload(config)
