@@ -73,7 +73,33 @@ DEFAULT_SCRAPER_DELAY = _get_float_env("LETTERBOXD_SCRAPER_DELAY", 1.0, min_val=
 DEFAULT_ASYNC_DELAY = _get_float_env("LETTERBOXD_ASYNC_DELAY", 0.2, min_val=0.0)
 DEFAULT_MAX_CONCURRENT = _get_int_env("LETTERBOXD_MAX_CONCURRENT", 5, min_val=1)
 DEFAULT_MAX_CONCURRENT_USERS = _get_int_env("LETTERBOXD_MAX_CONCURRENT_USERS", 2, min_val=1)
-LETTERBOXD_COOKIE = os.environ.get("LETTERBOXD_COOKIE")  # Optional authenticated scraping
+def _read_cookie_from_dotenv(path: Path = Path(".env")) -> str | None:
+    """Fallback reader for LETTERBOXD_COOKIE.
+
+    A full browser Cookie header is ~4KB and often contains quotes/backslashes that make
+    python-dotenv reject the line ("could not parse statement"), silently leaving the cookie unset.
+    """
+    try:
+        for line in path.read_text(encoding="utf-8-sig").splitlines():
+            key, sep, value = line.partition("=")
+            if sep and key.strip().removeprefix("export ").strip() == "LETTERBOXD_COOKIE":
+                value = value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                    value = value[1:-1]
+                return value or None
+    except OSError:
+        pass
+    return None
+
+
+LETTERBOXD_COOKIE = os.environ.get("LETTERBOXD_COOKIE") or _read_cookie_from_dotenv()  # Optional authenticated scraping
+# Block circuit breaker (letterboxdpy backend): after this many consecutive 403 "blocked" responses,
+# pause every worker, starting at COOLDOWN seconds and doubling per repeat up to MAX_COOLDOWN.
+BLOCK_BREAKER_THRESHOLD = _get_int_env("LETTERBOXD_BLOCK_THRESHOLD", 5, min_val=1)
+BLOCK_BREAKER_COOLDOWN = _get_float_env("LETTERBOXD_BLOCK_COOLDOWN", 300.0, min_val=1)
+BLOCK_BREAKER_MAX_COOLDOWN = _get_float_env("LETTERBOXD_BLOCK_MAX_COOLDOWN", 1800.0, min_val=1)
+# Cap on request starts per second for the async scrapers (steady pacing, independent of latency).
+DEFAULT_MAX_RPS = _get_float_env("LETTERBOXD_MAX_RPS", 6.0, min_val=0.1)
 SCRAPER_ADAPTIVE_DELAY_MIN = 0.1
 SCRAPER_ADAPTIVE_DELAY_MAX = 5.0
 SCRAPER_429_BACKOFF = 1.5
@@ -276,6 +302,53 @@ FEATURE_WEIGHTS_PATH = Path(os.environ.get("LETTERBOXD_FEATURE_WEIGHTS", "data/f
 # Item-item similarity safeguards (controls compute cost)
 ITEM_SIM_MIN_RATINGS = 2        # skip items with fewer than this many ratings
 ITEM_SIM_MAX_ITEMS = 20_000       # cap number of items to include in pairwise pass
+ITEM_SIM_BLOCK_CELLS = 4_000_000  # dense cells per block in the vectorized similarity pass (memory cap)
+
+# SVD implicit feedback: residuals (in stars) added on top of the user's and the film's
+# baseline for interactions that have no star rating. Positive means "liked it more than
+# expected", so an unrated like or watch never reads as a low rating.
+SVD_IMPLICIT_RESIDUALS = {
+    "liked": 0.75,
+    "watched": 0.1,
+    "watchlisted": 0.25,
+}
+
+# Damping for SVD film biases: bias = sum(residuals) / (n_ratings + SVD_ITEM_BIAS_REG).
+# Without it, a film with a single 5-star rating gets a +1.5 bias and tops every list
+# (offline eval on synthetic data: NDCG@20 0.006 with no damping, 0.046 at 25, 0.085 at 100).
+SVD_ITEM_BIAS_REG = _get_float_env("LETTERBOXD_SVD_ITEM_BIAS_REG", 50.0, min_val=0.0)
+
+# EASE (closed-form item-item model, Steck 2019). Tune with `evaluate`, e.g.
+# LETTERBOXD_EASE_LAMBDA=50 / 200 / 800 python main.py evaluate --strategies ease
+EASE_CACHE_PATH = Path("data/ease_model.npz")
+EASE_LAMBDA = _get_float_env("LETTERBOXD_EASE_LAMBDA", 200.0, min_val=0.0)
+EASE_MIN_INTERACTIONS = _get_int_env("LETTERBOXD_EASE_MIN_INTERACTIONS", 5, min_val=1)
+# Model is a dense items x items matrix: 8k items ~ 0.5 GB of float64 during the inverse
+EASE_MAX_ITEMS = _get_int_env("LETTERBOXD_EASE_MAX_ITEMS", 8_000, min_val=2)
+# Interaction strength in the user x item matrix (a rating overrides the watched flag)
+EASE_WEIGHTS = {
+    "liked": 1.0,
+    "rating_high": 1.0,    # >= 3.5 stars
+    "rating_mid": 0.5,     # 2.5 - 3 stars
+    "rating_low": 0.0,     # < 2.5 stars: watched it, but not a vote for similar films
+    "watched": 0.5,        # watched, unrated
+    "watchlisted": 0.25,
+}
+
+# Vectorized content strategy: per-field weights for the IDF-weighted film x feature matrix
+CONTENT_FIELD_WEIGHTS = {
+    "directors": 1.0,
+    "genres": 0.6,
+    "themes": 0.8,
+    "cast": 0.5,
+    "writers": 0.6,
+    "countries": 0.3,
+    "languages": 0.3,
+    "cinematographers": 0.4,
+    "composers": 0.4,
+    "decade": 0.4,
+}
+CONTENT_MAX_CAST = 8  # billed cast beyond this adds noise
 
 # Migrations
 MIGRATIONS_PATH = Path("src/letterboxd_rec/migrations")

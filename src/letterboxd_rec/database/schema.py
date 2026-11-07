@@ -209,6 +209,8 @@ def _migrate_films_table(conn):
         'fan_count': 'INTEGER',
         'is_short': 'INTEGER',
         'is_animation': 'INTEGER',
+        'tmdb_id': 'INTEGER',
+        'imdb_id': 'TEXT',
     }
 
     for col_name, col_type in new_columns.items():
@@ -218,6 +220,25 @@ def _migrate_films_table(conn):
                 logger.info(f"Added column '{col_name}' to films table")
             except sqlite3.Error as e:
                 logger.warning(f"Could not add column '{col_name}': {e}")
+
+
+def _migrate_film_external_ids(conn):
+    """Add tmdb_id / imdb_id to films (used to join with MovieLens) and index them."""
+    _migrate_films_table(conn)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_films_tmdb ON films(tmdb_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_films_imdb ON films(imdb_id)")
+
+
+def _migrate_pending_user_claims(conn):
+    """Add claim tracking to the pending queue so a crashed scrape doesn't lose its users."""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(pending_users)").fetchall()}
+    for col, ddl in (("claimed_at", "TEXT"), ("attempts", "INTEGER DEFAULT 0")):
+        if col not in existing:
+            try:
+                conn.execute(f"ALTER TABLE pending_users ADD COLUMN {col} {ddl}")
+                logger.info(f"Added column '{col}' to pending_users table")
+            except sqlite3.Error as e:
+                logger.warning(f"Could not add column '{col}': {e}")
 
 
 def _migrate_user_profiles_table(conn):
@@ -272,6 +293,9 @@ def run_versioned_migrations() -> int:
         ("0001_add_film_columns", _migrate_films_table),
         ("0002_add_user_profile_schema_version", _migrate_user_profiles_table),
         ("0003_ensure_user_relationships_table", _ensure_user_relationships_table),
+        # Re-runs the idempotent column check so existing DBs gain tmdb_id / imdb_id
+        ("0004_add_film_external_ids", _migrate_film_external_ids),
+        ("0005_pending_user_claims", _migrate_pending_user_claims),
     ]
 
     for version, fn in python_migrations:

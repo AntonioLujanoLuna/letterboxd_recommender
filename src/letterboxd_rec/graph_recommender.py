@@ -14,7 +14,7 @@ from typing import Iterable, Sequence, Tuple
 import numpy as np
 from scipy import sparse
 
-from .database import get_db, load_idf, load_json, parse_timestamp_naive
+from .database import get_data_version, get_db, load_idf, load_json, parse_timestamp_naive
 from .graph_config import GraphConfig
 from .recommender import Recommendation
 
@@ -143,7 +143,7 @@ class HeterogeneousGraph:
         return rel_weight * edge.weight
 
     # Cache helpers ----------------------------------------------------
-    def save(self, path: Path) -> None:
+    def save(self, path: Path, data_version: str | None = None) -> None:
         if self.transition is None:
             return
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -163,13 +163,16 @@ class HeterogeneousGraph:
             {
                 "config_key": getattr(self.config, "cache_key", None),
                 "cache_version": getattr(self.config, "cache_version", None),
+                "data_version": data_version,
                 "created_at": time.time(),
             }
         )
         np.savez_compressed(path, **payload)
 
     @classmethod
-    def load(cls, path: Path, config: GraphConfig) -> "HeterogeneousGraph | None":
+    def load(
+        cls, path: Path, config: GraphConfig, data_version: str | None = None
+    ) -> "HeterogeneousGraph | None":
         if not path.exists():
             return None
         try:
@@ -191,6 +194,9 @@ class HeterogeneousGraph:
                     config.cache_version,
                     config.cache_key,
                 )
+                return None
+            if data_version is not None and meta.get("data_version") != data_version:
+                logger.info("Graph cache %s was built from different data; rebuilding.", path)
                 return None
             rows = blob["rows"]
             cols = blob["cols"]
@@ -390,23 +396,42 @@ class GraphRecommender:
         return recs[:n]
 
     # Internal helpers -------------------------------------------------
+    def _data_version(self, conn) -> str:
+        """DB data version plus the item-similarity file the graph also reads."""
+        version = get_data_version(conn)
+        sim_path = self.config.item_similarity_path
+        if sim_path and Path(sim_path).exists():
+            stat = Path(sim_path).stat()
+            version += f"-{stat.st_size}-{stat.st_mtime_ns}"
+        return version
+
     def _load_or_build_graph(self, rebuild: bool) -> HeterogeneousGraph:
         cache_path = self.config.cache_file_path
-        if self.config.cache_enabled and not rebuild:
-            cached = HeterogeneousGraph.load(cache_path, self.config)
-            if cached:
-                logger.info(f"Loaded graph cache from {cache_path}")
-                return cached
+
+        def _try_cache(conn) -> tuple[HeterogeneousGraph | None, str]:
+            data_version = self._data_version(conn)
+            if self.config.cache_enabled and not rebuild:
+                cached = HeterogeneousGraph.load(cache_path, self.config, data_version=data_version)
+                if cached:
+                    logger.info(f"Loaded graph cache from {cache_path}")
+                    return cached, data_version
+            return None, data_version
 
         if self.conn is not None:
+            cached, data_version = _try_cache(self.conn)
+            if cached:
+                return cached
             graph = self._build_graph(self.conn)
         else:
             with get_db(read_only=True) as conn:
+                cached, data_version = _try_cache(conn)
+                if cached:
+                    return cached
                 graph = self._build_graph(conn)
         graph.build_transition_matrix()
 
         if self.config.cache_enabled:
-            graph.save(cache_path)
+            graph.save(cache_path, data_version=data_version)
             logger.info(f"Saved graph cache to {cache_path}")
         return graph
 

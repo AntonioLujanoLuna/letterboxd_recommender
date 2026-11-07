@@ -20,6 +20,12 @@ from ...config import DEFAULT_MAX_PER_BATCH, DEFAULT_ASYNC_DELAY, DEFAULT_MAX_CO
 logger = logging.getLogger(__name__)
 
 
+def _get_cli():
+    """Late import cli module to support monkeypatching in tests."""
+    from letterboxd_rec import cli
+    return cli
+
+
 def _scrape_film_metadata(
     scraper: 'LetterboxdScraper',
     slugs: list[str],
@@ -27,30 +33,37 @@ def _scrape_film_metadata(
     use_async: bool = True,
     async_scraper: 'AsyncLetterboxdScraper | None' = None,
 ) -> None:
-    """Helper to scrape film metadata for a list of slugs."""
+    """Scrape and save metadata for *all* given slugs, in chunks of `max_per_batch`.
+
+    The chunk size only bounds how many films are in flight/saved at once. It is deliberately
+    not a cap: callers treat every slug as handled afterwards, so dropping the overflow would
+    leave those films without metadata permanently.
+    """
     if not slugs:
         return
 
-    limited_slugs = slugs[:max_per_batch]
+    chunk_size = max(1, max_per_batch)
+    for start in range(0, len(slugs), chunk_size):
+        chunk = slugs[start:start + chunk_size]
 
-    if use_async and len(limited_slugs) > 10:
-        logger.info(f"Fetching {len(limited_slugs)} films (async)...")
+        if use_async and len(chunk) > 10:
+            logger.info(f"Fetching {len(chunk)} films (async)... [{start + len(chunk)}/{len(slugs)}]")
 
-        async def scrape_batch(shared: AsyncLetterboxdScraper | None):
-            if shared:
-                return await shared.scrape_films_batch(limited_slugs)
-            async with AsyncLetterboxdScraper(delay=0.2, max_concurrent=5) as temp_async:
-                return await temp_async.scrape_films_batch(limited_slugs)
+            async def scrape_batch(shared: 'AsyncLetterboxdScraper | None', batch=chunk):
+                if shared:
+                    return await shared.scrape_films_batch(batch)
+                async with _get_cli().make_async_scraper(delay=0.2, max_concurrent=5) as temp_async:
+                    return await temp_async.scrape_films_batch(batch)
 
-        metadata_list = asyncio.run(scrape_batch(async_scraper))
-    else:
-        metadata_list = []
-        for slug in tqdm(limited_slugs, desc="Metadata"):
-            meta = scraper.scrape_film(slug)
-            if meta:
-                metadata_list.append(meta)
+            metadata_list = asyncio.run(scrape_batch(async_scraper))
+        else:
+            metadata_list = []
+            for slug in tqdm(chunk, desc="Metadata"):
+                meta = scraper.scrape_film(slug)
+                if meta:
+                    metadata_list.append(meta)
 
-    _persist_metadata_batch(metadata_list)
+        _persist_metadata_batch(metadata_list)
 
 
 def _persist_metadata_batch(metadata_list: list) -> None:
@@ -63,8 +76,8 @@ def _persist_metadata_batch(metadata_list: list) -> None:
             INSERT OR REPLACE INTO films
             (slug, title, year, directors, genres, cast, themes, runtime, avg_rating, rating_count,
              fan_count, is_short, is_animation,
-             countries, languages, writers, cinematographers, composers)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             countries, languages, writers, cinematographers, composers, tmdb_id, imdb_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, [(
             m.slug, m.title, m.year,
             json.dumps(m.directors), json.dumps(m.genres),
@@ -73,7 +86,7 @@ def _persist_metadata_batch(metadata_list: list) -> None:
             m.fan_count, int(m.is_short), int(m.is_animation),
             json.dumps(m.countries), json.dumps(m.languages),
             json.dumps(m.writers), json.dumps(m.cinematographers),
-            json.dumps(m.composers)
+            json.dumps(m.composers), getattr(m, "tmdb_id", None), getattr(m, "imdb_id", None),
         ) for m in metadata_list])
 
         # Populate normalized tables for fast queries (batch operation)
@@ -88,22 +101,27 @@ async def _scrape_film_metadata_async(
     async_scraper: 'AsyncLetterboxdScraper',
     slugs: list[str],
     max_per_batch: int = 100,
-) -> None:
+) -> set[str]:
     """
     Async helper to scrape film metadata using a shared AsyncLetterboxdScraper.
-    Mirrors _scrape_film_metadata but avoids blocking the event loop.
+    Fetches *all* given slugs in chunks of `max_per_batch` and avoids blocking the event loop.
     """
+    saved: set[str] = set()
     if not slugs:
-        return
+        return saved
 
-    limited_slugs = slugs[:max_per_batch]
-    metadata_list = await async_scraper.scrape_films_batch(limited_slugs)
-
-    if not metadata_list:
-        return
-
-    await asyncio.to_thread(_persist_metadata_batch, metadata_list)
-    logger.info(f"Saved {len(metadata_list)} films")
+    # max_per_batch is the chunk size, not a cap: callers treat every slug as handled afterwards,
+    # so anything not fetched here would never get metadata. The returned set lets them see which
+    # slugs failed so those can be retried later.
+    chunk = max(1, max_per_batch)
+    for start in range(0, len(slugs), chunk):
+        metadata_list = await async_scraper.scrape_films_batch(slugs[start:start + chunk])
+        if not metadata_list:
+            continue
+        await asyncio.to_thread(_persist_metadata_batch, metadata_list)
+        saved.update(m.slug for m in metadata_list)
+        logger.info(f"Saved {len(metadata_list)} films")
+    return saved
 
 
 async def _scrape_users_parallel(
@@ -149,9 +167,11 @@ async def _scrape_users_parallel(
 
         await asyncio.to_thread(_persist)
 
-    async with AsyncLetterboxdScraper(
+    async with _get_cli().make_async_scraper(
         delay=getattr(args, "async_delay", DEFAULT_ASYNC_DELAY),
         max_concurrent=getattr(args, "max_concurrent_requests", DEFAULT_MAX_CONCURRENT),
+        max_rps=getattr(args, "max_rps", None),
+        rps_ceiling=getattr(args, "auto_rps", None),
     ) as async_scraper:
 
         async def _process(username: str):
@@ -167,11 +187,13 @@ async def _scrape_users_parallel(
                             known_film_slugs.update(new_slugs)
 
                         if new_slugs:
-                            await _scrape_film_metadata_async(
+                            saved = await _scrape_film_metadata_async(
                                 async_scraper,
                                 new_slugs,
                                 max_per_batch=getattr(args, "batch", DEFAULT_MAX_PER_BATCH),
                             )
+                            async with known_slugs_lock:
+                                known_film_slugs.difference_update(set(new_slugs) - saved)
 
                         logger.info(f"{username}: {len(interactions)} films (parallel)")
                     else:

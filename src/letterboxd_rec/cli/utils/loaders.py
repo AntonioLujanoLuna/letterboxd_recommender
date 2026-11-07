@@ -100,7 +100,7 @@ def _load_recommendation_data(
     """
     all_user_films: dict[str, list[dict]] | None = None
 
-    if strategy in ('hybrid', 'collaborative', 'svd'):
+    if strategy in ('hybrid', 'collaborative', 'svd', 'ease'):
         all_user_films = _load_all_user_films(conn)
         user_films = all_user_films.get(username, [])
     else:
@@ -116,7 +116,7 @@ def _load_recommendation_data(
         min_rating=args.min_rating
     )
 
-    if strategy in ('hybrid', 'collaborative', 'graph', 'svd'):
+    if strategy in ('hybrid', 'collaborative', 'graph', 'svd', 'ease', 'movielens'):
         all_films = {r['slug']: dict(r) for r in conn.execute("SELECT * FROM films")}
     else:
         all_films = all_films_filtered

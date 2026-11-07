@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -37,7 +38,7 @@ def cmd_discover(args: argparse.Namespace) -> None:
     """Discover and scrape other users with caching and pending queue support."""
     cli = _get_cli()
     cli.init_db()
-    scraper = cli.LetterboxdScraper(delay=getattr(args, "discover_delay", DEFAULT_SCRAPER_DELAY))
+    scraper = cli.make_scraper(delay=getattr(args, "discover_delay", DEFAULT_SCRAPER_DELAY))
 
     try:
         # Check if we're in continue mode (drain pending queue only)
@@ -152,29 +153,9 @@ def cmd_discover(args: argparse.Namespace) -> None:
                 if getattr(args, "skip_activity_checks", False):
                     filtered_usernames = usernames
                 else:
-                    filtered_usernames = []
-                    for username in usernames:
-                        activity = scraper.check_user_activity(username)
-                        activity_checked += 1
-
-                        if not activity:
-                            logger.debug(f"Skipping {username} (profile not accessible)")
-                            filtered_count += 1
-                            continue
-
-                        # Filter by minimum film count
-                        if activity['film_count'] < min_films:
-                            logger.debug(f"Skipping {username} (only {activity['film_count']} films < {min_films})")
-                            filtered_count += 1
-                            continue
-
-                        # Require ratings (they actually rate, not just log)
-                        if not activity['has_ratings']:
-                            logger.debug(f"Skipping {username} (no ratings)")
-                            filtered_count += 1
-                            continue
-
-                        filtered_usernames.append(username)
+                    filtered_usernames = _filter_active_users(scraper, usernames, min_films)
+                    activity_checked += len(usernames)
+                    filtered_count += len(usernames) - len(filtered_usernames)
 
                 all_discovered.extend(filtered_usernames)
 
@@ -307,7 +288,9 @@ def cmd_discover_refill(args: argparse.Namespace) -> None:
         ("popular", "members", 70, 1),
     ]
 
-    if args.sources_file:
+    if getattr(args, "sources", None):
+        sources = list(args.sources)
+    elif args.sources_file:
         import json as _json
         with open(args.sources_file) as f:
             loaded = _json.load(f)
@@ -325,7 +308,7 @@ def cmd_discover_refill(args: argparse.Namespace) -> None:
                 normalized_sources.append(tuple(item))
         sources = normalized_sources
 
-    scraper = cli.LetterboxdScraper(delay=1.0)
+    scraper = cli.make_scraper(delay=1.0)
     total_added = 0
 
     try:
@@ -363,11 +346,7 @@ def cmd_discover_refill(args: argparse.Namespace) -> None:
                 logger.warning(f"Unknown source {source_type}, skipping")
                 continue
 
-            filtered = []
-            for username in users:
-                activity = scraper.check_user_activity(username)
-                if activity and activity['film_count'] >= args.min_films and activity['has_ratings']:
-                    filtered.append(username)
+            filtered = _filter_active_users(scraper, users, args.min_films)
 
             added = cli.add_pending_users(filtered, source_type, source_id, priority)
             total_added += added
@@ -402,7 +381,7 @@ def cmd_discover_from_taste(args: argparse.Namespace) -> None:
     film_slugs = [r['film_slug'] for r in rows]
     logger.info(f"Discovering reviewers from {len(film_slugs)} of {username}'s top films...")
 
-    scraper = cli.LetterboxdScraper(delay=1.0)
+    scraper = cli.make_scraper(delay=1.0)
     total_added = 0
 
     try:
@@ -410,11 +389,7 @@ def cmd_discover_from_taste(args: argparse.Namespace) -> None:
             reviewers = scraper.scrape_film_reviewers(slug, limit=args.per_film)
             usernames = [r['username'] for r in reviewers if r.get('has_rating', True)]
 
-            filtered = []
-            for user in usernames[:args.per_film]:
-                activity = scraper.check_user_activity(user)
-                if activity and activity['film_count'] >= args.min_films and activity['has_ratings']:
-                    filtered.append(user)
+            filtered = _filter_active_users(scraper, usernames[:args.per_film], args.min_films)
 
             added = cli.add_pending_users(filtered, "taste_match", slug, priority=90)
             total_added += added
@@ -424,3 +399,127 @@ def cmd_discover_from_taste(args: argparse.Namespace) -> None:
         scraper.close()
 
     logger.info(f"\nAdded {total_added} taste-matched users to queue")
+
+
+def _passes_activity(activity: dict | None, min_films: int) -> bool:
+    """Enough films logged, and they actually rate (not just log)."""
+    return bool(activity and activity['film_count'] >= min_films and activity['has_ratings'])
+
+
+def _filter_active_users(scraper, usernames: list[str], min_films: int, workers: int = 8) -> list[str]:
+    """Activity pre-filter run concurrently (order preserved).
+
+    Each check is one profile request, and doing them one at a time left the whole pipeline idle
+    (~1.4s per candidate, minutes per refill). A failed check just skips that candidate.
+    """
+    if not usernames:
+        return []
+
+    def check(username: str):
+        try:
+            return scraper.check_user_activity(username)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"Activity check failed for {username}: {exc}")
+            return None
+
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(usernames)))) as pool:
+        results = list(pool.map(check, usernames))
+    return [u for u, activity in zip(usernames, results) if _passes_activity(activity, min_films)]
+
+
+def _enqueue_from_graph(scraper, limit: int, min_films: int) -> int:
+    """Queue unscraped users that appear in the scraped social graph (most-followed first)."""
+    cli = _get_cli()
+    with cli.get_db(read_only=True) as conn:
+        rows = conn.execute("""
+            SELECT f.followee AS username, COUNT(*) AS n
+            FROM user_follows f
+            WHERE f.followee NOT IN (SELECT DISTINCT username FROM user_films)
+              AND f.followee NOT IN (SELECT username FROM pending_users)
+            GROUP BY f.followee
+            ORDER BY n DESC
+            LIMIT ?
+        """, (limit * 3,)).fetchall()
+
+    keep = _filter_active_users(scraper, [r['username'] for r in rows], min_films)[:limit]
+    return cli.add_pending_users(keep, "graph", "user_follows", priority=40) if keep else 0
+
+
+def cmd_crawl(args: argparse.Namespace) -> None:
+    """Unattended large crawl: seed the queue, then alternate draining and refilling it.
+
+    Stops after --users users are scraped, or when no more candidates can be found.
+    """
+    cli = _get_cli()
+    cli.init_db()
+
+    sources: list[tuple] = []
+    for slug in args.seed_film or []:
+        sources.append(("film_reviews", slug, 100, 2))
+    for user in args.seed_user or []:
+        sources.append(("followers", _validate_username(user), 90, 2))
+    if args.popular:
+        sources.append(("popular", "members", 70, 1))
+
+    refill_ns = argparse.Namespace(
+        min_queue=args.refill_below, target=args.queue_target,
+        source_refresh_days=args.source_refresh_days, sources_file=args.sources_file,
+        sources=sources or None, min_films=args.min_films,
+    )
+
+    def _scraped_total() -> int:
+        with cli.get_db(read_only=True) as conn:
+            return conn.execute("SELECT COUNT(DISTINCT username) FROM user_films").fetchone()[0]
+
+    scraped_start = _scraped_total()
+
+    def _scraped_now() -> int:
+        return _scraped_total() - scraped_start
+
+    stalls = 0
+    while _scraped_now() < args.users:
+        queue = cli.get_pending_queue_stats()['total']
+        if queue < args.refill_below:
+            logger.info(f"Queue low ({queue}); refilling...")
+            cli.cmd_discover_refill(refill_ns)
+            queue = cli.get_pending_queue_stats()['total']
+
+            if queue < args.refill_below and args.expand_graph:
+                scraper = cli.make_scraper(delay=1.0)
+                try:
+                    added = _enqueue_from_graph(scraper, args.queue_target, args.min_films)
+                finally:
+                    scraper.close()
+                logger.info(f"Graph expansion queued {added} users")
+                queue = cli.get_pending_queue_stats()['total']
+
+        if queue == 0:
+            logger.info("No candidates left to scrape; stopping.")
+            break
+
+        chunk = min(args.chunk, args.users - _scraped_now())
+        before = _scraped_now()
+        cli.cmd_scrape_daemon(argparse.Namespace(
+            target=chunk, delay=args.async_delay, user_delay=args.user_delay,
+            wait_for_queue=False, wait_seconds=60, batch=args.batch,
+            remove_on_error=True, max_concurrent_users=args.max_concurrent_users,
+            max_concurrent_requests=args.max_concurrent_requests, async_delay=args.async_delay,
+            include_social=args.include_social, social_limit=args.social_limit,
+            claim_ttl_minutes=args.claim_ttl_minutes, max_rps=args.max_rps,
+            auto_rps=args.auto_rps,
+        ))
+
+        if _scraped_now() == before:
+            stalls += 1
+            logger.warning(f"Chunk scraped no users ({stalls}/{args.max_stalls}); "
+                           "Letterboxd may be blocking requests")
+            if stalls >= args.max_stalls:
+                logger.error("Stopping: repeated empty chunks. Try --backend letterboxdpy, a "
+                             "LETTERBOXD_COOKIE, or larger delays.")
+                break
+        else:
+            stalls = 0
+
+    logger.info(f"\nCrawl finished: {_scraped_now()} new users scraped this run.")
+
+

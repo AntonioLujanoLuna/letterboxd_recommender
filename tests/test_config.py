@@ -35,3 +35,14 @@ def test_invalid_env_values_fall_back_to_defaults(monkeypatch):
     assert cfg.DEFAULT_SCRAPER_DELAY == 1.0
     assert cfg.DEFAULT_ASYNC_DELAY == 0.2
     assert cfg.DEFAULT_MAX_CONCURRENT == 5
+
+def test_cookie_fallback_reads_line_dotenv_rejects(tmp_path):
+    from letterboxd_rec.config import _read_cookie_from_dotenv
+
+    env = tmp_path / ".env"
+    # An embedded quote makes python-dotenv fail on lines like this one.
+    env.write_text('LETTERBOXD_COOKIE="a=1; b={"x":"y"}; c=3"\n', encoding="utf-8")
+    assert _read_cookie_from_dotenv(env) == 'a=1; b={"x":"y"}; c=3'
+    assert _read_cookie_from_dotenv(tmp_path / "missing.env") is None
+    env.write_text("OTHER=1\n", encoding="utf-8")
+    assert _read_cookie_from_dotenv(env) is None

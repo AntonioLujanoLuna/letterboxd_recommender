@@ -24,6 +24,7 @@ from .recommenders import (
     TfidfEmbedder,
     # Fusion
     _fuse_normalized,
+    hybrid_weights,
     # Recommenders
     MetadataRecommender,
     CollaborativeRecommender,
@@ -55,6 +56,7 @@ __all__ = [
     "TfidfEmbedder",
     # Fusion
     "_fuse_normalized",
+    "hybrid_weights",
     # Recommenders
     "MetadataRecommender",
     "CollaborativeRecommender",

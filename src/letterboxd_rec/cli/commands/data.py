@@ -24,6 +24,12 @@ from ..utils.scrapers import _scrape_film_metadata
 logger = logging.getLogger(__name__)
 
 
+def _get_cli():
+    """Late import cli module to support monkeypatching in tests."""
+    from letterboxd_rec import cli
+    return cli
+
+
 def cmd_stats(args: argparse.Namespace) -> None:
     """Show database statistics."""
     with get_db() as conn:
@@ -141,15 +147,16 @@ def cmd_import(args: argparse.Namespace) -> None:
                 conn.executemany("""
                     INSERT OR REPLACE INTO films
                     (slug, title, year, directors, genres, cast, themes, runtime, avg_rating, rating_count,
-                     countries, languages, writers, cinematographers, composers)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     countries, languages, writers, cinematographers, composers, tmdb_id, imdb_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, [(
                     film['slug'], film.get('title'), film.get('year'),
                     film.get('directors'), film.get('genres'),
                     film.get('cast'), film.get('themes'),
                     film.get('runtime'), film.get('avg_rating'), film.get('rating_count'),
                     film.get('countries'), film.get('languages'),
-                    film.get('writers'), film.get('cinematographers'), film.get('composers')
+                    film.get('writers'), film.get('cinematographers'), film.get('composers'),
+                    film.get('tmdb_id'), film.get('imdb_id'),
                 ) for film in chunk])
                 # Keep normalized tables in sync with imported films
                 populate_normalized_tables_batch(conn, chunk)
@@ -205,7 +212,7 @@ def cmd_refresh_metadata(args: argparse.Namespace) -> None:
         logger.info("No films need refreshing.")
         return
 
-    scraper = LetterboxdScraper(delay=1.0)
+    scraper = _get_cli().make_scraper(delay=1.0)
     try:
         _scrape_film_metadata(scraper, slugs, max_per_batch=args.batch, use_async=True)
     finally:

@@ -8,6 +8,13 @@ from ...scraper import validate_slug
 logger = logging.getLogger(__name__)
 
 
+def film_url(slug: str) -> str:
+    """Letterboxd URL for a slug; 'tmdb:<id>' (films not in the local DB) uses Letterboxd's TMDB redirect."""
+    if slug.startswith("tmdb:"):
+        return f"https://letterboxd.com/tmdb/{slug[5:]}/"
+    return f"https://letterboxd.com/film/{slug}/"
+
+
 def send_notification(message: str) -> None:
     """Send a notification to a configured webhook (Discord/Slack-style)."""
     # Late import to support monkeypatching cli.NOTIFICATION_WEBHOOK_URL in tests

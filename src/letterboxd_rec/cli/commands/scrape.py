@@ -14,10 +14,14 @@ from ...database import (
     update_session_progress,
     complete_session,
     get_pending_users,
+    claim_pending_user,
+    release_pending_user,
+    release_stale_claims,
     save_user_follows,
     save_user_followers,
 )
-from ...scraper import AsyncLetterboxdScraper
+from ...scraper import AsyncLetterboxdScraper, ScrapeIncompleteError
+from ...scrape_stats import STATS
 from ...config import (
     DEFAULT_MAX_PER_BATCH,
     DEFAULT_MAX_CONCURRENT,
@@ -45,7 +49,7 @@ def cmd_scrape(args: argparse.Namespace) -> None:
     # Validate and sanitize username
     username = _validate_username(args.username)
 
-    scraper = cli.LetterboxdScraper(delay=1.0)
+    scraper = cli.make_scraper(delay=1.0)
 
     try:
         # Check if refresh is needed
@@ -81,7 +85,11 @@ def cmd_scrape(args: argparse.Namespace) -> None:
                 }
                 logger.info(f"Incremental mode: found {len(existing_slugs)} existing films for {username}")
 
-        interactions = scraper.scrape_user(username, existing_slugs=existing_slugs, stop_on_existing=incremental)
+        try:
+            interactions = scraper.scrape_user(username, existing_slugs=existing_slugs, stop_on_existing=incremental)
+        except ScrapeIncompleteError as e:
+            logger.error(str(e))
+            return
 
         # Batch insert user films (cli.get_db() context manager handles transaction)
         with cli.get_db() as conn:
@@ -179,7 +187,7 @@ def cmd_scrape_social(args: argparse.Namespace) -> None:
     cli = _get_cli()
     cli.init_db()
     username = _validate_username(args.username)
-    scraper = cli.LetterboxdScraper(delay=1.0)
+    scraper = cli.make_scraper(delay=1.0)
 
     try:
         total_saved = 0
@@ -242,7 +250,7 @@ def cmd_backfill_social(args: argparse.Namespace) -> None:
             logger.info(f"  ... and {len(users_needing_social) - len(sample)} more")
         return
 
-    scraper = cli.LetterboxdScraper(delay=1.0)
+    scraper = cli.make_scraper(delay=1.0)
     try:
         for username in tqdm(list(users_needing_social)[: args.limit], desc="Social"):
             following = scraper.scrape_following(username, limit=args.social_limit)
@@ -265,6 +273,12 @@ async def _cmd_scrape_daemon_async(args: argparse.Namespace) -> None:
     """Async daemon: drain pending queue with shared client + coordinated rate limiting."""
     cli = _get_cli()
     cli.init_db()
+
+    # Users claimed by a run that crashed are still marked in-flight; put them back.
+    ttl_minutes = getattr(args, "claim_ttl_minutes", 30)
+    recovered = release_stale_claims(ttl_minutes * 60)
+    if recovered:
+        logger.info(f"Recovered {recovered} user(s) left claimed by an earlier run")
 
     # Track session progress and allow resuming visibility
     session_id = create_scrape_session()
@@ -296,8 +310,17 @@ async def _cmd_scrape_daemon_async(args: argparse.Namespace) -> None:
                 ])
         await asyncio.to_thread(_persist)
 
+    unfetchable: set[str] = set()  # films whose metadata fetch failed this run
+    in_flight: set[str] = set()
+    failed_this_run: set[str] = set()  # each user gets one attempt per run; later runs retry
+
     async def _remove_pending(username: str):
+        in_flight.discard(username)
         await asyncio.to_thread(remove_pending_user, username)
+
+    async def _release_pending(username: str, count_attempt: bool = True):
+        in_flight.discard(username)
+        await asyncio.to_thread(release_pending_user, username, count_attempt)
 
     async def _update_session():
         if session_id:
@@ -311,9 +334,11 @@ async def _cmd_scrape_daemon_async(args: argparse.Namespace) -> None:
                 f"Scrape progress: {scraped_count_local} users done, {queue_remaining} remaining"
             )
 
-    async with AsyncLetterboxdScraper(
+    async with _get_cli().make_async_scraper(
         delay=getattr(args, "async_delay", getattr(args, "delay", DEFAULT_ASYNC_DELAY)),
         max_concurrent=getattr(args, "max_concurrent_requests", DEFAULT_MAX_CONCURRENT),
+        max_rps=getattr(args, "max_rps", None),
+        rps_ceiling=getattr(args, "auto_rps", None),
     ) as async_scraper:
 
         async def _scrape_social_async(username: str):
@@ -336,9 +361,16 @@ async def _cmd_scrape_daemon_async(args: argparse.Namespace) -> None:
 
                     if interactions:
                         await _persist_user_films(username, interactions)
-                        new_slugs = [i.film_slug for i in interactions if i.film_slug not in known_film_slugs]
-                        await _scrape_film_metadata_async(async_scraper, new_slugs, max_per_batch=args.batch)
+                        # Claim the new films *before* awaiting, so a user scraped concurrently with
+                        # overlapping films doesn't fetch them a second time. Films that fail are
+                        # un-claimed for later runs, but not retried again within this run.
+                        new_slugs = [i.film_slug for i in interactions
+                                     if i.film_slug not in known_film_slugs and i.film_slug not in unfetchable]
                         known_film_slugs.update(new_slugs)
+                        saved = await _scrape_film_metadata_async(async_scraper, new_slugs, max_per_batch=args.batch)
+                        failed_films = set(new_slugs) - saved
+                        known_film_slugs.difference_update(failed_films)
+                        unfetchable.update(failed_films)
 
                         if getattr(args, "include_social", False):
                             await _scrape_social_async(username)
@@ -361,20 +393,31 @@ async def _cmd_scrape_daemon_async(args: argparse.Namespace) -> None:
                     logger.error(f"Error scraping {username}: {exc}")
                     if args.remove_on_error:
                         await _remove_pending(username)
+                    else:
+                        # Back to the queue; parked for good after MAX_QUEUE_ATTEMPTS failures.
+                        failed_this_run.add(username)
+                        await _release_pending(username)
 
         tasks: set[asyncio.Task] = set()
 
         try:
             while not shutdown_requested:
-                # Refill task set up to max_concurrent_users
-                while len(tasks) < getattr(args, "max_concurrent_users", 1):
-                    next_batch = await asyncio.to_thread(get_pending_users, 1)
-                    if not next_batch:
+                # Refill task set up to max_concurrent_users, but never claim more users than the
+                # target still needs: users in flight when the target is hit would be cancelled
+                # mid-scrape and their work thrown away.
+                while (len(tasks) < getattr(args, "max_concurrent_users", 1)
+                       and not (args.target and scraped_count + len(tasks) >= args.target)):
+                    # Atomic claim: the user stays queued (marked in-flight) until they succeed.
+                    claimed = await asyncio.to_thread(claim_pending_user, frozenset(failed_this_run))
+                    if not claimed:
                         break
-                    uname = next_batch[0]['username']
-                    # Remove immediately to avoid multiple concurrent claims of the same user
-                    await asyncio.to_thread(remove_pending_user, uname)
+                    uname = claimed['username']
+                    in_flight.add(uname)
                     tasks.add(asyncio.create_task(_process_user(uname)))
+
+                if not tasks and args.target and scraped_count >= args.target:
+                    logger.info(f"Reached target of {args.target} users.")
+                    break
 
                 if not tasks:
                     if args.wait_for_queue:
@@ -387,24 +430,27 @@ async def _cmd_scrape_daemon_async(args: argparse.Namespace) -> None:
                 done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED, timeout=1)
                 tasks = pending
 
+                report = STATS.maybe_report(60)
+                if report:
+                    logger.info(report)
+
                 await _update_session()
                 await _notify(scraped_count)
-
-                if args.target and scraped_count >= args.target:
-                    logger.info(f"Reached target of {args.target} users.")
-                    break
 
         finally:
             for task in tasks:
                 task.cancel()
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
+            for uname in list(in_flight):  # interrupted, not failed
+                await _release_pending(uname, count_attempt=False)
 
     elapsed = (datetime.now() - session_start).total_seconds()
     status = "interrupted" if shutdown_requested else "completed"
     if session_id:
         complete_session(session_id, status=status)
     logger.info(f"\nSession complete: {scraped_count} users in {elapsed/3600:.1f} hours")
+    logger.info(STATS.summary())
 
 
 def cmd_scrape_daemon(args: argparse.Namespace) -> None:

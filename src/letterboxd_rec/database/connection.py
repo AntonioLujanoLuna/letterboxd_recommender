@@ -307,3 +307,46 @@ def cleanup_connection_pool() -> None:
     """Legacy function - cleanup is now automatic."""
     pool = _get_pool()
     pool._maybe_cleanup()
+
+
+_DATA_VERSION_QUERIES = {
+    # INSERT OR REPLACE gives a fresh rowid, so MAX(rowid) moves on every rewrite;
+    # the totals catch in-place UPDATEs.
+    "user_films": (
+        "COUNT(*), MAX(rowid), TOTAL(rating), TOTAL(liked), TOTAL(watched), "
+        "TOTAL(watchlisted), MAX(scraped_at)"
+    ),
+    "films": "COUNT(*), MAX(rowid), TOTAL(avg_rating), TOTAL(rating_count), TOTAL(year)",
+    "film_directors": "COUNT(*), MAX(rowid)",
+    "film_genres": "COUNT(*), MAX(rowid)",
+    "film_cast": "COUNT(*), MAX(rowid)",
+    "film_themes": "COUNT(*), MAX(rowid)",
+    "user_follows": "COUNT(*), MAX(rowid)",
+    "user_relationships": "COUNT(*), MAX(rowid)",
+    "attribute_idf": "COUNT(*), TOTAL(idf_score), TOTAL(doc_count)",
+}
+
+
+def get_data_version(conn) -> str:
+    """
+    Cheap fingerprint of the data that derived models (e.g. the graph) are built from.
+
+    A handful of aggregate scans, so it is fast enough to check on every run.
+    Missing tables are skipped.
+    """
+    import hashlib
+
+    existing = {
+        row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    }
+    h = hashlib.blake2b(digest_size=12)
+    for table, expr in _DATA_VERSION_QUERIES.items():
+        if table not in existing:
+            continue
+        try:
+            row = conn.execute(f"SELECT {expr} FROM {table}").fetchone()
+        except sqlite3.OperationalError:
+            # Column missing in an older schema: fall back to the row count
+            row = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+        h.update(f"{table}:{tuple(row)!r};".encode("utf-8"))
+    return h.hexdigest()

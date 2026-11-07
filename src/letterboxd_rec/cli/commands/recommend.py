@@ -1,16 +1,20 @@
 """Recommendation-related CLI commands."""
 
 import argparse
+import json
 import logging
+from pathlib import Path
 
 from ...database import init_db, get_db, load_json
+from ...config import DB_PATH
 from ...recommender import MetadataRecommender, CollaborativeRecommender
 from ...profile import build_profile
 from ...group_recommender import recommend_for_group
-from ..utils.helpers import _validate_username, _parse_weights
+from ..utils.helpers import _validate_username, _parse_weights, film_url
 from ..utils.loaders import (
     _load_all_user_films,
     _load_recommendation_data,
+    _load_films_with_filters,
     _warn_missing_metadata,
 )
 from ..utils.strategies import (
@@ -19,6 +23,9 @@ from ..utils.strategies import (
     _run_hybrid_strategy,
     _run_graph_strategy,
     _run_svd_strategy,
+    _run_ease_strategy,
+    _run_content_strategy,
+    _run_movielens_strategy,
 )
 from ..utils.output import _output_recommendations
 
@@ -47,6 +54,9 @@ def cmd_recommend(args: argparse.Namespace) -> None:
         'hybrid': _run_hybrid_strategy,
         'svd': _run_svd_strategy,
         'graph': _run_graph_strategy,
+        'ease': _run_ease_strategy,
+        'content': _run_content_strategy,
+        'movielens': _run_movielens_strategy,
     }
 
     handler = strategy_handlers[strategy]
@@ -161,7 +171,7 @@ def cmd_jam(args: argparse.Namespace) -> None:
                 "agreement": round(rec.agreement_score, 2),
                 "unanimous": rec.is_unanimous,
                 "reasons": rec.consensus_reasons,
-                "url": f"https://letterboxd.com/film/{rec.slug}/",
+                "url": film_url(rec.slug),
             }
             for rec in recs
         ]
@@ -217,3 +227,128 @@ def cmd_jam(args: argparse.Namespace) -> None:
             logger.info(f"   {warning}")
 
         logger.info("")
+def cmd_evaluate(args: argparse.Namespace) -> None:
+    """Score strategies offline by hiding some of each user's liked films."""
+    from ...evaluation import EVALUABLE_STRATEGIES, format_results_table, run_evaluation
+
+    strategies = args.strategies or list(EVALUABLE_STRATEGIES)
+    if not args.strategies:
+        from ...movielens import ML_MODEL_PATH
+        if ML_MODEL_PATH.exists():
+            strategies.append("movielens")
+    if "popularity" not in strategies:
+        strategies = ["popularity", *strategies]  # always report the baseline
+
+    no_data_msg = (
+        f"No scraped data in {DB_PATH.resolve()}. Run 'python main.py scrape YOUR_USERNAME' "
+        "and then 'python main.py discover' to add other users before evaluating "
+        "(set LETTERBOXD_DB if your database lives elsewhere)."
+    )
+    if not DB_PATH.exists():  # don't let sqlite create an empty file
+        logger.error(no_data_msg)
+        return
+
+    with get_db(read_only=True) as conn:
+        has_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='user_films'"
+        ).fetchone()
+        all_user_films = _load_all_user_films(conn) if has_table else {}
+        films = _load_films_with_filters(conn) if has_table else {}
+
+    if not all_user_films:
+        logger.error(no_data_msg)
+        return
+    if len(all_user_films) < 2:
+        logger.error(
+            "Only one user in the database. Evaluation needs other users "
+            "(run 'python main.py discover') so the collaborative strategies have data."
+        )
+        return
+
+    users = [_validate_username(u) for u in args.users] if args.users else None
+    split, results = run_evaluation(
+        all_user_films,
+        films,
+        strategies=strategies,
+        k=args.k,
+        holdout_frac=args.holdout,
+        min_positives=args.min_positives,
+        max_users=args.max_users,
+        users=users,
+        seed=args.seed,
+        progress=not args.json,
+    )
+
+    if not split.test:
+        logger.error(
+            "No users qualified for evaluation (need %d+ films rated >= 3.5 or liked). "
+            "Lower --min-positives or add users.", args.min_positives,
+        )
+        return
+
+    if args.json:
+        payload = {
+            "k": args.k,
+            "holdout_frac": args.holdout,
+            "seed": args.seed,
+            "n_users": len(split.test),
+            "n_held_out": sum(len(v) for v in split.test.values()),
+            "results": [r.as_dict(include_per_user=args.per_user) for r in results],
+        }
+        print(json.dumps(payload, indent=2))
+        return
+
+    n_held = sum(len(v) for v in split.test.values())
+    logger.info(
+        f"\nEvaluated {len(split.test)} users, {n_held} hidden films "
+        f"({args.holdout:.0%} of each user's positives, seed {args.seed})\n"
+    )
+    logger.info(format_results_table(results))
+    logger.info(
+        "\nrecall/ndcg/hit: higher is better. 'vs pop' is the NDCG change against the "
+        "popularity baseline.\nThe graph strategy is not evaluated: it reads the live "
+        "database, so hidden films would leak in."
+    )
+
+
+def cmd_movielens_build(args: argparse.Namespace) -> None:
+    """Download (optionally) MovieLens, fit EASE, report held-out quality, save the model."""
+    from ...movielens import ML_DIR, ML_DOWNLOAD_URL, build_model
+
+    ml_dir = Path(args.dir) if args.dir else ML_DIR
+    if not (ml_dir / "ratings.csv").exists() and not (ml_dir / "ratings.npz").exists():
+        if not args.download:
+            logger.error(f"MovieLens not found in {ml_dir}. Re-run with --download, or download "
+                         f"{ML_DOWNLOAD_URL} and unzip it into {ml_dir.parent}.")
+            return
+        import httpx
+        import zipfile
+        ml_dir.parent.mkdir(parents=True, exist_ok=True)
+        zip_path = ml_dir.parent / "ml-32m.zip"
+        logger.info(f"Downloading {ML_DOWNLOAD_URL} (~240 MB)...")
+        with httpx.stream("GET", ML_DOWNLOAD_URL, follow_redirects=True, timeout=120) as resp:
+            resp.raise_for_status()
+            with open(zip_path, "wb") as fh:
+                for chunk in resp.iter_bytes(1 << 20):
+                    fh.write(chunk)
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(ml_dir.parent)
+
+    model, report = build_model(
+        ml_dir=ml_dir, max_items=args.max_items, lambdas=tuple(args.lambdas),
+        eval_users=args.eval_users, k=args.k, seed=args.seed,
+    )
+    k = report.k
+    logger.info(f"\nMovieLens: {report.n_ratings:,} ratings, {report.n_users:,} users, "
+                f"{report.n_items:,} films kept. Held-out test: {report.n_eval_users:,} users, "
+                f"20% of their liked films hidden.\n")
+    base = report.results[0][f"ndcg@{k}"]
+    logger.info(f"{'model':<22}{f'recall@{k}':>11}{f'ndcg@{k}':>10}{'vs pop':>9}{'fit s':>8}")
+    for r in report.results:
+        name = r["model"] if r["lambda"] is None else f"ease (lambda={r['lambda']:g})"
+        lift = "" if r["lambda"] is None or not base else f"{(r[f'ndcg@{k}'] / base - 1) * 100:+.0f}%"
+        best = "  <- saved" if r["lambda"] == report.best_lambda else ""
+        logger.info(f"{name:<22}{r[f'recall@{k}']:>11.4f}{r[f'ndcg@{k}']:>10.4f}{lift:>9}{r['fit_seconds']:>8.0f}{best}")
+    logger.info("\nNext: python main.py recommend YOUR_USERNAME --strategy movielens")
+
+

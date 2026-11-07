@@ -26,7 +26,13 @@ from ..config import (
     DISCOVERY_PRIORITY_MAP,
 )
 from ..scraper import LetterboxdScraper
+from ..lbpy_backend import BACKENDS, make_async_scraper, make_scraper, set_backend
+from ..scrape_stats import STATS
 
+from .commands.scrape import _cmd_scrape_daemon_async
+from .utils.helpers import film_url
+from .utils.strategies import _run_movielens_strategy, _run_ease_strategy, _run_content_strategy
+from .commands.discover import _passes_activity, _filter_active_users, _enqueue_from_graph
 from .commands import (
     cmd_scrape,
     cmd_scrape_social,
@@ -35,7 +41,10 @@ from .commands import (
     cmd_discover,
     cmd_discover_refill,
     cmd_discover_from_taste,
+    cmd_crawl,
     cmd_recommend,
+    cmd_evaluate,
+    cmd_movielens_build,
     cmd_similar_users,
     cmd_jam,
     cmd_stats,
@@ -140,6 +149,9 @@ def setup_jam_parser(subparsers):
 def main():
     parser = argparse.ArgumentParser(description="Letterboxd Recommender")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
+    parser.add_argument("--backend", choices=BACKENDS, default=None,
+                        help="Scraping backend for user/film pages (default: $LETTERBOXD_BACKEND or native). "
+                             "'letterboxdpy' uses browser-impersonating requests and can bypass 403 blocks.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # Scrape command
@@ -186,6 +198,10 @@ def main():
                                   help="Max concurrent HTTP requests when using --parallel-users")
     discover_parser.add_argument("--async-delay", type=float, default=DEFAULT_ASYNC_DELAY,
                                   help="Base async delay between requests when using --parallel-users")
+    discover_parser.add_argument("--max-rps", type=float, default=None,
+                                  help="Cap on requests started per second (default: $LETTERBOXD_MAX_RPS or 6)")
+    discover_parser.add_argument("--auto-rps", type=float, default=None, metavar="CEILING",
+                                  help="Probe upward from --max-rps toward CEILING req/s, halving on 429/403")
     discover_parser.add_argument(
         "--discover-delay",
         type=float,
@@ -240,6 +256,12 @@ def main():
                                help="Max concurrent HTTP requests across tasks (async)")
     daemon_parser.add_argument("--async-delay", type=float, default=DEFAULT_ASYNC_DELAY,
                                help="Base async delay between requests (seconds)")
+    daemon_parser.add_argument("--max-rps", type=float, default=None,
+                               help="Cap on requests started per second (default: $LETTERBOXD_MAX_RPS or 6)")
+    daemon_parser.add_argument("--auto-rps", type=float, default=None, metavar="CEILING",
+                               help="Probe upward from --max-rps toward CEILING req/s, halving on 429/403")
+    daemon_parser.add_argument("--claim-ttl-minutes", type=float, default=30,
+                               help="On start, re-queue users left claimed longer than this by a crashed run (0 = all)")
     daemon_parser.add_argument("--include-social", action="store_true", help="Also scrape following/followers for each user")
     daemon_parser.add_argument("--social-limit", type=int, default=200, help="Max following/followers to scrape per user")
     daemon_parser.set_defaults(func=cmd_scrape_daemon)
@@ -247,7 +269,7 @@ def main():
     # Recommend command
     rec_parser = subparsers.add_parser("recommend", help="Generate recommendations")
     rec_parser.add_argument("username", help="Letterboxd username")
-    rec_parser.add_argument("--strategy", choices=['metadata', 'collaborative', 'hybrid', 'svd', 'graph'],
+    rec_parser.add_argument("--strategy", choices=['metadata', 'collaborative', 'hybrid', 'svd', 'graph', 'ease', 'content', 'movielens'],
                             default='metadata', help="Recommendation strategy")
     rec_parser.add_argument("--limit", type=int, default=20, help="Number of recommendations")
     rec_parser.add_argument("--min-year", type=int, help="Minimum release year")
@@ -427,12 +449,85 @@ def main():
     taste_parser.add_argument("--min-films", type=int, default=50, help="Minimum film count for candidate users")
     taste_parser.set_defaults(func=cmd_discover_from_taste)
 
+    crawl_parser = subparsers.add_parser(
+        "crawl", help="Unattended crawl: seed queue, then alternate scraping and refilling")
+    crawl_parser.add_argument("--users", type=int, default=200, help="Stop after scraping this many new users")
+    crawl_parser.add_argument("--seed-film", action="append", metavar="SLUG",
+                              help="Seed from reviewers of this film (repeatable)")
+    crawl_parser.add_argument("--seed-user", action="append", metavar="USER",
+                              help="Seed from this user's followers (repeatable)")
+    crawl_parser.add_argument("--popular", action="store_true", help="Also seed from popular members")
+    crawl_parser.add_argument("--sources-file", help="JSON sources file (see discover-refill); used when no seeds given")
+    crawl_parser.add_argument("--min-films", type=int, default=50, help="Minimum films for activity filter")
+    crawl_parser.add_argument("--refill-below", type=int, default=50, help="Refill when queue drops below this")
+    crawl_parser.add_argument("--queue-target", type=int, default=200, help="Queue size to refill up to")
+    crawl_parser.add_argument("--source-refresh-days", type=int, default=7)
+    crawl_parser.add_argument("--no-expand-graph", dest="expand_graph", action="store_false",
+                              help="Don't fall back to unscraped users from the social graph")
+    crawl_parser.add_argument("--chunk", type=int, default=50, help="Users to scrape between queue checks")
+    crawl_parser.add_argument("--batch", type=int, default=DEFAULT_MAX_PER_BATCH, help="Film metadata batch size")
+    crawl_parser.add_argument("--max-concurrent-users", type=int, default=DEFAULT_MAX_CONCURRENT_USERS)
+    crawl_parser.add_argument("--max-concurrent-requests", type=int, default=DEFAULT_MAX_CONCURRENT)
+    crawl_parser.add_argument("--async-delay", type=float, default=DEFAULT_ASYNC_DELAY)
+    crawl_parser.add_argument("--max-rps", type=float, default=None,
+                              help="Cap on requests started per second (default: $LETTERBOXD_MAX_RPS or 6)")
+    crawl_parser.add_argument("--auto-rps", type=float, default=None, metavar="CEILING",
+                              help="Probe upward from --max-rps toward CEILING req/s, halving on 429/403")
+    crawl_parser.add_argument("--user-delay", type=float, default=0, help="Extra delay between users (seconds)")
+    crawl_parser.add_argument("--no-social", dest="include_social", action="store_false",
+                              help="Skip following/followers per user (default is to scrape them; feeds graph expansion)")
+    crawl_parser.set_defaults(include_social=True, expand_graph=True)
+    crawl_parser.add_argument("--social-limit", type=int, default=200)
+    crawl_parser.add_argument("--claim-ttl-minutes", type=float, default=30,
+                              help="Re-queue users left claimed longer than this by a crashed run (0 = all)")
+    crawl_parser.add_argument("--max-stalls", type=int, default=3,
+                              help="Abort after this many consecutive chunks that scraped nobody")
+    crawl_parser.set_defaults(func=cmd_crawl)
+
+    # Offline evaluation command
+    eval_parser = subparsers.add_parser(
+        "evaluate", help="Measure recommendation quality by hiding some of each user's liked films"
+    )
+    eval_parser.add_argument(
+        "--strategies", nargs="+",
+        choices=["popularity", "svd", "collaborative", "metadata", "hybrid", "ease", "content", "movielens"],
+        help="Strategies to compare (default: all; the popularity baseline is always included)",
+    )
+    eval_parser.add_argument("--k", type=int, default=20, help="Cutoff for recall@k / NDCG@k")
+    eval_parser.add_argument("--holdout", type=float, default=0.2,
+                             help="Fraction of each user's positives to hide (default 0.2)")
+    eval_parser.add_argument("--min-positives", type=int, default=10,
+                             help="Only evaluate users with at least this many positives")
+    eval_parser.add_argument("--max-users", type=int, default=200,
+                             help="Sample at most this many users (metadata scoring is slow)")
+    eval_parser.add_argument("--users", nargs="+", help="Evaluate exactly these users")
+    eval_parser.add_argument("--seed", type=int, default=42, help="Random seed for the hold-out split")
+    eval_parser.add_argument("--json", action="store_true", help="Print results as JSON")
+    eval_parser.add_argument("--per-user", action="store_true", help="Include per-user metrics in JSON output")
+    eval_parser.set_defaults(func=cmd_evaluate)
+
+    ml_parser = subparsers.add_parser(
+        "movielens-build", help="Train the MovieLens EASE model and report its held-out quality"
+    )
+    ml_parser.add_argument("--download", action="store_true", help="Download ML-32M if missing (~240 MB)")
+    ml_parser.add_argument("--dir", help="Unzipped MovieLens directory (default data/movielens/ml-32m)")
+    ml_parser.add_argument("--max-items", type=int, default=10_000,
+                           help="Most-rated films to model (memory grows with the square; 10k ~ 3 GB peak)")
+    ml_parser.add_argument("--lambdas", type=float, nargs="+", default=[200.0, 500.0, 1000.0, 3000.0],
+                           help="EASE regularization values to compare; the best is saved")
+    ml_parser.add_argument("--eval-users", type=int, default=2000, help="Held-out MovieLens users to score")
+    ml_parser.add_argument("--k", type=int, default=20)
+    ml_parser.add_argument("--seed", type=int, default=42)
+    ml_parser.set_defaults(func=cmd_movielens_build)
+
     # Session history
     session_parser = subparsers.add_parser("session-history", help="Show scraping session history")
     session_parser.add_argument("--limit", type=int, default=10, help="Number of sessions to display")
     session_parser.set_defaults(func=cmd_session_history)
 
     args = parser.parse_args()
+    if args.backend:
+        set_backend(args.backend)
 
     # Configure logging based on verbosity
     log_level = logging.DEBUG if args.verbose else logging.INFO
@@ -507,4 +602,8 @@ __all__ = [
     '_run_graph_strategy',
     '_run_svd_strategy',
     '_output_recommendations',
+    '_cmd_scrape_daemon_async',
+    '_passes_activity',
+    '_filter_active_users',
+    '_enqueue_from_graph',
 ]

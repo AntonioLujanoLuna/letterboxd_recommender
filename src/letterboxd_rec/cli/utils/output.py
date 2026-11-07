@@ -8,6 +8,8 @@ from ...database import load_json
 from ...recommender import Recommendation
 from ...profile import UserProfile
 
+from .helpers import film_url
+
 logger = logging.getLogger(__name__)
 
 
@@ -37,7 +39,7 @@ def _output_recommendations(
                 "slug": r.slug,
                 "score": round(r.score, 2),
                 "reasons": r.reasons,
-                "url": f"https://letterboxd.com/film/{r.slug}/",
+                "url": film_url(r.slug),
                 "directors": load_json(film.get('directors', [])),
                 "genres": load_json(film.get('genres', [])),
                 "cast": load_json(film.get('cast', []))[:5],
@@ -71,12 +73,12 @@ def _output_recommendations(
         logger.info("Title,Year,URL,Score,Reasons")
         for r in recs:
             reasons = "; ".join(r.reasons).replace('"', '""')
-            logger.info(f'"{r.title}",{r.year},https://letterboxd.com/film/{r.slug}/,{r.score:.2f},"{reasons}"')
+            logger.info(f'"{r.title}",{r.year},{film_url(r.slug)},{r.score:.2f},"{reasons}"')
 
     elif output_format == 'markdown':
         logger.info(f"\n# Top {len(recs)} recommendations for {username} ({strategy})\n")
         for i, r in enumerate(recs, 1):
-            logger.info(f"## {i}. [{r.title} ({r.year})](https://letterboxd.com/film/{r.slug}/)")
+            logger.info(f"## {i}. [{r.title} ({r.year})]({film_url(r.slug)})")
             logger.info(f"**Score**: {r.score:.1f}  ")
             logger.info(f"**Why**: {', '.join(r.reasons)}\n")
 

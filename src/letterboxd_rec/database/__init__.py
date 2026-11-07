@@ -7,6 +7,7 @@ from .connection import (
     get_db,
     close_pool,
     cleanup_connection_pool,
+    get_data_version,
     _execute_with_retry,
     _is_lock_error,
 )
@@ -33,6 +34,10 @@ from .discovery import (
     get_pending_users,
     remove_pending_user,
     get_pending_queue_stats,
+    MAX_QUEUE_ATTEMPTS,
+    claim_pending_user,
+    release_pending_user,
+    release_stale_claims,
 )
 from .sessions import (
     create_scrape_session,
@@ -60,6 +65,7 @@ __all__ = [
     'get_db',
     'close_pool',
     'cleanup_connection_pool',
+    'get_data_version',
     '_execute_with_retry',
     '_is_lock_error',
     # Schema
@@ -82,6 +88,10 @@ __all__ = [
     'get_pending_users',
     'remove_pending_user',
     'get_pending_queue_stats',
+    'MAX_QUEUE_ATTEMPTS',
+    'claim_pending_user',
+    'release_pending_user',
+    'release_stale_claims',
     # Sessions
     'create_scrape_session',
     'update_session_progress',

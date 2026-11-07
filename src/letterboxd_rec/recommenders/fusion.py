@@ -3,6 +3,29 @@
 from .recommendation import Recommendation
 
 
+def hybrid_weights(
+    n_users: int,
+    rated_count: int,
+    meta_weight: float | None = None,
+    collab_weight: float | None = None,
+) -> tuple[float, float]:
+    """
+    Resolve (metadata, collaborative) weights for the hybrid strategy.
+
+    With no overrides, lean on metadata when there are few users or the target user
+    has few ratings. With one override, derive the other as its complement.
+    """
+    if meta_weight is None and collab_weight is None:
+        if n_users < 10 or rated_count < 20:
+            return 0.7, 0.3
+        return 0.6, 0.4
+    if meta_weight is None:
+        meta_weight = max(0.0, 1.0 - collab_weight)
+    if collab_weight is None:
+        collab_weight = max(0.0, 1.0 - meta_weight)
+    return meta_weight, collab_weight
+
+
 def _fuse_normalized(
     meta_results: list[Recommendation],
     collab_results: list[Recommendation],

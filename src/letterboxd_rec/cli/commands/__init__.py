@@ -10,11 +10,14 @@ from .discover import (
     cmd_discover,
     cmd_discover_refill,
     cmd_discover_from_taste,
+    cmd_crawl,
 )
 from .recommend import (
     cmd_recommend,
     cmd_similar_users,
     cmd_jam,
+    cmd_evaluate,
+    cmd_movielens_build,
 )
 from .data import (
     cmd_stats,

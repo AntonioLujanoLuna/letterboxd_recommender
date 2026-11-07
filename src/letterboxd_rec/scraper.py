@@ -7,6 +7,9 @@ from selectolax.parser import HTMLParser
 from dataclasses import dataclass
 from tqdm import tqdm
 import asyncio
+from contextlib import aclosing
+from .scrape_stats import TimedAsyncClient, TimedClient
+from .rate_control import AimdRate
 from .config import (
     SCRAPER_MAX_CAST,
     HTTP_TIMEOUT,
@@ -24,6 +27,28 @@ from .config import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class ScrapeIncompleteError(RuntimeError):
+    """A user's watched-films listing could not be fetched (blocked, 403, network error).
+
+    Raised instead of returning a partial result: saving only a watchlist would look like a
+    user who has watched nothing, which silently corrupts recommendations and evaluation.
+    """
+
+    def __init__(self, username: str, url: str):
+        self.username = username
+        self.url = url
+        super().__init__(
+            f"Could not fetch {username}'s watched films ({url}). Letterboxd may be blocking "
+            "automated requests; nothing was saved for this user."
+        )
+
+
+def _looks_private(text: str | None) -> bool:
+    """Letterboxd's 403 for private/restricted pages ("classified"), as opposed to a block."""
+    t = (text or "").lower()
+    return "classified" in t or "falken" in t
 
 
 def _parse_cookie_header(cookie_header: str | None) -> dict[str, str]:
@@ -168,6 +193,8 @@ class FilmMetadata:
     composers: list[str]
     is_short: bool
     is_animation: bool
+    tmdb_id: int | None = None   # joins to MovieLens links.csv / TMDB
+    imdb_id: str | None = None   # e.g. "tt6751668"
 
 
 def parse_film_page(tree: HTMLParser, slug: str) -> FilmMetadata:
@@ -305,14 +332,33 @@ def parse_film_page(tree: HTMLParser, slug: str) -> FilmMetadata:
     # Composers
     composers = list(dict.fromkeys([a.text(strip=True) for a in tree.css("a[href*='/composer/']") if a.text(strip=True)]))
 
+    # External IDs (exact joins to MovieLens/TMDB/IMDb)
+    tmdb_id = None
+    body = tree.css_first("body")
+    raw_tmdb = body.attributes.get("data-tmdb-id") if body else None
+    if raw_tmdb and str(raw_tmdb).isdigit() and (body.attributes.get("data-tmdb-type") or "movie") == "movie":
+        tmdb_id = int(raw_tmdb)
+    imdb_id = None
+    imdb_link = tree.css_first("a[data-track-action='IMDb'], a[href*='imdb.com/title/']")
+    if imdb_link:
+        m = re.search(r"(tt\d+)", imdb_link.attributes.get("href") or "")
+        imdb_id = m.group(1) if m else None
+
+    # Fan count shown on the film page ("76K fans"); the old CSI endpoint no longer exists.
+    fan_count = None
+    fans_link = tree.css_first("a[href$='/fans/']")
+    if fans_link:
+        fan_count = _parse_fan_count_from_html(fans_link.text())
+
     return FilmMetadata(
         slug=slug, title=title, year=year, directors=directors,
         genres=genres, cast=cast, themes=themes,
         runtime=runtime, avg_rating=avg_rating, rating_count=rating_count,
-        fan_count=None,
+        fan_count=fan_count,
         countries=countries, languages=languages, writers=writers,
         cinematographers=cinematographers, composers=composers,
         is_short=is_short, is_animation=is_animation,
+        tmdb_id=tmdb_id, imdb_id=imdb_id,
     )
 
 
@@ -328,10 +374,14 @@ class LetterboxdScraper:
             http2=SCRAPER_HTTP2,
             cookies=self.cookies or None,
         )
+        self.client = TimedClient(self.client)
+        # URLs whose last fetch failed for a transient/unknown reason (not 404, not private)
+        self._failed: set[str] = set()
         self.delay = delay
         self._current_delay = max(delay, SCRAPER_ADAPTIVE_DELAY_MIN)
 
     def _get(self, url: str, max_retries: int = MAX_HTTP_RETRIES) -> HTMLParser | None:
+        self._failed.discard(url)
         time.sleep(self._current_delay)
 
         retries = 0
@@ -349,6 +399,7 @@ class LetterboxdScraper:
                     # Check if we've waited too long for 429s
                     if total_429_wait_time + retry_after > MAX_429_RETRY_SECONDS:
                         logger.error(f"Max 429 wait time exceeded for {url} (waited {total_429_wait_time}s, would need {retry_after}s more)")
+                        self._failed.add(url)
                         return None
                     
                     logger.warning(f"Rate limited (429) on {url}, waiting {retry_after}s... (total 429 wait: {total_429_wait_time}s)")
@@ -381,14 +432,19 @@ class LetterboxdScraper:
                     retries += 1
                 else:
                     logger.error(f"Max retries exceeded for {url}: {e}")
+                    self._failed.add(url)
                     return None
             except httpx.HTTPStatusError as e:
                 logger.error(f"HTTP error on {url}: {e}")
+                if not (e.response.status_code == 403 and _looks_private(e.response.text)):
+                    self._failed.add(url)
                 return None
             except httpx.HTTPError as e:
                 logger.error(f"Request error on {url}: {e}")
+                self._failed.add(url)
                 return None
         
+        self._failed.add(url)
         return None
     
     def _detect_soft_block(self, tree: HTMLParser) -> bool:
@@ -431,22 +487,26 @@ class LetterboxdScraper:
                     return tree
 
             logger.error(f"Persistent soft block on {url}")
+            self._failed.add(url)
             return None
 
         return tree
-    
-    def _fetch_fan_count(self, slug: str) -> int | None:
+
+    def _get_listing_page(self, url: str, attempts: int = 3) -> HTMLParser | None:
+        """Fetch one page of a paginated listing, retrying transient failures.
+
+        Returns None only when the page genuinely isn't there (404 / private); if it is still
+        failing after the retries it also returns None, but `url` stays in `self._failed` so the
+        caller can tell the two apart.
         """
-        Fetch fan count from the ratings-summary CSI endpoint.
-        """
-        try:
-            resp = self.client.get(f"{self.BASE}/csi/film/{slug}/ratings-summary/")
-            if resp.status_code != 200:
-                return None
-            return _parse_fan_count_from_html(resp.text)
-        except httpx.HTTPError as exc:
-            logger.debug(f"Fan count fetch failed for {slug}: {exc}")
-            return None
+        tree = None
+        for attempt in range(attempts):
+            tree = self._get_with_soft_block_recovery(url)
+            if tree is not None or url not in self._failed:
+                return tree
+            if attempt < attempts - 1:
+                time.sleep(2 * (attempt + 1) ** 2)  # 2s, 8s
+        return tree
     
     def scrape_user(self, username: str, existing_slugs: set[str] | None = None, stop_on_existing: bool = False) -> list[FilmInteraction]:
         """
@@ -468,9 +528,12 @@ class LetterboxdScraper:
         consecutive_existing = 0  # Track consecutive existing films for early termination
 
         while True:
-            tree = self._get_with_soft_block_recovery(f"{self.BASE}/{username}/films/page/{page}/")
+            films_url = f"{self.BASE}/{username}/films/page/{page}/"
+            tree = self._get_listing_page(films_url)
             if not tree:
-                break
+                # Past-the-end pages come back 200 with an empty grid, so a missing page is a
+                # failure. Stopping here would silently keep a truncated profile.
+                raise ScrapeIncompleteError(username, films_url)
 
             items = tree.css("li.griditem")
             if not items:
@@ -530,9 +593,12 @@ class LetterboxdScraper:
         logger.info(f"Scraping {username}'s watchlist...")
         page = 1
         while True:
-            tree = self._get_with_soft_block_recovery(f"{self.BASE}/{username}/watchlist/page/{page}/")
+            watch_url = f"{self.BASE}/{username}/watchlist/page/{page}/"
+            tree = self._get_listing_page(watch_url)
             if not tree:
-                break
+                if page > 1 or watch_url in self._failed:
+                    raise ScrapeIncompleteError(username, watch_url)
+                break  # private or missing watchlist
             
             items = tree.css("li.griditem")
             if not items:
@@ -582,9 +648,12 @@ class LetterboxdScraper:
         empty_pages = 0
 
         while True:
-            tree = self._get_with_soft_block_recovery(f"{self.BASE}/{username}/films/page/{page}/")
+            films_url = f"{self.BASE}/{username}/films/page/{page}/"
+            tree = self._get_listing_page(films_url)
             if not tree:
-                break
+                # Past-the-end pages come back 200 with an empty grid, so a missing page is a
+                # failure. Stopping here would silently keep a truncated profile.
+                raise ScrapeIncompleteError(username, films_url)
 
             items = tree.css("li.griditem")
             if not items:
@@ -629,9 +698,12 @@ class LetterboxdScraper:
         # Watchlist sweep (reuse standard logic with smart requests)
         page = 1
         while True:
-            tree = self._get_with_soft_block_recovery(f"{self.BASE}/{username}/watchlist/page/{page}/")
+            watch_url = f"{self.BASE}/{username}/watchlist/page/{page}/"
+            tree = self._get_listing_page(watch_url)
             if not tree:
-                break
+                if page > 1 or watch_url in self._failed:
+                    raise ScrapeIncompleteError(username, watch_url)
+                break  # private or missing watchlist
             
             items = tree.css("li.griditem")
             if not items:
@@ -667,7 +739,6 @@ class LetterboxdScraper:
         if not tree:
             return None
         meta = parse_film_page(tree, slug)
-        meta.fan_count = self._fetch_fan_count(slug)
         return meta
     
     def _parse_rating(self, span) -> float | None:
@@ -812,13 +883,13 @@ class LetterboxdScraper:
                 break
 
             # Reviews are in li.film-detail elements
-            review_items = tree.css("li.film-detail")
+            review_items = tree.css("li.film-detail") or tree.css("div.listitem article.production-viewing")
             if not review_items:
                 break
 
             for item in review_items:
                 # Extract username from the author link
-                author_link = item.css_first("a.context")
+                author_link = item.css_first("a.avatar") or item.css_first("a.context")
                 if not author_link:
                     continue
 
@@ -831,13 +902,17 @@ class LetterboxdScraper:
                     continue
 
                 # Check if they have a rating (star icons visible)
-                has_rating = item.css_first("span.rating") is not None
+                has_rating = item.css_first("span.rating, span.inline-rating") is not None
 
                 # Try to extract review date if visible
                 review_date = None
                 date_link = item.css_first("span._nobr a")
                 if date_link:
                     review_date = date_link.text(strip=True)
+                else:
+                    time_el = item.css_first("time")
+                    if time_el:
+                        review_date = time_el.attributes.get("datetime") or time_el.text(strip=True) or None
 
                 reviewers.append({
                     'username': username,
@@ -882,6 +957,13 @@ class LetterboxdScraper:
                     count_str = count_span.text(strip=True).replace(",", "")
                     film_count = int(count_str)
                 except (ValueError, IndexError):
+                    pass
+        if not film_count:
+            value_span = tree.css_first(f"a[href='/{username}/films/'] span.value")
+            if value_span:
+                try:
+                    film_count = int(value_span.text(strip=True).replace(",", ""))
+                except ValueError:
                     pass
 
 
@@ -1039,8 +1121,20 @@ class AsyncLetterboxdScraper:
 
     BASE = "https://letterboxd.com"
 
-    def __init__(self, delay: float = 0.2, max_concurrent: int = 5):
+    PAGE_WAVE = 4  # listing pages fetched concurrently once page 1 shows there are more
+
+    def __init__(self, delay: float = 0.2, max_concurrent: int = 5, max_rps: float | None = None,
+                 rps_ceiling: float | None = None):
         self.delay = delay
+        self._base_delay = delay
+        self._max_concurrent = max_concurrent
+        # Optional global cap on request *starts* per second, independent of latency.
+        self.max_rps = max_rps
+        # With a ceiling above max_rps, the rate is probed upward and backed off on throttling.
+        self._aimd = AimdRate(start=max_rps, ceiling=rps_ceiling) if (max_rps and rps_ceiling and rps_ceiling > max_rps) else None
+        self._pace_lock = asyncio.Lock()
+        self._next_start = 0.0
+        self._failed: set[str] = set()
         self.semaphore = asyncio.Semaphore(max_concurrent)
         self.client = None
         self.cookies = _parse_cookie_header(LETTERBOXD_COOKIE)
@@ -1052,6 +1146,38 @@ class AsyncLetterboxdScraper:
     def _parse_rating(span) -> float | None:
         """Reuse the shared rating parser."""
         return _parse_rating_span(span)
+
+    def _pace_interval(self) -> float:
+        """Minimum gap between request starts: the rps cap, or the (adaptive) delay shared across
+        the concurrency slots. The delay grows after 429s, so backoff still slows everything."""
+        rps = self._aimd.rps if self._aimd else self.max_rps
+        cap = (1.0 / rps) if rps else 0.0
+        return max(cap, self.delay / max(1, self._max_concurrent))
+
+    async def _pace(self) -> None:
+        """Space request starts evenly. Unlike a per-request sleep inside the concurrency slot,
+        this keeps the request rate steady regardless of how slow individual responses are."""
+        interval = self._pace_interval()
+        if interval <= 0:
+            return
+        async with self._pace_lock:
+            loop = asyncio.get_running_loop()
+            now = loop.time()
+            start = max(now, self._next_start)
+            self._next_start = start + interval
+        if start > now:
+            await asyncio.sleep(start - now)
+
+    def _decay_delay(self) -> None:
+        """After a successful request, ease the delay back toward its base (mirrors the sync scraper)."""
+        self.delay = max(self._base_delay, self.delay * 0.8 + self._base_delay * 0.2)
+        if self._aimd:
+            self._aimd.on_ok()
+
+    def _note_throttle(self) -> None:
+        """A 429 or a blocking 403 was seen: tell the adaptive rate controller (if enabled)."""
+        if self._aimd:
+            self._aimd.on_throttle()
 
     @staticmethod
     def _detect_soft_block(tree: HTMLParser | None) -> bool:
@@ -1081,6 +1207,7 @@ class AsyncLetterboxdScraper:
             http2=SCRAPER_HTTP2,
             cookies=self.cookies or None,
         )
+        self.client = TimedAsyncClient(self.client)
         return self
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -1097,8 +1224,9 @@ class AsyncLetterboxdScraper:
         if not self.client:
             raise RuntimeError("AsyncLetterboxdScraper must be used as an async context manager for user scraping")
 
+        self._failed.discard(url)
         async with self.semaphore:
-            await asyncio.sleep(self.delay)
+            await self._pace()
 
             for attempt in range(MAX_HTTP_RETRIES):
                 await self._rate_limit_event.wait()
@@ -1123,9 +1251,11 @@ class AsyncLetterboxdScraper:
                         jitter = random.uniform(0, self.delay * 2)
                         await asyncio.sleep(jitter)
                         self.delay = min(SCRAPER_ADAPTIVE_DELAY_MAX, self.delay * SCRAPER_429_BACKOFF)
+                        self._note_throttle()
                         continue
 
                     resp.raise_for_status()
+                    self._decay_delay()
                     return HTMLParser(resp.text)
 
                 except httpx.TimeoutException:
@@ -1137,13 +1267,19 @@ class AsyncLetterboxdScraper:
 
                 except httpx.HTTPStatusError as exc:
                     logger.error(f"HTTP {exc.response.status_code} on {url}: {exc}")
+                    if not (exc.response.status_code == 403 and _looks_private(exc.response.text)):
+                        self._failed.add(url)
+                        if exc.response.status_code == 403:
+                            self._note_throttle()
                     return None
 
                 except httpx.HTTPError as exc:
                     logger.error(f"Request error on {url}: {type(exc).__name__}: {exc}")
+                    self._failed.add(url)
                     return None
 
             logger.error(f"Max retries exceeded for {url}")
+            self._failed.add(url)
             return None
 
     async def _get_with_soft_block_recovery(self, url: str) -> HTMLParser | None:
@@ -1157,101 +1293,148 @@ class AsyncLetterboxdScraper:
                 if tree and not self._detect_soft_block(tree):
                     return tree
             logger.error(f"Persistent soft block on {url}")
+            self._failed.add(url)
             return None
         return tree
 
+    async def _get_listing_page(self, url: str, attempts: int = 3) -> HTMLParser | None:
+        """Async twin of LetterboxdScraper._get_listing_page: retry transient failures; None with
+        `url` left in `self._failed` means it is still failing, plain None means 404/private."""
+        tree = None
+        for attempt in range(attempts):
+            tree = await self._get_with_soft_block_recovery(url)
+            if tree is not None or url not in self._failed:
+                return tree
+            if attempt < attempts - 1:
+                await asyncio.sleep(2 * (attempt + 1) ** 2)  # 2s, 8s
+        return tree
+
+    async def _iter_pages(self, url_for_page, wave: int | None = None, max_pages: int = 500):
+        """Yield (page_number, tree) in order.
+
+        Page 1 is fetched alone, so a one-page listing costs one request. If the consumer keeps
+        going, the following pages are fetched `wave` at a time. Pages past the end are cheap empty
+        grids and the consumer stops at the first short/empty page, so the speculation wastes at
+        most wave-1 requests per listing.
+        """
+        wave = wave or self.PAGE_WAVE
+        yield 1, await self._get_listing_page(url_for_page(1))
+        page = 2
+        while page <= max_pages:
+            numbers = list(range(page, min(page + wave, max_pages + 1)))
+            trees = await asyncio.gather(*(self._get_listing_page(url_for_page(n)) for n in numbers))
+            for n, tree in zip(numbers, trees):
+                yield n, tree
+            page += wave
+
+    @staticmethod
+    def _slug_of(item) -> str | None:
+        react_comp = item.css_first("div.react-component")
+        if not react_comp:
+            return None
+        return validate_slug(react_comp.attributes.get("data-item-slug"))
+
+    @staticmethod
+    def _viewing_data(item) -> tuple[float | None, bool]:
+        rating, liked = None, False
+        viewing_data = item.css_first("p.poster-viewingdata")
+        if viewing_data:
+            rating_span = viewing_data.css_first("span.rating")
+            if rating_span:
+                rating = _parse_rating_span(rating_span)
+            liked = viewing_data.css_first("span.like") is not None
+        return rating, liked
+
+    async def _scrape_watchlist_into(self, username: str, films: dict[str, FilmInteraction]) -> None:
+        """Merge the user's watchlist into `films`. Private/missing watchlists are skipped; a page
+        that keeps failing raises, so a half-fetched watchlist is never kept."""
+        def url_for(p: int) -> str:
+            return f"{self.BASE}/{username}/watchlist/page/{p}/"
+
+        seen: set[str] = set()
+        async with aclosing(self._iter_pages(url_for)) as pages:
+            async for page, tree in pages:
+                if not tree:
+                    if page > 1 or url_for(page) in self._failed:
+                        raise ScrapeIncompleteError(username, url_for(page))
+                    break  # private or missing watchlist
+                items = tree.css("li.griditem")
+                if not items:
+                    break
+
+                new_on_page = False
+                for item in items:
+                    slug = self._slug_of(item)
+                    if not slug:
+                        continue
+                    if slug not in seen:
+                        seen.add(slug)
+                        new_on_page = True
+                    if slug in films:
+                        films[slug].watchlisted = True
+                    else:
+                        films[slug] = FilmInteraction(slug, None, False, True, False)
+
+                # A short page is the last one; a page with nothing new means the site is
+                # repeating content past the end.
+                if len(items) < SCRAPER_PAGE_SIZE or not new_on_page:
+                    break
+
     async def scrape_user(self, username: str, existing_slugs: set[str] | None = None, stop_on_existing: bool = False) -> list[FilmInteraction]:
         """
-        Async variant of user scraping. Uses the shared client/semaphore so requests are globally rate limited.
+        Async variant of user scraping. Uses the shared client/semaphore so requests are globally
+        rate limited. After page 1, listing pages are fetched PAGE_WAVE at a time. Any page that
+        cannot be fetched raises ScrapeIncompleteError rather than keeping a truncated profile.
         """
         films: dict[str, FilmInteraction] = {}
 
         logger.info(f"Scraping {username}'s films (async)...")
-        page = 1
         consecutive_existing = 0
 
-        while True:
-            tree = await self._get_with_soft_block_recovery(f"{self.BASE}/{username}/films/page/{page}/")
-            if not tree:
-                break
+        def url_for(p: int) -> str:
+            return f"{self.BASE}/{username}/films/page/{p}/"
 
-            items = tree.css("li.griditem")
-            if not items:
-                break
+        async with aclosing(self._iter_pages(url_for)) as pages:
+            async for page, tree in pages:
+                if not tree:
+                    # Past-the-end pages are 200 with an empty grid, so a missing page is a failure.
+                    raise ScrapeIncompleteError(username, url_for(page))
 
-            page_had_new_films = False
-            stop_after_page = len(items) < SCRAPER_PAGE_SIZE
+                items = tree.css("li.griditem")
+                if not items:
+                    break
 
-            for item in items:
-                react_comp = item.css_first("div.react-component")
-                if not react_comp:
-                    continue
+                page_had_new_films = False
+                for item in items:
+                    slug = self._slug_of(item)
+                    if not slug:
+                        continue
 
-                slug = validate_slug(react_comp.attributes.get("data-item-slug"))
-                if not slug:
-                    continue
+                    if stop_on_existing and existing_slugs and slug in existing_slugs:
+                        consecutive_existing += 1
+                        if consecutive_existing >= MAX_CONSECUTIVE_EXISTING:
+                            logger.info(
+                                f"  Found {consecutive_existing} consecutive existing films, stopping early (incremental mode)"
+                            )
+                            return list(films.values())
+                        continue
+                    else:
+                        consecutive_existing = 0
+                        page_had_new_films = True
 
-                if stop_on_existing and existing_slugs and slug in existing_slugs:
-                    consecutive_existing += 1
-                    if consecutive_existing >= MAX_CONSECUTIVE_EXISTING:
-                        logger.info(
-                            f"  Found {consecutive_existing} consecutive existing films, stopping early (incremental mode)"
-                        )
-                        return list(films.values())
-                    continue
-                else:
-                    consecutive_existing = 0
-                    page_had_new_films = True
+                    rating, liked = self._viewing_data(item)
+                    films[slug] = FilmInteraction(slug, rating, True, False, liked)
 
-                rating = None
-                liked = False
-                viewing_data = item.css_first("p.poster-viewingdata")
-                if viewing_data:
-                    rating_span = viewing_data.css_first("span.rating")
-                    if rating_span:
-                        rating = self._parse_rating(rating_span)
-                    liked = viewing_data.css_first("span.like") is not None
+                logger.debug(f"  Watched page {page}: {len(items)} films")
 
-                films[slug] = FilmInteraction(slug, rating, True, False, liked)
-
-            page += 1
-            logger.debug(f"  Watched page {page-1}: {len(items)} films")
-
-            if stop_on_existing and not page_had_new_films and existing_slugs:
-                logger.info(f"  No new films found on page {page-1}, stopping early (incremental mode)")
-                break
-            if stop_after_page:
-                break
+                if stop_on_existing and not page_had_new_films and existing_slugs:
+                    logger.info(f"  No new films found on page {page}, stopping early (incremental mode)")
+                    break
+                if len(items) < SCRAPER_PAGE_SIZE:
+                    break
 
         logger.info(f"Scraping {username}'s watchlist (async)...")
-        page = 1
-        while True:
-            tree = await self._get_with_soft_block_recovery(f"{self.BASE}/{username}/watchlist/page/{page}/")
-            if not tree:
-                break
-
-            items = tree.css("li.griditem")
-            if not items:
-                break
-
-            stop_after_page = len(items) < SCRAPER_PAGE_SIZE
-            for item in items:
-                react_comp = item.css_first("div.react-component")
-                if not react_comp:
-                    continue
-
-                slug = validate_slug(react_comp.attributes.get("data-item-slug"))
-                if not slug:
-                    continue
-
-                if slug in films:
-                    films[slug].watchlisted = True
-                else:
-                    films[slug] = FilmInteraction(slug, None, False, True, False)
-
-            page += 1
-            if stop_after_page:
-                break
+        await self._scrape_watchlist_into(username, films)
 
         n_rated = sum(1 for f in films.values() if f.rating)
         n_liked = sum(1 for f in films.values() if f.liked)
@@ -1275,88 +1458,43 @@ class AsyncLetterboxdScraper:
             if estimated_pages > 10:
                 logger.info(f"Large profile detected ({known_film_count} films, ~{estimated_pages} pages)")
 
-        page = 1
         empty_pages = 0
 
-        while True:
-            tree = await self._get_with_soft_block_recovery(f"{self.BASE}/{username}/films/page/{page}/")
-            if not tree:
-                break
+        def url_for(p: int) -> str:
+            return f"{self.BASE}/{username}/films/page/{p}/"
 
-            items = tree.css("li.griditem")
-            if not items:
-                empty_pages += 1
-                if empty_pages >= 2:
+        async with aclosing(self._iter_pages(url_for)) as pages:
+            async for page, tree in pages:
+                if not tree:
+                    raise ScrapeIncompleteError(username, url_for(page))
+
+                items = tree.css("li.griditem")
+                if not items:
+                    empty_pages += 1
+                    if empty_pages >= 2:
+                        break
+                    continue
+
+                empty_pages = 0
+                for item in items:
+                    slug = self._slug_of(item)
+                    if not slug:
+                        continue
+                    rating, liked = self._viewing_data(item)
+                    films[slug] = FilmInteraction(slug, rating, True, False, liked)
+
+                if len(items) < SCRAPER_PAGE_SIZE * 0.8:
                     break
-                page += 1
-                continue
+                if estimated_pages and page + 1 > estimated_pages + 2:
+                    break
 
-            empty_pages = 0
-            stop_after_page = len(items) < SCRAPER_PAGE_SIZE * 0.8
-
-            for item in items:
-                react_comp = item.css_first("div.react-component")
-                if not react_comp:
-                    continue
-
-                slug = validate_slug(react_comp.attributes.get("data-item-slug"))
-                if not slug:
-                    continue
-
-                rating = None
-                liked = False
-
-                viewing_data = item.css_first("p.poster-viewingdata")
-                if viewing_data:
-                    rating_span = viewing_data.css_first("span.rating")
-                    if rating_span:
-                        rating = _parse_rating_span(rating_span)
-
-                    liked = viewing_data.css_first("span.like") is not None
-
-                films[slug] = FilmInteraction(slug, rating, True, False, liked)
-
-            page += 1
-            if stop_after_page:
-                break
-            if estimated_pages and page > estimated_pages + 2:
-                break
-
-        # Watchlist sweep (reuse standard logic with smart requests)
-        page = 1
-        while True:
-            tree = await self._get_with_soft_block_recovery(f"{self.BASE}/{username}/watchlist/page/{page}/")
-            if not tree:
-                break
-
-            items = tree.css("li.griditem")
-            if not items:
-                break
-
-            stop_after_page = len(items) < SCRAPER_PAGE_SIZE
-            for item in items:
-                react_comp = item.css_first("div.react-component")
-                if not react_comp:
-                    continue
-
-                slug = validate_slug(react_comp.attributes.get("data-item-slug"))
-                if not slug:
-                    continue
-
-                if slug in films:
-                    films[slug].watchlisted = True
-                else:
-                    films[slug] = FilmInteraction(slug, None, False, True, False)
-
-            page += 1
-            if stop_after_page:
-                break
+        await self._scrape_watchlist_into(username, films)
 
         n_rated = sum(1 for f in films.values() if f.rating)
         n_liked = sum(1 for f in films.values() if f.liked)
         logger.info(f"Smart scrape total (async): {len(films)} films ({n_rated} rated, {n_liked} liked)")
         return list(films.values())
-    
+
     async def scrape_following_async(self, username: str, limit: int = 100) -> list[str]:
         """Scrape usernames that the target user follows (async)."""
         usernames: list[str] = []
@@ -1435,7 +1573,7 @@ class AsyncLetterboxdScraper:
             http2=SCRAPER_HTTP2,
             cookies=self.cookies or None,
         ) as temp_client:
-            return await self._scrape_batch_with_client(temp_client, slugs)
+            return await self._scrape_batch_with_client(TimedAsyncClient(temp_client), slugs)
     
     async def _scrape_batch_with_client(self, client: httpx.AsyncClient, slugs: list[str]) -> list[FilmMetadata]:
         """
@@ -1482,21 +1620,10 @@ class AsyncLetterboxdScraper:
 
         return successful
     
-    async def _fetch_fan_count_async(self, client: httpx.AsyncClient, slug: str) -> int | None:
-        """Async helper to fetch fan count from ratings-summary CSI endpoint."""
-        try:
-            resp = await client.get(f"{self.BASE}/csi/film/{slug}/ratings-summary/")
-            if resp.status_code != 200:
-                return None
-            return _parse_fan_count_from_html(resp.text)
-        except httpx.HTTPError as exc:
-            logger.debug(f"Fan count fetch failed for {slug}: {exc}")
-            return None
-    
     async def _scrape_film_async(self, client: httpx.AsyncClient, slug: str) -> FilmMetadata | None:
         """Scrape a single film asynchronously with proper retry logic and coordinated rate limiting."""
         async with self.semaphore:
-            await asyncio.sleep(self.delay)
+            await self._pace()
 
             for attempt in range(MAX_HTTP_RETRIES):
                 # Wait if globally rate limited by another task
@@ -1528,12 +1655,13 @@ class AsyncLetterboxdScraper:
                         await asyncio.sleep(jitter)
                         # Adjust delay upwards for future calls
                         self.delay = min(SCRAPER_ADAPTIVE_DELAY_MAX, self.delay * SCRAPER_429_BACKOFF)
+                        self._note_throttle()
                         continue
 
                     resp.raise_for_status()
+                    self._decay_delay()
                     tree = HTMLParser(resp.text)
                     meta = parse_film_page(tree, slug)
-                    meta.fan_count = await self._fetch_fan_count_async(client, slug)
                     return meta
 
                 except httpx.TimeoutException:
@@ -1545,6 +1673,8 @@ class AsyncLetterboxdScraper:
 
                 except httpx.HTTPStatusError as e:
                     logger.error(f"HTTP {e.response.status_code} on {slug}: {e}")
+                    if e.response.status_code == 403 and not _looks_private(e.response.text):
+                        self._note_throttle()
                     return None
 
                 except httpx.HTTPError as e:

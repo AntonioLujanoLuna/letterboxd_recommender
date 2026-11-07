@@ -213,3 +213,40 @@ def test_scrape_user_lists_marks_ranked(monkeypatch):
         {"list_slug": "top-10", "list_name": "Top 10", "is_ranked": True},
         {"list_slug": "random-list", "list_name": "Random", "is_ranked": False},
     ]
+
+def test_scrape_film_reviewers_current_markup(monkeypatch):
+    lb = scraper.LetterboxdScraper(delay=0.0)
+    html = """
+    <div class="listitem"><article class="production-viewing -viewing">
+      <a class="avatar -a40" href="/alice/"></a>
+      <span class="inline-symbol inline-rating"></span>
+      <a class="context" href="/alice/film/film-x/"></a>
+      <time datetime="2026-11-07"></time>
+    </article></div>
+    <div class="listitem"><article class="production-viewing -viewing">
+      <a class="avatar -a40" href="/bob/"></a>
+      <a class="context" href="/bob/film/film-x/"></a>
+    </article></div>
+    """
+    monkeypatch.setattr(lb, "_get", lambda url: HTMLParser(html) if "page/1" in url else HTMLParser("<html></html>"))
+    reviewers = lb.scrape_film_reviewers("film-x", limit=5)
+    lb.close()
+    assert reviewers == [
+        {"username": "alice", "has_rating": True, "review_date": "2026-11-07"},
+        {"username": "bob", "has_rating": False, "review_date": None},
+    ]
+
+
+def test_check_user_activity_current_markup(monkeypatch):
+    lb = scraper.LetterboxdScraper(delay=0.0)
+    html = """<html><h4 class="profile-statistic"><a href="/alice/films/"><span class="value">1,234</span>
+    <span class="definition">Films</span></a></h4><a href="/films/ratings/rated/4/"></a></html>"""
+    monkeypatch.setattr(lb, "_get_with_soft_block_recovery", lambda url: HTMLParser(html))
+    info = lb.check_user_activity("alice")
+    lb.close()
+    assert info["film_count"] == 1234 and info["has_ratings"]
+
+
+def test_parse_film_page_reads_fan_count_from_page():
+    tree = HTMLParser('<html><body><a href="/film/x/fans/" class="accessory"> 76K fans</a></body></html>')
+    assert scraper.parse_film_page(tree, "x").fan_count == 76_000

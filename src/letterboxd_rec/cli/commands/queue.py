@@ -28,6 +28,8 @@ def cmd_queue_status(args: argparse.Namespace) -> None:
     logger.info(f"Total pending users: {stats['total']}")
     if stats['avg_priority'] is not None:
         logger.info(f"Average priority: {stats['avg_priority']:.1f}")
+    if stats.get('parked'):
+        logger.info(f"Parked after repeated failures: {stats['parked']} (see queue-clear to drop them)")
 
     if stats['breakdown']:
         logger.info("\nBy source:")

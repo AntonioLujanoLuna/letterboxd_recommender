@@ -11,12 +11,14 @@ from ...recommender import (
     CollaborativeRecommender,
     Recommendation,
     _fuse_normalized,
+    hybrid_weights,
 )
 from ...matrix_factorization import SVDRecommender
 from ...profile import build_profile
 from ...graph_config import GraphConfig
 from ...graph_recommender import GraphRecommender
-from ...config import SVD_CACHE_PATH
+from ...config import SVD_CACHE_PATH, SVD_ITEM_BIAS_REG
+from .helpers import film_url
 
 logger = logging.getLogger(__name__)
 
@@ -103,23 +105,12 @@ def _run_hybrid_strategy(
     collab_rec = CollaborativeRecommender(all_user_films, all_films)
 
     rated_count = sum(1 for f in user_films if f.get('rating'))
-    meta_weight = args.hybrid_meta_weight
-    collab_weight = args.hybrid_collab_weight
-
-    if meta_weight is None and collab_weight is None:
-        # Heuristic: lean on metadata when user data or neighbors are sparse
-        if len(all_user_films) < 10 or rated_count < 20:
-            meta_weight = 0.7
-            collab_weight = 0.3
-        else:
-            meta_weight = 0.6
-            collab_weight = 0.4
-    else:
-        # If only one is provided, derive the other to preserve user intent
-        if meta_weight is None:
-            meta_weight = max(0.0, 1.0 - collab_weight) if collab_weight is not None else 0.6
-        if collab_weight is None:
-            collab_weight = max(0.0, 1.0 - meta_weight) if meta_weight is not None else 0.4
+    meta_weight, collab_weight = hybrid_weights(
+        len(all_user_films),
+        rated_count,
+        meta_weight=args.hybrid_meta_weight,
+        collab_weight=args.hybrid_collab_weight,
+    )
 
     meta_recs = meta_rec.recommend(
         user_films,
@@ -251,13 +242,14 @@ def _run_svd_strategy(
     cache_path = SVD_CACHE_PATH
     n_factors = min(50, n_users - 1)
     use_implicit = True
-    implicit_weight = 0.3
+    implicit_weight = 1.0  # scales SVD_IMPLICIT_RESIDUALS
     fingerprint = SVDRecommender.compute_fingerprint(
         all_user_films,
         hyperparams={
             "n_factors": n_factors,
             "use_implicit": use_implicit,
             "implicit_weight": implicit_weight,
+            "item_bias_reg": SVD_ITEM_BIAS_REG,
         },
     )
     svd = SVDRecommender.load(cache_path, expected_fingerprint=fingerprint)
@@ -328,3 +320,154 @@ def _run_svd_strategy(
             break
 
     return recs
+
+
+_MOVIELENS_MODEL = None
+
+
+def _run_movielens_strategy(
+    user_films: list[dict],
+    all_films: dict[str, dict],
+    args: argparse.Namespace,
+    username: str,
+    user_lists: list[dict] | None,
+    all_user_films: dict[str, list[dict]] | None = None,
+) -> list[Recommendation]:
+    """EASE trained on MovieLens users, scored from this user's Letterboxd history."""
+    global _MOVIELENS_MODEL
+    from ...movielens import FilmMatcher, MovieLensModel
+
+    try:
+        if _MOVIELENS_MODEL is None:
+            _MOVIELENS_MODEL = MovieLensModel.load()
+    except FileNotFoundError as e:
+        logger.error(str(e))
+        return []
+    model = _MOVIELENS_MODEL
+    matcher = FilmMatcher(model)
+
+    weighted, seen, unmatched = matcher.map_history(user_films, all_films)
+    if not weighted:
+        logger.error(
+            f"None of {username}'s {len(user_films)} films matched MovieLens "
+            f"({unmatched} unmatched). Scrape the profile first, or refresh film metadata."
+        )
+        return []
+    if unmatched:
+        logger.info(f"Matched {len(user_films) - unmatched}/{len(user_films)} films to MovieLens "
+                    f"(MovieLens ends in late 2023; newer and obscure films can't be used).")
+
+    col_to_slug = matcher.letterboxd_slugs(all_films)
+    needs_metadata = bool(args.genres or args.exclude_genres or args.min_rating)
+    liked_cols = [c for c, w in sorted(weighted.items(), key=lambda kv: -kv[1]) if w >= 1.0]
+
+    recs: list[Recommendation] = []
+    for col, score in model.recommend_columns(weighted, seen, n=max(args.limit * 20, 300)):
+        slug = col_to_slug.get(col)
+        year = model.years[col]
+        if slug and slug in all_films:
+            film = all_films[slug]
+            if not _passes_cli_filters(film, args):
+                continue
+            title, year = film.get('title', model.titles[col]), film.get('year') or year
+        else:
+            if needs_metadata:
+                continue  # can't check genre/rating filters without Letterboxd metadata
+            if (args.min_year and year and year < args.min_year) or (args.max_year and year and year > args.max_year):
+                continue
+            tmdb = model.tmdb_ids[col]
+            if not tmdb:
+                continue
+            slug, title = f"tmdb:{tmdb}", model.titles[col]
+        contrib = sorted(((float(model.B[c, col]), c) for c in liked_cols), reverse=True)[:2]
+        reasons = [f"Because you liked {model.titles[c]}" for w, c in contrib if w > 0]
+        recs.append(Recommendation(slug=slug, title=title, year=year, score=score, reasons=reasons))
+        if len(recs) >= args.limit:
+            break
+    return recs
+
+
+def _passes_cli_filters(film: dict, args: argparse.Namespace) -> bool:
+    """Year / genre / average-rating filters from the recommend command line."""
+    year = film.get('year')
+    if args.min_year and year and year < args.min_year:
+        return False
+    if args.max_year and year and year > args.max_year:
+        return False
+    film_genres = load_json(film.get('genres', []))
+    if args.genres and not any(g.lower() in film_genres for g in args.genres):
+        return False
+    if args.exclude_genres and any(g.lower() in film_genres for g in args.exclude_genres):
+        return False
+    if args.min_rating and film.get('avg_rating') and film['avg_rating'] < args.min_rating:
+        return False
+    return True
+
+
+def _run_ease_strategy(
+    user_films: list[dict],
+    all_films: dict[str, dict],
+    args: argparse.Namespace,
+    username: str,
+    user_lists: list[dict] | None,
+    all_user_films: dict[str, list[dict]] | None,
+) -> list[Recommendation]:
+    """EASE item-item model (closed form, cached per data version)."""
+    from ...ease import load_or_fit_ease
+
+    if not all_user_films:
+        logger.error("EASE strategy requires all user data.")
+        return []
+    try:
+        model = load_or_fit_ease(all_user_films)
+    except ValueError as e:
+        logger.error(f"Unable to fit EASE model: {e}")
+        return []
+
+    # Over-fetch so metadata filters still leave enough results
+    ranked = model.recommend(user_films, n=max(args.limit * 10, 200))
+    liked = [f['slug'] for f in user_films if f.get('liked') or (f.get('rating') or 0) >= 4.0]
+    recs: list[Recommendation] = []
+    for slug, score in ranked:
+        film = all_films.get(slug)
+        if not film or not _passes_cli_filters(film, args):
+            continue
+        reasons = []
+        idx = model.item_index.get(slug)
+        if idx is not None and liked:
+            # Films the user liked that push this one up the most
+            contrib = [(model.B[model.item_index[s], idx], s) for s in liked if s in model.item_index]
+            for weight, src in sorted(contrib, reverse=True)[:2]:
+                if weight > 0:
+                    title = all_films.get(src, {}).get('title', src)
+                    reasons.append(f"Because you liked {title}")
+        recs.append(Recommendation(slug=slug, title=film.get('title', slug), year=film.get('year'),
+                                   score=score, reasons=reasons))
+        if len(recs) >= args.limit:
+            break
+    return recs
+
+
+def _run_content_strategy(
+    user_films: list[dict],
+    all_films: dict[str, dict],
+    args: argparse.Namespace,
+    username: str,
+    user_lists: list[dict] | None,
+    all_user_films: dict[str, list[dict]] | None = None,
+) -> list[Recommendation]:
+    """Vectorized IDF-weighted content similarity (fast metadata alternative)."""
+    from ...content import ContentRecommender
+
+    candidates = {s: f for s, f in all_films.items() if _passes_cli_filters(f, args)}
+    model = ContentRecommender(candidates)
+    recs = []
+    for slug, score in model.recommend(user_films, n=args.limit):
+        film = candidates[slug]
+        recs.append(Recommendation(
+            slug=slug, title=film.get('title', slug), year=film.get('year'), score=score,
+            reasons=model.top_shared_features(user_films, slug),
+        ))
+    return recs
+
+
