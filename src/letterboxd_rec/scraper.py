@@ -1041,6 +1041,7 @@ class AsyncLetterboxdScraper:
 
     def __init__(self, delay: float = 0.2, max_concurrent: int = 5):
         self.delay = delay
+        self._base_delay = delay
         self.semaphore = asyncio.Semaphore(max_concurrent)
         self.client = None
         self.cookies = _parse_cookie_header(LETTERBOXD_COOKIE)
@@ -1052,6 +1053,10 @@ class AsyncLetterboxdScraper:
     def _parse_rating(span) -> float | None:
         """Reuse the shared rating parser."""
         return _parse_rating_span(span)
+
+    def _decay_delay(self) -> None:
+        """After a successful request, ease the delay back toward its base (mirrors the sync scraper)."""
+        self.delay = max(self._base_delay, self.delay * 0.8 + self._base_delay * 0.2)
 
     @staticmethod
     def _detect_soft_block(tree: HTMLParser | None) -> bool:
@@ -1126,6 +1131,7 @@ class AsyncLetterboxdScraper:
                         continue
 
                     resp.raise_for_status()
+                    self._decay_delay()
                     return HTMLParser(resp.text)
 
                 except httpx.TimeoutException:
@@ -1531,6 +1537,7 @@ class AsyncLetterboxdScraper:
                         continue
 
                     resp.raise_for_status()
+                    self._decay_delay()
                     tree = HTMLParser(resp.text)
                     meta = parse_film_page(tree, slug)
                     meta.fan_count = await self._fetch_fan_count_async(client, slug)

@@ -2,13 +2,17 @@ import json
 import logging
 from datetime import datetime
 from pathlib import Path
-from .config import SVD_CACHE_PATH
+from .config import SVD_CACHE_PATH, SVD_IMPLICIT_RESIDUALS
+from .data_version import interactions_digest
 
 import numpy as np
 from scipy.sparse import csr_matrix
 from scipy.sparse.linalg import svds
 
 logger = logging.getLogger(__name__)
+
+# Baseline used only when a model is fitted on implicit signals with no star ratings at all
+DEFAULT_GLOBAL_MEAN = 3.0
 
 class SVDRecommender:
     """
@@ -20,7 +24,7 @@ class SVDRecommender:
     - Σ captures factor importance
     """
     
-    def __init__(self, n_factors: int = 50, use_implicit: bool = True, implicit_weight: float = 0.3):
+    def __init__(self, n_factors: int = 50, use_implicit: bool = True, implicit_weight: float = 1.0):
         self.n_factors = n_factors
         self.use_implicit = use_implicit
         self.implicit_weight = implicit_weight
@@ -36,7 +40,7 @@ class SVDRecommender:
 
     @staticmethod
     def compute_fingerprint(all_user_films: dict[str, list[dict]], hyperparams: dict | None = None) -> dict:
-        """Lightweight fingerprint for cache validation."""
+        """Fingerprint for cache validation: counts plus a digest of every interaction."""
         n_users = len(all_user_films)
         rated_slugs = set()
         n_ratings = 0
@@ -49,109 +53,99 @@ class SVDRecommender:
             "n_users": n_users,
             "n_items": len(rated_slugs),
             "n_ratings": n_ratings,
+            "data_digest": interactions_digest(all_user_films),
         }
         if hyperparams:
             fp["hyperparams"] = hyperparams
         return fp
-    
+
+    @staticmethod
+    def _implicit_residual(f: dict) -> float:
+        """Residual (stars above baseline) for an unrated interaction; strongest signal wins."""
+        for key in ("liked", "watchlisted", "watched"):
+            if f.get(key):
+                return SVD_IMPLICIT_RESIDUALS[key]
+        return 0.0
+
     def fit(self, all_user_films: dict[str, list[dict]]) -> 'SVDRecommender':
         """
         Fit SVD model to user-film rating data.
-        
+
         Uses bias-corrected SVD: R_predicted = global_mean + user_bias + item_bias + U @ V^T
+
+        Biases come from explicit star ratings only. An unrated like/watch/watchlist entry
+        enters the residual matrix as a small positive residual (see SVD_IMPLICIT_RESIDUALS)
+        rather than as a pseudo-rating, so it can never read as a dislike after centering.
         """
         # Reset fitted flag in case of re-use
         self.is_fitted = False
 
-        # Build sparse matrix
         usernames = list(all_user_films.keys())
         self.user_index = {u: i for i, u in enumerate(usernames)}
-        
-        def _has_implicit_signal(f: dict) -> bool:
-            return bool(f.get('liked') or f.get('watched') or f.get('watchlisted'))
+        self.item_index = {}
 
-        all_films = set()
-        for films in all_user_films.values():
-            for f in films:
-                rating = f.get('rating')
-                if rating is not None or (self.use_implicit and _has_implicit_signal(f)):
-                    all_films.add(f['slug'])
-        
-        film_list = list(all_films)
-        self.item_index = {slug: i for i, slug in enumerate(film_list)}
-        
-        n_users = len(usernames)
-        n_items = len(film_list)
-        
-        # Build COO data
         rows, cols, data = [], [], []
         implicit_rows, implicit_cols, implicit_data = [], [], []
         for username, films in all_user_films.items():
             user_idx = self.user_index[username]
             for f in films:
                 rating = f.get('rating')
-                film_idx = self.item_index.get(f['slug'])
-                if film_idx is None:
-                    continue
-
                 if rating is not None:
+                    film_idx = self.item_index.setdefault(f['slug'], len(self.item_index))
                     rows.append(user_idx)
                     cols.append(film_idx)
                     data.append(rating)
-                    continue
+                elif self.use_implicit:
+                    residual = self._implicit_residual(f)
+                    if residual > 0:
+                        film_idx = self.item_index.setdefault(f['slug'], len(self.item_index))
+                        implicit_rows.append(user_idx)
+                        implicit_cols.append(film_idx)
+                        implicit_data.append(residual * self.implicit_weight)
 
-                # Implicit feedback (only when no explicit rating)
-                if not self.use_implicit:
-                    continue
-
-                implicit_score = 0.0
-                if f.get('liked'):
-                    implicit_score = 4.5  # Strong positive
-                elif f.get('watched'):
-                    implicit_score = 3.0  # Mild positive (chose to watch)
-                elif f.get('watchlisted'):
-                    implicit_score = 2.5  # Interest signal
-
-                if implicit_score > 0:
-                    implicit_rows.append(user_idx)
-                    implicit_cols.append(film_idx)
-                    implicit_data.append(implicit_score)
-        
-        all_rows = rows + implicit_rows
-        all_cols = cols + implicit_cols
-        all_data = data + [d * self.implicit_weight for d in implicit_data]
-
-        if not all_data:
+        if not data and not implicit_data:
             logger.warning("No ratings to fit SVD model")
             raise ValueError("Cannot fit SVD model because no ratings were provided.")
-        
-        R = csr_matrix((all_data, (all_rows, all_cols)), shape=(n_users, n_items), dtype=np.float32)
-        
-        # Compute biases
-        self.global_mean = np.mean(all_data)
-        
-        # User biases: mean rating per user - global mean
-        user_sums = np.array(R.sum(axis=1)).flatten()
-        user_counts = np.array(R.getnnz(axis=1), dtype=np.float32)
-        user_counts[user_counts == 0] = 1
-        self.user_biases = (user_sums / user_counts) - self.global_mean
-        
-        # Item biases: mean rating per item - global mean
-        item_sums = np.array(R.sum(axis=0)).flatten()
-        item_counts = np.array(R.getnnz(axis=0), dtype=np.float32)
-        item_counts[item_counts == 0] = 1
-        self.item_biases = (item_sums / item_counts) - self.global_mean
-        
-        # Center the matrix
-        R_centered = R.copy().tocsr()
-        for i in range(n_users):
-            start, end = R_centered.indptr[i], R_centered.indptr[i + 1]
-            for j in range(start, end):
-                col = R_centered.indices[j]
-                R_centered.data[j] -= (self.global_mean + self.user_biases[i] + self.item_biases[col])
-        
+
+        n_users = len(usernames)
+        n_items = len(self.item_index)
+        rows_e = np.asarray(rows, dtype=np.int64)
+        cols_e = np.asarray(cols, dtype=np.int64)
+        vals_e = np.asarray(data, dtype=np.float64)
+
+        # Biases from explicit ratings only (implicit signals are not on the star scale)
+        self.global_mean = float(vals_e.mean()) if vals_e.size else DEFAULT_GLOBAL_MEAN
+
+        user_counts = np.bincount(rows_e, minlength=n_users).astype(np.float64)
+        user_sums = np.bincount(rows_e, weights=vals_e, minlength=n_users)
+        self.user_biases = np.divide(
+            user_sums, user_counts, out=np.full(n_users, self.global_mean), where=user_counts > 0
+        ) - self.global_mean
+
+        item_counts = np.bincount(cols_e, minlength=n_items).astype(np.float64)
+        item_sums = np.bincount(cols_e, weights=vals_e, minlength=n_items)
+        self.item_biases = np.divide(
+            item_sums, item_counts, out=np.full(n_items, self.global_mean), where=item_counts > 0
+        ) - self.global_mean
+
+        # Residual matrix: explicit ratings minus baseline, implicit signals as positive residuals
+        explicit_resid = vals_e - (self.global_mean + self.user_biases[rows_e] + self.item_biases[cols_e])
+        R_centered = csr_matrix(
+            (
+                np.concatenate([explicit_resid, np.asarray(implicit_data, dtype=np.float64)]),
+                (
+                    np.concatenate([rows_e, np.asarray(implicit_rows, dtype=np.int64)]),
+                    np.concatenate([cols_e, np.asarray(implicit_cols, dtype=np.int64)]),
+                ),
+            ),
+            shape=(n_users, n_items),
+            dtype=np.float64,
+        )
+
         # Truncated SVD
         k = min(self.n_factors, min(n_users, n_items) - 1)
+        if k < 1:
+            raise ValueError("Cannot fit SVD model: need at least 2 users and 2 films.")
         U, sigma, Vt = svds(R_centered.astype(np.float64), k=k)
         
         # Store factors (incorporate sigma into both for symmetric treatment)

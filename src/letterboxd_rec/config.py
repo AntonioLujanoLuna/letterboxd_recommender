@@ -276,6 +276,16 @@ FEATURE_WEIGHTS_PATH = Path(os.environ.get("LETTERBOXD_FEATURE_WEIGHTS", "data/f
 # Item-item similarity safeguards (controls compute cost)
 ITEM_SIM_MIN_RATINGS = 2        # skip items with fewer than this many ratings
 ITEM_SIM_MAX_ITEMS = 20_000       # cap number of items to include in pairwise pass
+ITEM_SIM_BLOCK_CELLS = 4_000_000  # dense cells per block in the vectorized similarity pass (memory cap)
+
+# SVD implicit feedback: residuals (in stars) added on top of the user's and the film's
+# baseline for interactions that have no star rating. Positive means "liked it more than
+# expected", so an unrated like or watch never reads as a low rating.
+SVD_IMPLICIT_RESIDUALS = {
+    "liked": 0.75,
+    "watched": 0.1,
+    "watchlisted": 0.25,
+}
 
 # Migrations
 MIGRATIONS_PATH = Path("src/letterboxd_rec/migrations")

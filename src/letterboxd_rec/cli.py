@@ -33,7 +33,7 @@ from .config import (
     NOTIFICATION_INTERVAL,
 )
 from .scraper import LetterboxdScraper, AsyncLetterboxdScraper, validate_slug
-from .recommender import MetadataRecommender, CollaborativeRecommender, Recommendation, _fuse_normalized
+from .recommender import MetadataRecommender, CollaborativeRecommender, Recommendation, _fuse_normalized, hybrid_weights
 from .matrix_factorization import SVDRecommender
 from .profile import build_profile, UserProfile
 from .group_recommender import recommend_for_group
@@ -1373,23 +1373,12 @@ def _run_hybrid_strategy(
     collab_rec = CollaborativeRecommender(all_user_films, all_films)
 
     rated_count = sum(1 for f in user_films if f.get('rating'))
-    meta_weight = args.hybrid_meta_weight
-    collab_weight = args.hybrid_collab_weight
-
-    if meta_weight is None and collab_weight is None:
-        # Heuristic: lean on metadata when user data or neighbors are sparse
-        if len(all_user_films) < 10 or rated_count < 20:
-            meta_weight = 0.7
-            collab_weight = 0.3
-        else:
-            meta_weight = 0.6
-            collab_weight = 0.4
-    else:
-        # If only one is provided, derive the other to preserve user intent
-        if meta_weight is None:
-            meta_weight = max(0.0, 1.0 - collab_weight) if collab_weight is not None else 0.6
-        if collab_weight is None:
-            collab_weight = max(0.0, 1.0 - meta_weight) if meta_weight is not None else 0.4
+    meta_weight, collab_weight = hybrid_weights(
+        len(all_user_films),
+        rated_count,
+        meta_weight=args.hybrid_meta_weight,
+        collab_weight=args.hybrid_collab_weight,
+    )
 
     meta_recs = meta_rec.recommend(
         user_films,
@@ -1521,7 +1510,7 @@ def _run_svd_strategy(
     cache_path = SVD_CACHE_PATH
     n_factors = min(50, n_users - 1)
     use_implicit = True
-    implicit_weight = 0.3
+    implicit_weight = 1.0  # scales SVD_IMPLICIT_RESIDUALS
     fingerprint = SVDRecommender.compute_fingerprint(
         all_user_films,
         hyperparams={
@@ -1898,6 +1887,68 @@ def cmd_recommend(args: argparse.Namespace) -> None:
         recommender=recommender,
         profile=profile,
         user_films=user_films,
+    )
+
+
+def cmd_evaluate(args: argparse.Namespace) -> None:
+    """Score strategies offline by hiding some of each user's liked films."""
+    from .evaluation import EVALUABLE_STRATEGIES, format_results_table, run_evaluation
+
+    strategies = args.strategies or list(EVALUABLE_STRATEGIES)
+    if "popularity" not in strategies:
+        strategies = ["popularity", *strategies]  # always report the baseline
+
+    with get_db(read_only=True) as conn:
+        all_user_films = _load_all_user_films(conn)
+        films = _load_films_with_filters(conn)
+
+    if not all_user_films:
+        logger.error("No user data. Run 'scrape' and 'discover' first.")
+        return
+
+    users = [_validate_username(u) for u in args.users] if args.users else None
+    split, results = run_evaluation(
+        all_user_films,
+        films,
+        strategies=strategies,
+        k=args.k,
+        holdout_frac=args.holdout,
+        min_positives=args.min_positives,
+        max_users=args.max_users,
+        users=users,
+        seed=args.seed,
+        progress=not args.json,
+    )
+
+    if not split.test:
+        logger.error(
+            "No users qualified for evaluation (need %d+ films rated >= 3.5 or liked). "
+            "Lower --min-positives or add users.", args.min_positives,
+        )
+        return
+
+    if args.json:
+        payload = {
+            "k": args.k,
+            "holdout_frac": args.holdout,
+            "seed": args.seed,
+            "n_users": len(split.test),
+            "n_held_out": sum(len(v) for v in split.test.values()),
+            "results": [r.as_dict(include_per_user=args.per_user) for r in results],
+        }
+        print(json.dumps(payload, indent=2))
+        return
+
+    n_held = sum(len(v) for v in split.test.values())
+    logger.info(
+        f"\nEvaluated {len(split.test)} users, {n_held} hidden films "
+        f"({args.holdout:.0%} of each user's positives, seed {args.seed})\n"
+    )
+    logger.info(format_results_table(results))
+    logger.info(
+        "\nrecall/ndcg/hit: higher is better. 'vs pop' is the NDCG change against the "
+        "popularity baseline.\nThe graph strategy is not evaluated: it reads the live "
+        "database, so hidden films would leak in."
     )
 
 
@@ -2556,6 +2607,28 @@ def main():
     # Group recommendation command
     setup_jam_parser(subparsers)
     
+    # Offline evaluation command
+    eval_parser = subparsers.add_parser(
+        "evaluate", help="Measure recommendation quality by hiding some of each user's liked films"
+    )
+    eval_parser.add_argument(
+        "--strategies", nargs="+",
+        choices=["popularity", "svd", "collaborative", "metadata", "hybrid"],
+        help="Strategies to compare (default: all; the popularity baseline is always included)",
+    )
+    eval_parser.add_argument("--k", type=int, default=20, help="Cutoff for recall@k / NDCG@k")
+    eval_parser.add_argument("--holdout", type=float, default=0.2,
+                             help="Fraction of each user's positives to hide (default 0.2)")
+    eval_parser.add_argument("--min-positives", type=int, default=10,
+                             help="Only evaluate users with at least this many positives")
+    eval_parser.add_argument("--max-users", type=int, default=200,
+                             help="Sample at most this many users (metadata scoring is slow)")
+    eval_parser.add_argument("--users", nargs="+", help="Evaluate exactly these users")
+    eval_parser.add_argument("--seed", type=int, default=42, help="Random seed for the hold-out split")
+    eval_parser.add_argument("--json", action="store_true", help="Print results as JSON")
+    eval_parser.add_argument("--per-user", action="store_true", help="Include per-user metrics in JSON output")
+    eval_parser.set_defaults(func=cmd_evaluate)
+
     # Stats command
     stats_parser = subparsers.add_parser("stats", help="Show database statistics")
     stats_parser.set_defaults(func=cmd_stats)

@@ -7,6 +7,7 @@ from pathlib import Path
 from .profile import UserProfile, build_profile
 from .database import load_json
 from .feature_weights import FeatureWeights, load_feature_weights
+from .data_version import interactions_digest
 from .config import (
     WEIGHTS,
     MATCH_THRESHOLD_GENRE,
@@ -58,9 +59,33 @@ from .config import (
     ITEM_SIM_CACHE_PATH,
     ITEM_SIM_MIN_RATINGS,
     ITEM_SIM_MAX_ITEMS,
+    ITEM_SIM_BLOCK_CELLS,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def hybrid_weights(
+    n_users: int,
+    rated_count: int,
+    meta_weight: float | None = None,
+    collab_weight: float | None = None,
+) -> tuple[float, float]:
+    """
+    Resolve (metadata, collaborative) weights for the hybrid strategy.
+
+    With no overrides, lean on metadata when there are few users or the target user
+    has few ratings. With one override, derive the other as its complement.
+    """
+    if meta_weight is None and collab_weight is None:
+        if n_users < 10 or rated_count < 20:
+            return 0.7, 0.3
+        return 0.6, 0.4
+    if meta_weight is None:
+        meta_weight = max(0.0, 1.0 - collab_weight)
+    if collab_weight is None:
+        collab_weight = max(0.0, 1.0 - meta_weight)
+    return meta_weight, collab_weight
 
 
 def _fuse_normalized(
@@ -1561,14 +1586,22 @@ class CollaborativeRecommender:
     Uses sparse matrices for efficient similarity computation on large datasets.
     """
 
-    def __init__(self, all_user_films: dict[str, list[dict]], film_metadata: dict[str, dict] | None = None):
+    def __init__(
+        self,
+        all_user_films: dict[str, list[dict]],
+        film_metadata: dict[str, dict] | None = None,
+        use_cache: bool = True,
+    ):
         """
         Args:
             all_user_films: Dict mapping username -> list of user_films dicts
             film_metadata: Optional dict mapping slug -> film metadata dict for filtering and display
+            use_cache: Read/write the on-disk item-similarity cache. Disable for throwaway
+                models (e.g. offline evaluation on a train split) so the real cache is untouched.
         """
         self.all_user_films = all_user_films
         self.films = film_metadata or {}
+        self.use_cache = use_cache
 
         # Precompute user-item matrix for efficient similarity computation
         self._user_matrix = None
@@ -1687,10 +1720,11 @@ class CollaborativeRecommender:
             "n_users": n_users,
             "n_items": n_items,
             "n_ratings": n_ratings,
+            "data_digest": interactions_digest(self.all_user_films),
         }
 
     def _maybe_load_item_similarity_cache(self):
-        if not ITEM_SIM_CACHE_PATH.exists():
+        if not self.use_cache or not ITEM_SIM_CACHE_PATH.exists():
             return
         try:
             payload = json.loads(ITEM_SIM_CACHE_PATH.read_text())
@@ -1708,6 +1742,8 @@ class CollaborativeRecommender:
             logger.warning(f"Failed to load item similarity cache: {e}")
 
     def _save_item_similarity_cache(self):
+        if not self.use_cache:
+            return
         try:
             ITEM_SIM_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
             payload = {
@@ -1728,91 +1764,87 @@ class CollaborativeRecommender:
         Compute item similarity using rating patterns, not just co-occurrence.
 
         Films are similar if users who rate one highly also rate the other highly.
+        Adjusted cosine: ratings are centered by each user's mean rating, and both norms
+        are taken over co-rating users only. Pairs need at least 2 co-raters and a
+        similarity above 0.3.
+
+        Vectorized as sparse matrix products over column blocks, so memory stays bounded
+        (ITEM_SIM_BLOCK_CELLS). Benchmark: 2k users x 20k films in about a minute, where
+        the previous pairwise Python loop took hours.
         """
         import numpy as np
-        from collections import defaultdict
 
-        if not self.all_user_films:
+        X = self._user_matrix
+        if not self.all_user_films or X is None or X.nnz == 0:
             return
 
         logger.info("Computing item-item similarity cache...")
-
-        # Build item -> [(user, rating)] mapping
-        item_ratings: dict[str, list[tuple[int, float]]] = defaultdict(list)
-
-        for username, films in self.all_user_films.items():
-            user_idx = self._user_index[username]
-            for f in films:
-                rating = f.get('rating')
-                if rating:
-                    item_ratings[f['slug']].append((user_idx, rating))
+        X = X.tocsr().astype(np.float64)
 
         # Filter to reduce compute: drop very sparse items and cap total
-        item_ratings = {
-            slug: ratings for slug, ratings in item_ratings.items()
-            if len(ratings) >= ITEM_SIM_MIN_RATINGS
-        }
-        if not item_ratings:
+        counts = X.getnnz(axis=0)
+        eligible = np.flatnonzero(counts >= ITEM_SIM_MIN_RATINGS)
+        if eligible.size == 0:
             logger.info("Item similarity: no items meet minimum rating count")
             return
-
-        if len(item_ratings) > ITEM_SIM_MAX_ITEMS:
-            sorted_items = sorted(item_ratings.items(), key=lambda x: -len(x[1]))
-            dropped = len(sorted_items) - ITEM_SIM_MAX_ITEMS
-            item_ratings = dict(sorted_items[:ITEM_SIM_MAX_ITEMS])
+        if eligible.size > ITEM_SIM_MAX_ITEMS:
+            order = np.argsort(-counts[eligible], kind="stable")
+            dropped = eligible.size - ITEM_SIM_MAX_ITEMS
             logger.info(
-                f"Item similarity: trimming items from {len(sorted_items)} to "
+                f"Item similarity: trimming items from {eligible.size} to "
                 f"{ITEM_SIM_MAX_ITEMS} (dropped {dropped}) to cap computation"
             )
+            eligible = np.sort(eligible[order[:ITEM_SIM_MAX_ITEMS]])
 
-        # Compute adjusted cosine similarity between items (ratings centered by user mean)
-        user_means = {}
-        for username, films in self.all_user_films.items():
-            ratings = [f['rating'] for f in films if f.get('rating')]
-            if ratings:
-                user_means[self._user_index[username]] = sum(ratings) / len(ratings)
+        # User means over all of the user's ratings (not just eligible items)
+        row_nnz = X.getnnz(axis=1)
+        row_sums = np.asarray(X.sum(axis=1)).ravel()
+        user_means = np.divide(row_sums, row_nnz, out=np.zeros_like(row_sums), where=row_nnz > 0)
 
-        film_slugs = list(item_ratings.keys())
-        sim_map: dict[str, list[tuple[str, float]]] = defaultdict(list)
+        Xe = X[:, eligible].tocsr()
+        Xe.sort_indices()
+        # B (co-rating pattern) and C (centered ratings) share Xe's sparsity structure,
+        # so a rating equal to the user's mean still counts as a co-rating.
+        B = Xe.copy()
+        B.data = np.ones_like(B.data)
+        C = Xe.copy()
+        C.data = Xe.data - np.repeat(user_means, np.diff(Xe.indptr))
+        C2 = C.multiply(C).tocsr()
 
-        for i, slug_a in enumerate(film_slugs):
-            ratings_a = item_ratings[slug_a]
-            users_a = {u for u, _ in ratings_a}
+        Bt, Ct, C2t = B.T.tocsr(), C.T.tocsr(), C2.T.tocsr()
+        B_csc, C_csc, C2_csc = B.tocsc(), C.tocsc(), C2.tocsc()
 
-            for slug_b in film_slugs[i + 1:]:
-                ratings_b = item_ratings[slug_b]
-                users_b = {u for u, _ in ratings_b}
+        m = eligible.size
+        slugs_by_col = {idx: slug for slug, idx in self._film_index.items()}
+        eligible_slugs = [slugs_by_col[int(c)] for c in eligible]
+        top_k = self._item_sim_top_k
+        block = max(1, ITEM_SIM_BLOCK_CELLS // max(m, 1))
 
-                common_users = users_a & users_b
-                # Allow similarity computation for small communities; need at least 2 overlaps
-                if len(common_users) < 2:
+        for j0 in range(0, m, block):
+            j1 = min(j0 + block, m)
+            dot = (Ct @ C_csc[:, j0:j1]).toarray()
+            co = (Bt @ B_csc[:, j0:j1]).toarray()
+            norm_a = (C2t @ B_csc[:, j0:j1]).toarray()   # sum of x_a^2 over co-raters
+            norm_b = (Bt @ C2_csc[:, j0:j1]).toarray()   # sum of x_b^2 over co-raters
+
+            denom = np.sqrt(norm_a * norm_b)
+            sim = np.divide(dot, denom, out=np.zeros_like(dot), where=denom > 0)
+            valid = (co >= 2) & (norm_a > 0) & (norm_b > 0) & (sim > 0.3)
+            cols = np.arange(j1 - j0)
+            valid[j0 + cols, cols] = False  # no self-similarity
+
+            for c in range(j1 - j0):
+                nbrs = np.flatnonzero(valid[:, c])
+                if nbrs.size == 0:
                     continue
-
-                ratings_a_dict = dict(ratings_a)
-                ratings_b_dict = dict(ratings_b)
-
-                dot_product = 0.0
-                norm_a = 0.0
-                norm_b = 0.0
-
-                for user in common_users:
-                    mean = user_means.get(user, 3.0)
-                    adj_a = ratings_a_dict[user] - mean
-                    adj_b = ratings_b_dict[user] - mean
-
-                    dot_product += adj_a * adj_b
-                    norm_a += adj_a ** 2
-                    norm_b += adj_b ** 2
-
-                if norm_a > 0 and norm_b > 0:
-                    sim = dot_product / (np.sqrt(norm_a) * np.sqrt(norm_b))
-                    if sim > 0.3:
-                        sim_map[slug_a].append((slug_b, sim))
-                        sim_map[slug_b].append((slug_a, sim))
-
-        for slug, sims in sim_map.items():
-            sims.sort(key=lambda x: -x[1])
-            self._item_similarities[slug] = sims[: self._item_sim_top_k]
+                scores = sim[nbrs, c]
+                if nbrs.size > top_k:
+                    keep = np.argpartition(-scores, top_k - 1)[:top_k]
+                    nbrs, scores = nbrs[keep], scores[keep]
+                order = np.argsort(-scores, kind="stable")
+                self._item_similarities[eligible_slugs[j0 + c]] = [
+                    (eligible_slugs[int(nbrs[i])], float(scores[i])) for i in order
+                ]
 
         self._save_item_similarity_cache()
 
@@ -2001,7 +2033,9 @@ class CollaborativeRecommender:
 
         # Similarity = normalized_matrix @ target_row.T (single sparse matrix-vector multiply)
         target_row = self._normalized_matrix[target_idx]
-        similarities = np.asarray(self._normalized_matrix @ target_row.T).ravel()
+        # sparse @ sparse returns a sparse matrix; np.asarray() would wrap it in a 0-d object
+        # array rather than densify it, so convert explicitly.
+        similarities = (self._normalized_matrix @ target_row.T).toarray().ravel()
 
         # Overlap counts for confidence weighting
         target_binary = self._overlap_matrix[target_idx]

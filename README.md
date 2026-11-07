@@ -236,6 +236,23 @@ Run this:
 - Periodically as your database grows
 - After adding many new users
 
+### `evaluate` — Measure recommendation quality
+
+```bash
+python main.py evaluate [--strategies popularity svd collaborative metadata hybrid]
+                        [--k 20] [--holdout 0.2] [--min-positives 10] [--max-users 200]
+                        [--users NAME ...] [--seed 42] [--json [--per-user]]
+```
+
+Hides a random 20% of each sampled user's positive films (rated ≥3.5★ or liked), fits each
+strategy on what's left, and reports how many hidden films land in the top k:
+recall@k, NDCG@k, hit-rate@k and catalog coverage. A **popularity** baseline (most-liked films
+the user hasn't seen) is always included; a strategy that doesn't beat it isn't earning its
+complexity. Run it before and after changing weights in `config.py` and keep only changes that
+improve NDCG. Use the same `--seed` when comparing runs.
+
+The `graph` strategy isn't evaluated yet: it reads the live database, so hidden films would leak in.
+
 ### `stats` — Database statistics
 
 ```bash
