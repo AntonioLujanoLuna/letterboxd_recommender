@@ -1179,6 +1179,11 @@ class AsyncLetterboxdScraper:
         if self._aimd:
             self._aimd.on_throttle()
 
+    def _note_soft_block(self) -> None:
+        """A blocked attempt that a retry recovered: a soft signal (cuts the rate only in clusters)."""
+        if self._aimd:
+            self._aimd.on_soft_block()
+
     @staticmethod
     def _detect_soft_block(tree: HTMLParser | None) -> bool:
         """Detect CAPTCHA/please-wait soft blocks to avoid burning retries."""

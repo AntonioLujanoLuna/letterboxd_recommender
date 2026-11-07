@@ -557,3 +557,27 @@ def test_activity_filter_is_concurrent_ordered_and_skips_failures():
     assert live["max"] > 1
     assert elapsed < len(names) * 0.03 * 0.6  # clearly faster than serial
     assert cli._filter_active_users(Scraper(), [], 50) == []
+
+
+def test_aimd_soft_blocks_only_cut_when_they_cluster():
+    t = _Tick()
+    r = AimdRate(start=8, ceiling=12, floor=1, soft_threshold=5, soft_window=30, debounce=0, clock=t)
+    for i in range(4):
+        t.now = i * 5
+        r.on_soft_block()
+    assert r.rps == 8                      # 4 within the window: still noise
+    t.now = 20; r.on_soft_block()
+    assert r.rps == 4                      # the 5th within 30s cuts, once
+    t.now = 100
+    for _ in range(4):
+        r.on_soft_block()
+    assert r.rps == 4                      # counter was reset; spread-out noise never accumulates
+    t.now = 200; r.on_soft_block()
+    assert r.rps == 4                      # old ones aged out of the window
+
+
+def test_hard_throttle_still_cuts_immediately():
+    t = _Tick()
+    r = AimdRate(start=8, ceiling=12, floor=1, debounce=0, clock=t)
+    r.on_throttle()
+    assert r.rps == 4

@@ -401,9 +401,15 @@ def test_async_pyscraper_wires_transport_blocks_to_its_rate_controller(fake_fetc
         async with s:
             fake_fetch["/film/x/"] = [FakeCurlResponse(403, "Access denied"), FakeCurlResponse(200, "<html></html>")]
             await s.client.get("https://letterboxd.com/film/x/")
-        return s._aimd.rps
+            one_block = s._aimd.rps
+            for i in range(4):  # a cluster of retried blocks
+                fake_fetch[f"/film/y{i}/"] = [FakeCurlResponse(403, "Access denied"), FakeCurlResponse(200, "<html></html>")]
+                await s.client.get(f"https://letterboxd.com/film/y{i}/")
+        return one_block, s._aimd.rps
 
-    assert asyncio.run(run()) == 3.0  # 6 req/s halved by the retried block
+    one_block, after_cluster = asyncio.run(run())
+    assert one_block == 6.0       # a single recovered block is noise
+    assert after_cluster == 3.0   # five within the window halve the rate
 
 
 def test_aimd_throttles_from_many_threads_count_once():

@@ -266,7 +266,7 @@ class AsyncLetterboxdPyScraper(AsyncLetterboxdScraper):
     """AsyncLetterboxdScraper whose HTTP goes through letterboxdpy's fetcher (in worker threads)."""
 
     async def __aenter__(self):
-        self.client = AsyncCurlClient(CurlClient(on_block=self._note_throttle))
+        self.client = AsyncCurlClient(CurlClient(on_block=self._note_soft_block))
         return self
 
     async def scrape_films_batch(self, slugs):
