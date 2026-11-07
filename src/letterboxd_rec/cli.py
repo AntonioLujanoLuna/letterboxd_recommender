@@ -21,6 +21,7 @@ from .config import (
     DISCOVERY_PRIORITY_MAP,
     SVD_CACHE_PATH,
     SVD_ITEM_BIAS_REG,
+    DB_PATH,
     RUN_VACUUM_ANALYZE_DEFAULT,
     EXPORT_CHUNK_SIZE,
     IMPORT_CHUNK_SIZE,
@@ -1986,12 +1987,30 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
     if "popularity" not in strategies:
         strategies = ["popularity", *strategies]  # always report the baseline
 
+    no_data_msg = (
+        f"No scraped data in {DB_PATH.resolve()}. Run 'python main.py scrape YOUR_USERNAME' "
+        "and then 'python main.py discover' to add other users before evaluating "
+        "(set LETTERBOXD_DB if your database lives elsewhere)."
+    )
+    if not DB_PATH.exists():  # don't let sqlite create an empty file
+        logger.error(no_data_msg)
+        return
+
     with get_db(read_only=True) as conn:
-        all_user_films = _load_all_user_films(conn)
-        films = _load_films_with_filters(conn)
+        has_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='user_films'"
+        ).fetchone()
+        all_user_films = _load_all_user_films(conn) if has_table else {}
+        films = _load_films_with_filters(conn) if has_table else {}
 
     if not all_user_films:
-        logger.error("No user data. Run 'scrape' and 'discover' first.")
+        logger.error(no_data_msg)
+        return
+    if len(all_user_films) < 2:
+        logger.error(
+            "Only one user in the database. Evaluation needs other users "
+            "(run 'python main.py discover') so the collaborative strategies have data."
+        )
         return
 
     users = [_validate_username(u) for u in args.users] if args.users else None
