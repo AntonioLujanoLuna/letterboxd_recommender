@@ -752,8 +752,11 @@ class LetterboxdScraper:
         
         logger.info(f"Scraping {username}'s following...")
         while len(usernames) < limit:
-            tree = self._get_with_soft_block_recovery(f"{self.BASE}/{username}/following/page/{page}/")
+            url = f"{self.BASE}/{username}/following/page/{page}/"
+            tree = self._get_listing_page(url)
             if not tree:
+                if url in self._failed:  # a failed page is not the end of the list
+                    raise ScrapeIncompleteError(username, url)
                 break
             
             links = tree.css("a.name")
@@ -781,8 +784,11 @@ class LetterboxdScraper:
         
         logger.info(f"Scraping {username}'s followers...")
         while len(usernames) < limit:
-            tree = self._get_with_soft_block_recovery(f"{self.BASE}/{username}/followers/page/{page}/")
+            url = f"{self.BASE}/{username}/followers/page/{page}/"
+            tree = self._get_listing_page(url)
             if not tree:
+                if url in self._failed:  # a failed page is not the end of the list
+                    raise ScrapeIncompleteError(username, url)
                 break
             
             links = tree.css("a.name")
@@ -1507,8 +1513,11 @@ class AsyncLetterboxdScraper:
 
         logger.info(f"Scraping {username}'s following (async)...")
         while len(usernames) < limit:
-            tree = await self._get_with_soft_block_recovery(f"{self.BASE}/{username}/following/page/{page}/")
+            url = f"{self.BASE}/{username}/following/page/{page}/"
+            tree = await self._get_listing_page(url)
             if not tree:
+                if url in self._failed:  # a failed page is not the end of the list
+                    raise ScrapeIncompleteError(username, url)
                 break
 
             links = tree.css("a.name")
@@ -1536,8 +1545,11 @@ class AsyncLetterboxdScraper:
 
         logger.info(f"Scraping {username}'s followers (async)...")
         while len(usernames) < limit:
-            tree = await self._get_with_soft_block_recovery(f"{self.BASE}/{username}/followers/page/{page}/")
+            url = f"{self.BASE}/{username}/followers/page/{page}/"
+            tree = await self._get_listing_page(url)
             if not tree:
+                if url in self._failed:  # a failed page is not the end of the list
+                    raise ScrapeIncompleteError(username, url)
                 break
 
             links = tree.css("a.name")

@@ -581,3 +581,39 @@ def test_hard_throttle_still_cuts_immediately():
     r = AimdRate(start=8, ceiling=12, floor=1, debounce=0, clock=t)
     r.on_throttle()
     assert r.rps == 4
+
+
+# --- Social graph pages must not be silently truncated ---------------------
+
+@pytest.mark.parametrize("kind", ["following", "followers"])
+def test_async_social_scrape_raises_when_a_page_keeps_failing(monkeypatch, kind):
+    import asyncio
+    from letterboxd_rec.scraper import ScrapeIncompleteError
+
+    s = AsyncLetterboxdScraper(delay=0)
+
+    async def failing(url):
+        s._failed.add(url)  # blocked: still failing after retries
+        return None
+
+    async def no_sleep(_):
+        return None
+
+    monkeypatch.setattr(s, "_get_with_soft_block_recovery", failing)
+    monkeypatch.setattr(asyncio, "sleep", no_sleep)
+    fn = getattr(s, f"scrape_{kind}_async")
+    with pytest.raises(ScrapeIncompleteError):
+        asyncio.run(fn("someone"))
+
+
+@pytest.mark.parametrize("kind", ["following", "followers"])
+def test_async_social_scrape_treats_404_as_empty(monkeypatch, kind):
+    import asyncio
+
+    s = AsyncLetterboxdScraper(delay=0)
+
+    async def missing(url):
+        return None  # 404 / private: not recorded as failed
+
+    monkeypatch.setattr(s, "_get_with_soft_block_recovery", missing)
+    assert asyncio.run(getattr(s, f"scrape_{kind}_async")("someone")) == []
