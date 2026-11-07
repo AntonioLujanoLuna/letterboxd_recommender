@@ -34,7 +34,7 @@ from .config import (
     NOTIFICATION_WEBHOOK_URL,
     NOTIFICATION_INTERVAL,
 )
-from .scraper import LetterboxdScraper, AsyncLetterboxdScraper, validate_slug
+from .scraper import LetterboxdScraper, AsyncLetterboxdScraper, ScrapeIncompleteError, validate_slug
 from .recommender import MetadataRecommender, CollaborativeRecommender, Recommendation, _fuse_normalized, hybrid_weights
 from .matrix_factorization import SVDRecommender
 from .profile import build_profile, UserProfile
@@ -433,7 +433,11 @@ def cmd_scrape(args: argparse.Namespace) -> None:
                 }
                 logger.info(f"Incremental mode: found {len(existing_slugs)} existing films for {username}")
 
-        interactions = scraper.scrape_user(username, existing_slugs=existing_slugs, stop_on_existing=incremental)
+        try:
+            interactions = scraper.scrape_user(username, existing_slugs=existing_slugs, stop_on_existing=incremental)
+        except ScrapeIncompleteError as e:
+            logger.error(str(e))
+            return
 
         # Batch insert user films (get_db() context manager handles transaction)
         with get_db() as conn:

@@ -26,6 +26,22 @@ from .config import (
 logger = logging.getLogger(__name__)
 
 
+class ScrapeIncompleteError(RuntimeError):
+    """A user's watched-films listing could not be fetched (blocked, 403, network error).
+
+    Raised instead of returning a partial result: saving only a watchlist would look like a
+    user who has watched nothing, which silently corrupts recommendations and evaluation.
+    """
+
+    def __init__(self, username: str, url: str):
+        self.username = username
+        self.url = url
+        super().__init__(
+            f"Could not fetch {username}'s watched films ({url}). Letterboxd may be blocking "
+            "automated requests; nothing was saved for this user."
+        )
+
+
 def _parse_cookie_header(cookie_header: str | None) -> dict[str, str]:
     """
     Convert a raw Cookie header string into a dict for httpx.
@@ -470,6 +486,8 @@ class LetterboxdScraper:
         while True:
             tree = self._get_with_soft_block_recovery(f"{self.BASE}/{username}/films/page/{page}/")
             if not tree:
+                if page == 1:
+                    raise ScrapeIncompleteError(username, f"{self.BASE}/{username}/films/")
                 break
 
             items = tree.css("li.griditem")
@@ -584,6 +602,8 @@ class LetterboxdScraper:
         while True:
             tree = self._get_with_soft_block_recovery(f"{self.BASE}/{username}/films/page/{page}/")
             if not tree:
+                if page == 1:
+                    raise ScrapeIncompleteError(username, f"{self.BASE}/{username}/films/")
                 break
 
             items = tree.css("li.griditem")
@@ -1179,6 +1199,8 @@ class AsyncLetterboxdScraper:
         while True:
             tree = await self._get_with_soft_block_recovery(f"{self.BASE}/{username}/films/page/{page}/")
             if not tree:
+                if page == 1:
+                    raise ScrapeIncompleteError(username, f"{self.BASE}/{username}/films/")
                 break
 
             items = tree.css("li.griditem")
@@ -1287,6 +1309,8 @@ class AsyncLetterboxdScraper:
         while True:
             tree = await self._get_with_soft_block_recovery(f"{self.BASE}/{username}/films/page/{page}/")
             if not tree:
+                if page == 1:
+                    raise ScrapeIncompleteError(username, f"{self.BASE}/{username}/films/")
                 break
 
             items = tree.css("li.griditem")

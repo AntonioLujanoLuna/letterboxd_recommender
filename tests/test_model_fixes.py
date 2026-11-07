@@ -224,3 +224,33 @@ def test_svd_item_bias_shrinkage_demotes_single_rating_films():
     assert undamped.item_biases[idx["obscure"]] > undamped.item_biases[idx["classic"]]
     assert damped.item_biases[idx["classic"]] > damped.item_biases[idx["obscure"]]
     assert damped.recommend("target", {"filler"}, n=1)[0][0] == "classic"
+
+
+# --- Blocked profile pages -------------------------------------------------
+
+def test_scrape_user_raises_when_films_listing_is_blocked(monkeypatch):
+    from letterboxd_rec.scraper import LetterboxdScraper, ScrapeIncompleteError
+
+    scraper = LetterboxdScraper(delay=0)
+    monkeypatch.setattr(scraper, "_get_with_soft_block_recovery", lambda url: None)  # e.g. 403
+    with pytest.raises(ScrapeIncompleteError):
+        scraper.scrape_user("someone")
+    with pytest.raises(ScrapeIncompleteError):
+        scraper.scrape_user_smart("someone")
+    scraper.close()
+
+
+def test_async_scrape_user_raises_when_films_listing_is_blocked(monkeypatch):
+    import asyncio
+    from letterboxd_rec.scraper import AsyncLetterboxdScraper, ScrapeIncompleteError
+
+    scraper = AsyncLetterboxdScraper(delay=0)
+
+    async def blocked(url):
+        return None
+
+    monkeypatch.setattr(scraper, "_get_with_soft_block_recovery", blocked)
+    with pytest.raises(ScrapeIncompleteError):
+        asyncio.run(scraper.scrape_user("someone"))
+    with pytest.raises(ScrapeIncompleteError):
+        asyncio.run(scraper.scrape_user_smart("someone"))
