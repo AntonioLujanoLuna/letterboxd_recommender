@@ -444,6 +444,8 @@ def _migrate_films_table(conn):
         'fan_count': 'INTEGER',
         'is_short': 'INTEGER',
         'is_animation': 'INTEGER',
+        'tmdb_id': 'INTEGER',
+        'imdb_id': 'TEXT',
     }
 
     for col_name, col_type in new_columns.items():
@@ -453,6 +455,25 @@ def _migrate_films_table(conn):
                 logger.info(f"Added column '{col_name}' to films table")
             except sqlite3.Error as e:
                 logger.warning(f"Could not add column '{col_name}': {e}")
+
+
+def _migrate_film_external_ids(conn):
+    """Add tmdb_id / imdb_id to films (used to join with MovieLens) and index them."""
+    _migrate_films_table(conn)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_films_tmdb ON films(tmdb_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_films_imdb ON films(imdb_id)")
+
+
+def _migrate_pending_user_claims(conn):
+    """Add claim tracking to the pending queue so a crashed scrape doesn't lose its users."""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(pending_users)").fetchall()}
+    for col, ddl in (("claimed_at", "TEXT"), ("attempts", "INTEGER DEFAULT 0")):
+        if col not in existing:
+            try:
+                conn.execute(f"ALTER TABLE pending_users ADD COLUMN {col} {ddl}")
+                logger.info(f"Added column '{col}' to pending_users table")
+            except sqlite3.Error as e:
+                logger.warning(f"Could not add column '{col}': {e}")
 
 
 def _migrate_user_profiles_table(conn):
@@ -507,6 +528,9 @@ def run_versioned_migrations() -> int:
         ("0001_add_film_columns", _migrate_films_table),
         ("0002_add_user_profile_schema_version", _migrate_user_profiles_table),
         ("0003_ensure_user_relationships_table", _ensure_user_relationships_table),
+        # Re-runs the idempotent column check so existing DBs gain tmdb_id / imdb_id
+        ("0004_add_film_external_ids", _migrate_film_external_ids),
+        ("0005_pending_user_claims", _migrate_pending_user_claims),
     ]
 
     for version, fn in python_migrations:
@@ -915,9 +939,10 @@ def get_pending_users(limit: int = 50) -> list[dict]:
         cursor = conn.execute("""
             SELECT username, discovered_from_type, discovered_from_id, discovered_at, priority
             FROM pending_users
+            WHERE claimed_at IS NULL AND COALESCE(attempts, 0) < ?
             ORDER BY priority DESC, discovered_at ASC
             LIMIT ?
-        """, (limit,))
+        """, (MAX_QUEUE_ATTEMPTS, limit))
         return [dict(row) for row in cursor.fetchall()]
 
 
@@ -925,6 +950,66 @@ def remove_pending_user(username: str) -> None:
     """Remove a user from pending_users queue after successful scrape."""
     with get_db() as conn:
         conn.execute("DELETE FROM pending_users WHERE username = ?", (username,))
+
+
+# A queued user that fails this many times is parked (kept in the table, never claimed again)
+# instead of being retried forever or silently dropped.
+MAX_QUEUE_ATTEMPTS = 3
+
+
+def claim_pending_user(exclude: "set[str] | frozenset[str] | None" = None) -> dict | None:
+    """Atomically claim the next unclaimed user (highest priority first).
+
+    `exclude` skips usernames (e.g. ones that already failed in this run, so a failing profile
+    isn't retried back-to-back).
+
+    The row stays in pending_users, marked with claimed_at, until the caller removes it on
+    success or releases it on failure. If the process dies in between, the claim goes stale
+    and release_stale_claims() puts the user back, so nobody is lost.
+    """
+    excluded = sorted(exclude or ())
+    skip_sql = f" AND username NOT IN ({','.join('?' * len(excluded))})" if excluded else ""
+    for _ in range(5):  # lost races retry; each retry picks the next candidate
+        with get_db() as conn:
+            row = conn.execute(f"""
+                SELECT username, discovered_from_type, discovered_from_id, discovered_at, priority
+                FROM pending_users
+                WHERE claimed_at IS NULL AND COALESCE(attempts, 0) < ?{skip_sql}
+                ORDER BY priority DESC, discovered_at ASC
+                LIMIT 1
+            """, (MAX_QUEUE_ATTEMPTS, *excluded)).fetchone()
+            if row is None:
+                return None
+            claimed = conn.execute(
+                "UPDATE pending_users SET claimed_at = ? WHERE username = ? AND claimed_at IS NULL",
+                (datetime.now().isoformat(), row['username']),
+            ).rowcount
+        if claimed:
+            return dict(row)
+    return None
+
+
+def release_pending_user(username: str, count_attempt: bool = True) -> None:
+    """Give a claimed user back to the queue (e.g. after a failed scrape).
+
+    count_attempt=False is for interrupted work (shutdown), which isn't the user's fault.
+    """
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE pending_users SET claimed_at = NULL, attempts = COALESCE(attempts, 0) + ? "
+            "WHERE username = ?",
+            (1 if count_attempt else 0, username),
+        )
+
+
+def release_stale_claims(max_age_seconds: float) -> int:
+    """Release claims older than max_age_seconds (0 releases all). Returns how many."""
+    cutoff = datetime.fromtimestamp(time.time() - max_age_seconds).isoformat()
+    with get_db() as conn:
+        return conn.execute(
+            "UPDATE pending_users SET claimed_at = NULL WHERE claimed_at IS NOT NULL AND claimed_at <= ?",
+            (cutoff,),
+        ).rowcount
 
 
 def get_pending_queue_stats() -> dict:
@@ -936,23 +1021,30 @@ def get_pending_queue_stats() -> dict:
                 COUNT(DISTINCT discovered_from_type) as source_types,
                 AVG(priority) as avg_priority
             FROM pending_users
-        """)
+            WHERE COALESCE(attempts, 0) < ?
+        """, (MAX_QUEUE_ATTEMPTS,))
         row = cursor.fetchone()
+        parked = conn.execute(
+            "SELECT COUNT(*) FROM pending_users WHERE COALESCE(attempts, 0) >= ?",
+            (MAX_QUEUE_ATTEMPTS,),
+        ).fetchone()[0]
 
         # Get breakdown by source type
         breakdown_cursor = conn.execute("""
             SELECT discovered_from_type, COUNT(*) as count
             FROM pending_users
+            WHERE COALESCE(attempts, 0) < ?
             GROUP BY discovered_from_type
             ORDER BY count DESC
-        """)
+        """, (MAX_QUEUE_ATTEMPTS,))
         breakdown = {r['discovered_from_type']: r['count'] for r in breakdown_cursor.fetchall()}
 
         return {
             'total': row['total'],
             'source_types': row['source_types'],
             'avg_priority': row['avg_priority'],
-            'breakdown': breakdown
+            'breakdown': breakdown,
+            'parked': parked,
         }
 
 

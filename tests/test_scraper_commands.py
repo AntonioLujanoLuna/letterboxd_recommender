@@ -54,7 +54,7 @@ async def test_cmd_scrape_skips_refresh(monkeypatch, tmp_path):
 
     # Avoid real LetterboxdScraper network calls
     dummy = DummyScraper()
-    monkeypatch.setattr(cli, "LetterboxdScraper", lambda delay=1.0: dummy)
+    monkeypatch.setattr(cli, "make_scraper", lambda delay=1.0: dummy)
 
     # Seed last_scrape to be recent so refresh skip is triggered
     from letterboxd_rec import database
@@ -89,7 +89,7 @@ def test_cmd_discover_dry_run(monkeypatch, tmp_path, caplog):
         return ["u1", "u2"]
 
     # Patch constructor to return dummy instance
-    monkeypatch.setattr(cli, "LetterboxdScraper", lambda delay=1.0: dummy)
+    monkeypatch.setattr(cli, "make_scraper", lambda delay=1.0: dummy)
     monkeypatch.setattr(cli, "get_discovery_source", lambda *args, **kwargs: None)
     monkeypatch.setattr(cli, "add_pending_users", lambda users, *args, **kwargs: len(users))
     monkeypatch.setattr(cli, "get_pending_users", lambda limit=50: [{"username": "u1"}, {"username": "u2"}])
@@ -123,7 +123,7 @@ def test_cmd_discover_queue_only_followers(monkeypatch, tmp_path):
     dummy.scrape_followers = lambda username, limit=100: ["u1", "u2", "u3"]
     dummy.check_user_activity = lambda username: {"film_count": 200, "has_ratings": True}
 
-    monkeypatch.setattr(cli, "LetterboxdScraper", lambda delay=1.0: dummy)
+    monkeypatch.setattr(cli, "make_scraper", lambda delay=1.0: dummy)
     monkeypatch.setattr(cli, "get_discovery_source", lambda *args, **kwargs: None)
     monkeypatch.setattr(cli, "update_discovery_source", lambda *args, **kwargs: None)
     queue_stats = {"total": 0, "avg_priority": None, "breakdown": {}}
@@ -178,7 +178,7 @@ def test_cmd_scrape_incremental_passes_existing(monkeypatch, tmp_path):
         return []
 
     dummy.scrape_user = fake_scrape_user
-    monkeypatch.setattr(cli, "LetterboxdScraper", lambda delay=1.0: dummy)
+    monkeypatch.setattr(cli, "make_scraper", lambda delay=1.0: dummy)
 
     args = SimpleNamespace(
         username="alice",

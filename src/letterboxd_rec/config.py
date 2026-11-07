@@ -73,7 +73,33 @@ DEFAULT_SCRAPER_DELAY = _get_float_env("LETTERBOXD_SCRAPER_DELAY", 1.0, min_val=
 DEFAULT_ASYNC_DELAY = _get_float_env("LETTERBOXD_ASYNC_DELAY", 0.2, min_val=0.0)
 DEFAULT_MAX_CONCURRENT = _get_int_env("LETTERBOXD_MAX_CONCURRENT", 5, min_val=1)
 DEFAULT_MAX_CONCURRENT_USERS = _get_int_env("LETTERBOXD_MAX_CONCURRENT_USERS", 2, min_val=1)
-LETTERBOXD_COOKIE = os.environ.get("LETTERBOXD_COOKIE")  # Optional authenticated scraping
+def _read_cookie_from_dotenv(path: Path = Path(".env")) -> str | None:
+    """Fallback reader for LETTERBOXD_COOKIE.
+
+    A full browser Cookie header is ~4KB and often contains quotes/backslashes that make
+    python-dotenv reject the line ("could not parse statement"), silently leaving the cookie unset.
+    """
+    try:
+        for line in path.read_text(encoding="utf-8-sig").splitlines():
+            key, sep, value = line.partition("=")
+            if sep and key.strip().removeprefix("export ").strip() == "LETTERBOXD_COOKIE":
+                value = value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                    value = value[1:-1]
+                return value or None
+    except OSError:
+        pass
+    return None
+
+
+LETTERBOXD_COOKIE = os.environ.get("LETTERBOXD_COOKIE") or _read_cookie_from_dotenv()  # Optional authenticated scraping
+# Block circuit breaker (letterboxdpy backend): after this many consecutive 403 "blocked" responses,
+# pause every worker, starting at COOLDOWN seconds and doubling per repeat up to MAX_COOLDOWN.
+BLOCK_BREAKER_THRESHOLD = _get_int_env("LETTERBOXD_BLOCK_THRESHOLD", 5, min_val=1)
+BLOCK_BREAKER_COOLDOWN = _get_float_env("LETTERBOXD_BLOCK_COOLDOWN", 300.0, min_val=1)
+BLOCK_BREAKER_MAX_COOLDOWN = _get_float_env("LETTERBOXD_BLOCK_MAX_COOLDOWN", 1800.0, min_val=1)
+# Cap on request starts per second for the async scrapers (steady pacing, independent of latency).
+DEFAULT_MAX_RPS = _get_float_env("LETTERBOXD_MAX_RPS", 6.0, min_val=0.1)
 SCRAPER_ADAPTIVE_DELAY_MIN = 0.1
 SCRAPER_ADAPTIVE_DELAY_MAX = 5.0
 SCRAPER_429_BACKOFF = 1.5

@@ -226,6 +226,29 @@ def _build_content(train: dict[str, list[dict]], films: dict[str, dict]) -> Reco
     return recommend
 
 
+def _build_movielens(train: dict[str, list[dict]], films: dict[str, dict]) -> RecommendFn:
+    """Pre-trained MovieLens EASE: nothing is fitted on the split, so nothing can leak."""
+    from .movielens import FilmMatcher, MovieLensModel
+
+    model = MovieLensModel.load()
+    matcher = FilmMatcher(model)
+    col_to_slug = matcher.letterboxd_slugs(films)
+
+    def recommend(username: str, user_films: list[dict], k: int) -> list[str]:
+        weighted, seen, _ = matcher.map_history(user_films, films)
+        train_slugs = {f["slug"] for f in user_films}
+        out = []
+        for col, _ in model.recommend_columns(weighted, seen, n=k * 5):
+            slug = col_to_slug.get(col)
+            if slug and slug not in train_slugs:
+                out.append(slug)
+                if len(out) >= k:
+                    break
+        return out
+
+    return recommend
+
+
 STRATEGY_BUILDERS: dict[str, Callable[[dict, dict], RecommendFn]] = {
     "popularity": _build_popularity,
     "svd": _build_svd,
@@ -234,6 +257,7 @@ STRATEGY_BUILDERS: dict[str, Callable[[dict, dict], RecommendFn]] = {
     "hybrid": _build_hybrid,
     "ease": _build_ease,
     "content": _build_content,
+    "movielens": _build_movielens,
 }
 
 

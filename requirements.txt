@@ -2,3 +2,4 @@ httpx>=0.27.0
 selectolax>=0.3.21
 tqdm>=4.66.0
 scipy>=1.11.0
+letterboxdpy>=6.7.0,<7

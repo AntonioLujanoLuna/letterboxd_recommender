@@ -113,7 +113,7 @@ def test_cmd_discover_refill_adds_users(monkeypatch):
             self.closed = True
 
     created = []
-    monkeypatch.setattr(cli, "LetterboxdScraper", lambda delay=1.0: created.append(DummyScraper(delay)) or created[-1])
+    monkeypatch.setattr(cli, "make_scraper", lambda delay=1.0: created.append(DummyScraper(delay)) or created[-1])
 
     args = SimpleNamespace(
         min_queue=5,
@@ -143,7 +143,7 @@ def test_cmd_discover_continue_empty_queue(monkeypatch, caplog):
             self.closed = True
 
     created = []
-    monkeypatch.setattr(cli, "LetterboxdScraper", lambda delay=1.0: created.append(DummyScraper(delay)) or created[-1])
+    monkeypatch.setattr(cli, "make_scraper", lambda delay=1.0: created.append(DummyScraper(delay)) or created[-1])
 
     caplog.set_level(logging.INFO)
     cli.cmd_discover(SimpleNamespace(continue_mode=True, limit=5, source_refresh_days=7))
@@ -184,7 +184,7 @@ def test_cmd_discover_queue_only_popular(monkeypatch):
             self.closed = True
 
     created = []
-    monkeypatch.setattr(cli, "LetterboxdScraper", lambda delay=1.0: created.append(DummyScraper(delay)) or created[-1])
+    monkeypatch.setattr(cli, "make_scraper", lambda delay=1.0: created.append(DummyScraper(delay)) or created[-1])
 
     args = SimpleNamespace(
         source="popular",
@@ -230,7 +230,7 @@ def test_cmd_discover_refill_skips_when_queue_full(monkeypatch):
     monkeypatch.setattr(cli, "get_pending_queue_stats", lambda: {"total": 10, "avg_priority": None, "breakdown": {}})
 
     called = {}
-    monkeypatch.setattr(cli, "LetterboxdScraper", lambda delay=1.0: called.setdefault("scraper", True))
+    monkeypatch.setattr(cli, "make_scraper", lambda delay=1.0: called.setdefault("scraper", True))
 
     args = SimpleNamespace(min_queue=5, target=3, source_refresh_days=7, min_films=50, sources_file=None)
 

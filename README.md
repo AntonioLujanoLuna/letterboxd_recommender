@@ -84,6 +84,83 @@ python main.py scrape your_username --incremental
 python main.py scrape your_username --no-include-lists
 ```
 
+### `--backend letterboxdpy` — Scrape through letterboxdpy
+
+If plain scraping gets 403s, pass the global `--backend letterboxdpy` flag (or set
+`LETTERBOXD_BACKEND=letterboxdpy`). Only the HTTP layer changes: requests go through
+[letterboxdpy](https://github.com/nmcassa/letterboxdpy)'s browser-impersonating fetcher, and all
+parsing, discovery, async batching and the `scrape-daemon` / `crawl` commands work as usual.
+
+```bash
+python main.py --backend letterboxdpy scrape YOUR_USERNAME
+```
+
+### `crawl` — Unattended large-scale scraping
+
+Seeds the pending queue, drains it with the async daemon, refills it, and repeats until `--users`
+new users are scraped or no candidates remain. If the discovery sources run dry it falls back to
+unscraped users from the social graph (most-followed first).
+
+```bash
+python main.py --backend letterboxdpy crawl   --seed-film perfect-blue --seed-film parasite --popular   --users 2000 --min-films 100   --max-concurrent-users 2 --max-concurrent-requests 4 --async-delay 0.5
+```
+
+Useful options: `--seed-user USER` (their followers), `--sources-file`, `--refill-below N`,
+`--queue-target N`, `--chunk N` (users per drain), `--no-social`, `--no-expand-graph`,
+`--max-stalls N` (abort after N consecutive chunks that scraped nobody). It resumes safely: the
+queue lives in the database.
+
+**Resilience.** Queued users are *claimed*, not deleted, when a worker picks them up; they leave
+the queue only after a successful scrape. If the process is killed, claims older than
+`--claim-ttl-minutes` (default 30; `0` = all) are put back on the next start. A user whose scrape
+fails is re-queued and retried on later runs; after 3 failures they are *parked* (kept in the table,
+never claimed again; see the "Parked" line in `queue-status`, drop them with `queue-clear`). Each
+user gets one attempt per run. With the letterboxdpy backend, repeated 403 "blocked" responses
+trip a circuit breaker that pauses all workers (5 minutes, doubling up to 30) instead of
+hammering a blocked IP; private profiles don't count. Film metadata for a user is always fetched in
+full, in chunks of `--batch`.
+
+**Speed and integrity.** The async scrapers (daemon, `crawl`, `discover --parallel-users`) start
+requests at a steady rate capped by `--max-rps` (default `$LETTERBOXD_MAX_RPS` or 6). Throughput is
+that cap, not `concurrency / latency`, so raise `--max-concurrent-requests` (about `max-rps x
+latency`, e.g. 6-8) before raising the cap. A 429 still slows everything via the adaptive delay. After
+page 1, a user's listing pages are fetched 4 at a time. A listing page that can't be fetched is
+retried and then fails the user (queued again for later) instead of silently keeping a truncated
+profile, because Letterboxd answers pages past the end with an empty grid, never a 404. The daemon
+logs a throughput line about once a minute (requests/s, p50/p95 latency, 403/429/error counts) and a
+summary at the end; use it to tune `--max-rps`. Concurrent users never fetch the same film twice, and
+films whose fetch failed are retried on later runs.
+
+**Going faster.** `--auto-rps CEILING` (daemon, `crawl`, `discover --parallel-users`) starts at
+`--max-rps` and probes upward by 1 req/s after every 20 clean seconds, halving at once on a 429 or a
+blocking 403, so it settles near what Letterboxd tolerates instead of you guessing:
+
+```bash
+python main.py --backend letterboxdpy crawl --seed-film parasite --users 2000   --max-rps 6 --auto-rps 12 --max-concurrent-requests 10
+```
+
+Keep `--max-concurrent-requests` above `rps x ~0.5s` (latency), e.g. 10 for a 12 req/s ceiling, or
+concurrency becomes the limit. Watch the once-a-minute throughput line for `403`/`429` counts. In a
+75-second test it climbed from 6 to 12 req/s with no throttling, but sustained runs weren't
+measured, so treat the ceiling as something to verify on your own connection. Discovery's activity
+pre-filter (one profile request per candidate) now runs 8 at a time, and users are claimed only up
+to `--users`, so no in-flight user is cancelled at the end of a chunk. The letterboxdpy transport
+retries a blocking 403 twice with short backoff and returns private-profile 403s immediately.
+
+### Authenticated scraping (`LETTERBOXD_COOKIE`)
+
+Optional. Put your logged-in session in `.env` (git-ignored) as one line:
+
+```
+LETTERBOXD_COOKIE="name1=value1; name2=value2; ..."
+```
+
+To get it: sign in at letterboxd.com in Chrome, open DevTools (F12) → **Network**, reload, click the
+first `letterboxd.com` document request → **Headers** → **Request Headers** → copy the entire
+`Cookie:` value. Use this rather than `document.cookie` or the Application tab, which hide
+HttpOnly cookies, including the session cookie. Treat it like a password and re-copy it if it
+expires. Lines that python-dotenv can't parse are still read by a fallback loader.
+
 ### `discover` — Find and scrape other users
 
 ```bash
@@ -256,6 +333,25 @@ improve NDCG. Use the same `--seed` when comparing runs.
 
 The `graph` strategy isn't evaluated yet: it reads the live database, so hidden films would leak in.
 
+### `movielens-build` — Train on MovieLens (lots of real users, no scraping)
+
+```bash
+python main.py movielens-build --download   # first time: fetches ML-32M (~240 MB)
+python main.py movielens-build --lambdas 500 1000 2000 --max-items 12000
+python main.py recommend YOUR_USERNAME --strategy movielens
+```
+
+Fits EASE on [MovieLens 32M](https://grouplens.org/datasets/movielens/) (32M ratings from 200k
+people), tries each `--lambdas` value on 2,000 held-out MovieLens users, prints recall/NDCG@20
+against a popularity baseline, and saves the best model to `data/movielens_ease.npz`.
+Your Letterboxd films are matched to MovieLens by TMDB/IMDb id (captured on every film
+scrape), falling back to title + year.
+
+**Limits:** MovieLens ratings stop in October 2023, so newer films can't be recommended by
+this strategy or used as input (`content` covers them). `--max-items` films are modelled; memory
+grows with its square (10k ≈ 3 GB peak). GroupLens terms: personal/research use only, no
+redistribution.
+
 ### `stats` — Database statistics
 
 ```bash
@@ -395,6 +491,15 @@ Advanced users can override defaults via environment variables:
 ```bash
 # Database location
 export LETTERBOXD_DB="data/letterboxd.db"
+
+# Scraping backend (native | letterboxdpy) and optional logged-in session
+# Request-start rate cap for the async scrapers (requests/second)
+# LETTERBOXD_MAX_RPS=6
+
+# Block circuit breaker (letterboxdpy backend): threshold, cooldown and max cooldown (seconds)
+# LETTERBOXD_BLOCK_THRESHOLD=5  LETTERBOXD_BLOCK_COOLDOWN=300  LETTERBOXD_BLOCK_MAX_COOLDOWN=1800
+export LETTERBOXD_BACKEND="letterboxdpy"
+# LETTERBOXD_COOKIE is best kept in .env (see Authenticated scraping)
 
 # Scraper delays (in seconds)
 export LETTERBOXD_SCRAPER_DELAY=1.0

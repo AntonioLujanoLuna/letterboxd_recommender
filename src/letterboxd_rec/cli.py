@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 import argparse
 import json
 import logging
@@ -12,6 +13,7 @@ from .database import (
     init_db, get_db, load_json, load_user_lists, parse_timestamp_naive,
     get_discovery_source, update_discovery_source, add_pending_users,
     get_pending_users, remove_pending_user, get_pending_queue_stats,
+    claim_pending_user, release_pending_user, release_stale_claims,
     compute_and_store_idf, populate_normalized_tables_batch, close_pool, run_maintenance,
     create_scrape_session, update_session_progress, complete_session, get_session_history,
     load_films_by_attribute, update_idf_incremental,
@@ -35,6 +37,8 @@ from .config import (
     NOTIFICATION_INTERVAL,
 )
 from .scraper import LetterboxdScraper, AsyncLetterboxdScraper, ScrapeIncompleteError, validate_slug
+from .lbpy_backend import BACKENDS, make_async_scraper, make_scraper, set_backend
+from .scrape_stats import STATS
 from .recommender import MetadataRecommender, CollaborativeRecommender, Recommendation, _fuse_normalized, hybrid_weights
 from .matrix_factorization import SVDRecommender
 from .profile import build_profile, UserProfile
@@ -202,31 +206,37 @@ def _scrape_film_metadata(
     use_async: bool = True,
     async_scraper: 'AsyncLetterboxdScraper | None' = None,
 ) -> None:
-    """Helper to scrape film metadata for a list of slugs."""
+    """Scrape and save metadata for *all* given slugs, in chunks of `max_per_batch`.
+
+    The chunk size only bounds how many films are in flight/saved at once. It is deliberately
+    not a cap: callers treat every slug as handled afterwards, so dropping the overflow would
+    leave those films without metadata permanently.
+    """
     if not slugs:
         return
 
-    limited_slugs = slugs[:max_per_batch]
+    chunk_size = max(1, max_per_batch)
+    for start in range(0, len(slugs), chunk_size):
+        chunk = slugs[start:start + chunk_size]
 
-    if use_async and len(limited_slugs) > 10:
-        from .scraper import AsyncLetterboxdScraper
-        logger.info(f"Fetching {len(limited_slugs)} films (async)...")
+        if use_async and len(chunk) > 10:
+            logger.info(f"Fetching {len(chunk)} films (async)... [{start + len(chunk)}/{len(slugs)}]")
 
-        async def scrape_batch(shared: AsyncLetterboxdScraper | None):
-            if shared:
-                return await shared.scrape_films_batch(limited_slugs)
-            async with AsyncLetterboxdScraper(delay=0.2, max_concurrent=5) as temp_async:
-                return await temp_async.scrape_films_batch(limited_slugs)
+            async def scrape_batch(shared: 'AsyncLetterboxdScraper | None', batch=chunk):
+                if shared:
+                    return await shared.scrape_films_batch(batch)
+                async with make_async_scraper(delay=0.2, max_concurrent=5) as temp_async:
+                    return await temp_async.scrape_films_batch(batch)
 
-        metadata_list = asyncio.run(scrape_batch(async_scraper))
-    else:
-        metadata_list = []
-        for slug in tqdm(limited_slugs, desc="Metadata"):
-            meta = scraper.scrape_film(slug)
-            if meta:
-                metadata_list.append(meta)
+            metadata_list = asyncio.run(scrape_batch(async_scraper))
+        else:
+            metadata_list = []
+            for slug in tqdm(chunk, desc="Metadata"):
+                meta = scraper.scrape_film(slug)
+                if meta:
+                    metadata_list.append(meta)
 
-    _persist_metadata_batch(metadata_list)
+        _persist_metadata_batch(metadata_list)
 
 
 def _persist_metadata_batch(metadata_list: list) -> None:
@@ -239,8 +249,8 @@ def _persist_metadata_batch(metadata_list: list) -> None:
             INSERT OR REPLACE INTO films
             (slug, title, year, directors, genres, cast, themes, runtime, avg_rating, rating_count,
              fan_count, is_short, is_animation,
-             countries, languages, writers, cinematographers, composers)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             countries, languages, writers, cinematographers, composers, tmdb_id, imdb_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, [(
             m.slug, m.title, m.year,
             json.dumps(m.directors), json.dumps(m.genres),
@@ -249,7 +259,7 @@ def _persist_metadata_batch(metadata_list: list) -> None:
             m.fan_count, int(m.is_short), int(m.is_animation),
             json.dumps(m.countries), json.dumps(m.languages),
             json.dumps(m.writers), json.dumps(m.cinematographers),
-            json.dumps(m.composers)
+            json.dumps(m.composers), getattr(m, "tmdb_id", None), getattr(m, "imdb_id", None),
         ) for m in metadata_list])
 
         # Populate normalized tables for fast queries (batch operation)
@@ -264,22 +274,27 @@ async def _scrape_film_metadata_async(
     async_scraper: 'AsyncLetterboxdScraper',
     slugs: list[str],
     max_per_batch: int = 100,
-) -> None:
+) -> set[str]:
     """
     Async helper to scrape film metadata using a shared AsyncLetterboxdScraper.
-    Mirrors _scrape_film_metadata but avoids blocking the event loop.
+    Fetches *all* given slugs in chunks of `max_per_batch` and avoids blocking the event loop.
     """
+    saved: set[str] = set()
     if not slugs:
-        return
+        return saved
 
-    limited_slugs = slugs[:max_per_batch]
-    metadata_list = await async_scraper.scrape_films_batch(limited_slugs)
-
-    if not metadata_list:
-        return
-
-    await asyncio.to_thread(_persist_metadata_batch, metadata_list)
-    logger.info(f"Saved {len(metadata_list)} films")
+    # max_per_batch is the chunk size, not a cap: callers treat every slug as handled afterwards,
+    # so anything not fetched here would never get metadata. The returned set lets them see which
+    # slugs failed so those can be retried later.
+    chunk = max(1, max_per_batch)
+    for start in range(0, len(slugs), chunk):
+        metadata_list = await async_scraper.scrape_films_batch(slugs[start:start + chunk])
+        if not metadata_list:
+            continue
+        await asyncio.to_thread(_persist_metadata_batch, metadata_list)
+        saved.update(m.slug for m in metadata_list)
+        logger.info(f"Saved {len(metadata_list)} films")
+    return saved
 
 
 async def _scrape_users_parallel(
@@ -325,9 +340,11 @@ async def _scrape_users_parallel(
 
         await asyncio.to_thread(_persist)
 
-    async with AsyncLetterboxdScraper(
+    async with make_async_scraper(
         delay=getattr(args, "async_delay", DEFAULT_ASYNC_DELAY),
         max_concurrent=getattr(args, "max_concurrent_requests", DEFAULT_MAX_CONCURRENT),
+        max_rps=getattr(args, "max_rps", None),
+        rps_ceiling=getattr(args, "auto_rps", None),
     ) as async_scraper:
 
         async def _process(username: str):
@@ -343,11 +360,13 @@ async def _scrape_users_parallel(
                             known_film_slugs.update(new_slugs)
 
                         if new_slugs:
-                            await _scrape_film_metadata_async(
+                            saved = await _scrape_film_metadata_async(
                                 async_scraper,
                                 new_slugs,
                                 max_per_batch=getattr(args, "batch", DEFAULT_MAX_PER_BATCH),
                             )
+                            async with known_slugs_lock:
+                                known_film_slugs.difference_update(set(new_slugs) - saved)
 
                         logger.info(f"{username}: {len(interactions)} films (parallel)")
                     else:
@@ -397,7 +416,7 @@ def cmd_scrape(args: argparse.Namespace) -> None:
     # Validate and sanitize username
     username = _validate_username(args.username)
     
-    scraper = LetterboxdScraper(delay=1.0)
+    scraper = make_scraper(delay=1.0)
     
     try:
         # Check if refresh is needed
@@ -534,7 +553,7 @@ def cmd_scrape_social(args: argparse.Namespace) -> None:
     """Scrape and store social graph (following/followers) for a user."""
     init_db()
     username = _validate_username(args.username)
-    scraper = LetterboxdScraper(delay=1.0)
+    scraper = make_scraper(delay=1.0)
     
     try:
         total_saved = 0
@@ -595,7 +614,7 @@ def cmd_backfill_social(args: argparse.Namespace) -> None:
             logger.info(f"  ... and {len(users_needing_social) - len(sample)} more")
         return
 
-    scraper = LetterboxdScraper(delay=1.0)
+    scraper = make_scraper(delay=1.0)
     try:
         for username in tqdm(list(users_needing_social)[: args.limit], desc="Social"):
             following = scraper.scrape_following(username, limit=args.social_limit)
@@ -616,7 +635,7 @@ def cmd_backfill_social(args: argparse.Namespace) -> None:
 def cmd_discover(args: argparse.Namespace) -> None:
     """Discover and scrape other users with caching and pending queue support."""
     init_db()
-    scraper = LetterboxdScraper(delay=getattr(args, "discover_delay", DEFAULT_SCRAPER_DELAY))
+    scraper = make_scraper(delay=getattr(args, "discover_delay", DEFAULT_SCRAPER_DELAY))
 
     try:
         # Check if we're in continue mode (drain pending queue only)
@@ -731,29 +750,9 @@ def cmd_discover(args: argparse.Namespace) -> None:
                 if getattr(args, "skip_activity_checks", False):
                     filtered_usernames = usernames
                 else:
-                    filtered_usernames = []
-                    for username in usernames:
-                        activity = scraper.check_user_activity(username)
-                        activity_checked += 1
-
-                        if not activity:
-                            logger.debug(f"Skipping {username} (profile not accessible)")
-                            filtered_count += 1
-                            continue
-
-                        # Filter by minimum film count
-                        if activity['film_count'] < min_films:
-                            logger.debug(f"Skipping {username} (only {activity['film_count']} films < {min_films})")
-                            filtered_count += 1
-                            continue
-
-                        # Require ratings (they actually rate, not just log)
-                        if not activity['has_ratings']:
-                            logger.debug(f"Skipping {username} (no ratings)")
-                            filtered_count += 1
-                            continue
-
-                        filtered_usernames.append(username)
+                    filtered_usernames = _filter_active_users(scraper, usernames, min_films)
+                    activity_checked += len(usernames)
+                    filtered_count += len(usernames) - len(filtered_usernames)
 
                 all_discovered.extend(filtered_usernames)
 
@@ -869,6 +868,12 @@ async def _cmd_scrape_daemon_async(args: argparse.Namespace) -> None:
     """Async daemon: drain pending queue with shared client + coordinated rate limiting."""
     init_db()
 
+    # Users claimed by a run that crashed are still marked in-flight; put them back.
+    ttl_minutes = getattr(args, "claim_ttl_minutes", 30)
+    recovered = release_stale_claims(ttl_minutes * 60)
+    if recovered:
+        logger.info(f"Recovered {recovered} user(s) left claimed by an earlier run")
+
     # Track session progress and allow resuming visibility
     session_id = create_scrape_session()
     scraped_count = 0
@@ -899,8 +904,17 @@ async def _cmd_scrape_daemon_async(args: argparse.Namespace) -> None:
                 ])
         await asyncio.to_thread(_persist)
 
+    unfetchable: set[str] = set()  # films whose metadata fetch failed this run
+    in_flight: set[str] = set()
+    failed_this_run: set[str] = set()  # each user gets one attempt per run; later runs retry
+
     async def _remove_pending(username: str):
+        in_flight.discard(username)
         await asyncio.to_thread(remove_pending_user, username)
+
+    async def _release_pending(username: str, count_attempt: bool = True):
+        in_flight.discard(username)
+        await asyncio.to_thread(release_pending_user, username, count_attempt)
 
     async def _update_session():
         if session_id:
@@ -913,9 +927,11 @@ async def _cmd_scrape_daemon_async(args: argparse.Namespace) -> None:
                 f"Scrape progress: {scraped_count_local} users done, {queue_remaining} remaining"
             )
 
-    async with AsyncLetterboxdScraper(
+    async with make_async_scraper(
         delay=getattr(args, "async_delay", getattr(args, "delay", DEFAULT_ASYNC_DELAY)),
         max_concurrent=getattr(args, "max_concurrent_requests", DEFAULT_MAX_CONCURRENT),
+        max_rps=getattr(args, "max_rps", None),
+        rps_ceiling=getattr(args, "auto_rps", None),
     ) as async_scraper:
 
         async def _scrape_social_async(username: str):
@@ -938,9 +954,16 @@ async def _cmd_scrape_daemon_async(args: argparse.Namespace) -> None:
 
                     if interactions:
                         await _persist_user_films(username, interactions)
-                        new_slugs = [i.film_slug for i in interactions if i.film_slug not in known_film_slugs]
-                        await _scrape_film_metadata_async(async_scraper, new_slugs, max_per_batch=args.batch)
+                        # Claim the new films *before* awaiting, so a user scraped concurrently with
+                        # overlapping films doesn't fetch them a second time. Films that fail are
+                        # un-claimed for later runs, but not retried again within this run.
+                        new_slugs = [i.film_slug for i in interactions
+                                     if i.film_slug not in known_film_slugs and i.film_slug not in unfetchable]
                         known_film_slugs.update(new_slugs)
+                        saved = await _scrape_film_metadata_async(async_scraper, new_slugs, max_per_batch=args.batch)
+                        failed_films = set(new_slugs) - saved
+                        known_film_slugs.difference_update(failed_films)
+                        unfetchable.update(failed_films)
 
                         if getattr(args, "include_social", False):
                             await _scrape_social_async(username)
@@ -963,20 +986,31 @@ async def _cmd_scrape_daemon_async(args: argparse.Namespace) -> None:
                     logger.error(f"Error scraping {username}: {exc}")
                     if args.remove_on_error:
                         await _remove_pending(username)
+                    else:
+                        # Back to the queue; parked for good after MAX_QUEUE_ATTEMPTS failures.
+                        failed_this_run.add(username)
+                        await _release_pending(username)
 
         tasks: set[asyncio.Task] = set()
 
         try:
             while not shutdown_requested:
-                # Refill task set up to max_concurrent_users
-                while len(tasks) < getattr(args, "max_concurrent_users", 1):
-                    next_batch = await asyncio.to_thread(get_pending_users, 1)
-                    if not next_batch:
+                # Refill task set up to max_concurrent_users, but never claim more users than the
+                # target still needs: users in flight when the target is hit would be cancelled
+                # mid-scrape and their work thrown away.
+                while (len(tasks) < getattr(args, "max_concurrent_users", 1)
+                       and not (args.target and scraped_count + len(tasks) >= args.target)):
+                    # Atomic claim: the user stays queued (marked in-flight) until they succeed.
+                    claimed = await asyncio.to_thread(claim_pending_user, frozenset(failed_this_run))
+                    if not claimed:
                         break
-                    uname = next_batch[0]['username']
-                    # Remove immediately to avoid multiple concurrent claims of the same user
-                    await asyncio.to_thread(remove_pending_user, uname)
+                    uname = claimed['username']
+                    in_flight.add(uname)
                     tasks.add(asyncio.create_task(_process_user(uname)))
+
+                if not tasks and args.target and scraped_count >= args.target:
+                    logger.info(f"Reached target of {args.target} users.")
+                    break
 
                 if not tasks:
                     if args.wait_for_queue:
@@ -989,24 +1023,27 @@ async def _cmd_scrape_daemon_async(args: argparse.Namespace) -> None:
                 done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED, timeout=1)
                 tasks = pending
 
+                report = STATS.maybe_report(60)
+                if report:
+                    logger.info(report)
+
                 await _update_session()
                 await _notify(scraped_count)
-
-                if args.target and scraped_count >= args.target:
-                    logger.info(f"Reached target of {args.target} users.")
-                    break
 
         finally:
             for task in tasks:
                 task.cancel()
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
+            for uname in list(in_flight):  # interrupted, not failed
+                await _release_pending(uname, count_attempt=False)
 
     elapsed = (datetime.now() - session_start).total_seconds()
     status = "interrupted" if shutdown_requested else "completed"
     if session_id:
         complete_session(session_id, status=status)
     logger.info(f"\nSession complete: {scraped_count} users in {elapsed/3600:.1f} hours")
+    logger.info(STATS.summary())
 
 
 def cmd_scrape_daemon(args: argparse.Namespace) -> None:
@@ -1027,6 +1064,8 @@ def cmd_queue_status(args: argparse.Namespace) -> None:
     logger.info(f"Total pending users: {stats['total']}")
     if stats['avg_priority'] is not None:
         logger.info(f"Average priority: {stats['avg_priority']:.1f}")
+    if stats.get('parked'):
+        logger.info(f"Parked after repeated failures: {stats['parked']} (see queue-clear to drop them)")
 
     if stats['breakdown']:
         logger.info("\nBy source:")
@@ -1103,7 +1142,9 @@ def cmd_discover_refill(args: argparse.Namespace) -> None:
         ("popular", "members", 70, 1),
     ]
 
-    if args.sources_file:
+    if getattr(args, "sources", None):
+        sources = list(args.sources)
+    elif args.sources_file:
         import json as _json
         with open(args.sources_file) as f:
             loaded = _json.load(f)
@@ -1121,7 +1162,7 @@ def cmd_discover_refill(args: argparse.Namespace) -> None:
                 normalized_sources.append(tuple(item))
         sources = normalized_sources
 
-    scraper = LetterboxdScraper(delay=1.0)
+    scraper = make_scraper(delay=1.0)
     total_added = 0
 
     try:
@@ -1159,11 +1200,7 @@ def cmd_discover_refill(args: argparse.Namespace) -> None:
                 logger.warning(f"Unknown source {source_type}, skipping")
                 continue
 
-            filtered = []
-            for username in users:
-                activity = scraper.check_user_activity(username)
-                if activity and activity['film_count'] >= args.min_films and activity['has_ratings']:
-                    filtered.append(username)
+            filtered = _filter_active_users(scraper, users, args.min_films)
 
             added = add_pending_users(filtered, source_type, source_id, priority)
             total_added += added
@@ -1175,6 +1212,126 @@ def cmd_discover_refill(args: argparse.Namespace) -> None:
         scraper.close()
 
     logger.info(f"\nRefill complete: added {total_added} users, queue now at {stats['total'] + total_added}")
+
+
+def _passes_activity(activity: dict | None, min_films: int) -> bool:
+    """Enough films logged, and they actually rate (not just log)."""
+    return bool(activity and activity['film_count'] >= min_films and activity['has_ratings'])
+
+
+def _filter_active_users(scraper, usernames: list[str], min_films: int, workers: int = 8) -> list[str]:
+    """Activity pre-filter run concurrently (order preserved).
+
+    Each check is one profile request, and doing them one at a time left the whole pipeline idle
+    (~1.4s per candidate, minutes per refill). A failed check just skips that candidate.
+    """
+    if not usernames:
+        return []
+
+    def check(username: str):
+        try:
+            return scraper.check_user_activity(username)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"Activity check failed for {username}: {exc}")
+            return None
+
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(usernames)))) as pool:
+        results = list(pool.map(check, usernames))
+    return [u for u, activity in zip(usernames, results) if _passes_activity(activity, min_films)]
+
+
+def _enqueue_from_graph(scraper, limit: int, min_films: int) -> int:
+    """Queue unscraped users that appear in the scraped social graph (most-followed first)."""
+    with get_db(read_only=True) as conn:
+        rows = conn.execute("""
+            SELECT f.followee AS username, COUNT(*) AS n
+            FROM user_follows f
+            WHERE f.followee NOT IN (SELECT DISTINCT username FROM user_films)
+              AND f.followee NOT IN (SELECT username FROM pending_users)
+            GROUP BY f.followee
+            ORDER BY n DESC
+            LIMIT ?
+        """, (limit * 3,)).fetchall()
+
+    keep = _filter_active_users(scraper, [r['username'] for r in rows], min_films)[:limit]
+    return add_pending_users(keep, "graph", "user_follows", priority=40) if keep else 0
+
+
+def cmd_crawl(args: argparse.Namespace) -> None:
+    """Unattended large crawl: seed the queue, then alternate draining and refilling it.
+
+    Stops after --users users are scraped, or when no more candidates can be found.
+    """
+    init_db()
+
+    sources: list[tuple] = []
+    for slug in args.seed_film or []:
+        sources.append(("film_reviews", slug, 100, 2))
+    for user in args.seed_user or []:
+        sources.append(("followers", _validate_username(user), 90, 2))
+    if args.popular:
+        sources.append(("popular", "members", 70, 1))
+
+    refill_ns = argparse.Namespace(
+        min_queue=args.refill_below, target=args.queue_target,
+        source_refresh_days=args.source_refresh_days, sources_file=args.sources_file,
+        sources=sources or None, min_films=args.min_films,
+    )
+
+    def _scraped_total() -> int:
+        with get_db(read_only=True) as conn:
+            return conn.execute("SELECT COUNT(DISTINCT username) FROM user_films").fetchone()[0]
+
+    scraped_start = _scraped_total()
+
+    def _scraped_now() -> int:
+        return _scraped_total() - scraped_start
+
+    stalls = 0
+    while _scraped_now() < args.users:
+        queue = get_pending_queue_stats()['total']
+        if queue < args.refill_below:
+            logger.info(f"Queue low ({queue}); refilling...")
+            cmd_discover_refill(refill_ns)
+            queue = get_pending_queue_stats()['total']
+
+            if queue < args.refill_below and args.expand_graph:
+                scraper = make_scraper(delay=1.0)
+                try:
+                    added = _enqueue_from_graph(scraper, args.queue_target, args.min_films)
+                finally:
+                    scraper.close()
+                logger.info(f"Graph expansion queued {added} users")
+                queue = get_pending_queue_stats()['total']
+
+        if queue == 0:
+            logger.info("No candidates left to scrape; stopping.")
+            break
+
+        chunk = min(args.chunk, args.users - _scraped_now())
+        before = _scraped_now()
+        cmd_scrape_daemon(argparse.Namespace(
+            target=chunk, delay=args.async_delay, user_delay=args.user_delay,
+            wait_for_queue=False, wait_seconds=60, batch=args.batch,
+            remove_on_error=True, max_concurrent_users=args.max_concurrent_users,
+            max_concurrent_requests=args.max_concurrent_requests, async_delay=args.async_delay,
+            include_social=args.include_social, social_limit=args.social_limit,
+            claim_ttl_minutes=args.claim_ttl_minutes, max_rps=args.max_rps,
+            auto_rps=args.auto_rps,
+        ))
+
+        if _scraped_now() == before:
+            stalls += 1
+            logger.warning(f"Chunk scraped no users ({stalls}/{args.max_stalls}); "
+                           "Letterboxd may be blocking requests")
+            if stalls >= args.max_stalls:
+                logger.error("Stopping: repeated empty chunks. Try --backend letterboxdpy, a "
+                             "LETTERBOXD_COOKIE, or larger delays.")
+                break
+        else:
+            stalls = 0
+
+    logger.info(f"\nCrawl finished: {_scraped_now()} new users scraped this run.")
 
 
 def cmd_session_history(args: argparse.Namespace) -> None:
@@ -1224,7 +1381,7 @@ def cmd_discover_from_taste(args: argparse.Namespace) -> None:
     film_slugs = [r['film_slug'] for r in rows]
     logger.info(f"Discovering reviewers from {len(film_slugs)} of {username}'s top films...")
 
-    scraper = LetterboxdScraper(delay=1.0)
+    scraper = make_scraper(delay=1.0)
     total_added = 0
 
     try:
@@ -1232,11 +1389,7 @@ def cmd_discover_from_taste(args: argparse.Namespace) -> None:
             reviewers = scraper.scrape_film_reviewers(slug, limit=args.per_film)
             usernames = [r['username'] for r in reviewers if r.get('has_rating', True)]
 
-            filtered = []
-            for user in usernames[:args.per_film]:
-                activity = scraper.check_user_activity(user)
-                if activity and activity['film_count'] >= args.min_films and activity['has_ratings']:
-                    filtered.append(user)
+            filtered = _filter_active_users(scraper, usernames[:args.per_film], args.min_films)
 
             added = add_pending_users(filtered, "taste_match", slug, priority=90)
             total_added += added
@@ -1276,7 +1429,7 @@ def _load_recommendation_data(
         min_rating=args.min_rating
     )
 
-    if strategy in ('hybrid', 'collaborative', 'graph', 'svd', 'ease'):
+    if strategy in ('hybrid', 'collaborative', 'graph', 'svd', 'ease', 'movielens'):
         all_films = {r['slug']: dict(r) for r in conn.execute("SELECT * FROM films")}
     else:
         all_films = all_films_filtered
@@ -1596,6 +1749,78 @@ def _run_svd_strategy(
     return recs
 
 
+def film_url(slug: str) -> str:
+    """Letterboxd URL for a slug; 'tmdb:<id>' (films not in the local DB) uses Letterboxd's TMDB redirect."""
+    if slug.startswith("tmdb:"):
+        return f"https://letterboxd.com/tmdb/{slug[5:]}/"
+    return f"https://letterboxd.com/film/{slug}/"
+
+
+_MOVIELENS_MODEL = None
+
+
+def _run_movielens_strategy(
+    user_films: list[dict],
+    all_films: dict[str, dict],
+    args: argparse.Namespace,
+    username: str,
+    user_lists: list[dict] | None,
+    all_user_films: dict[str, list[dict]] | None = None,
+) -> list[Recommendation]:
+    """EASE trained on MovieLens users, scored from this user's Letterboxd history."""
+    global _MOVIELENS_MODEL
+    from .movielens import FilmMatcher, MovieLensModel
+
+    try:
+        if _MOVIELENS_MODEL is None:
+            _MOVIELENS_MODEL = MovieLensModel.load()
+    except FileNotFoundError as e:
+        logger.error(str(e))
+        return []
+    model = _MOVIELENS_MODEL
+    matcher = FilmMatcher(model)
+
+    weighted, seen, unmatched = matcher.map_history(user_films, all_films)
+    if not weighted:
+        logger.error(
+            f"None of {username}'s {len(user_films)} films matched MovieLens "
+            f"({unmatched} unmatched). Scrape the profile first, or refresh film metadata."
+        )
+        return []
+    if unmatched:
+        logger.info(f"Matched {len(user_films) - unmatched}/{len(user_films)} films to MovieLens "
+                    f"(MovieLens ends in late 2023; newer and obscure films can't be used).")
+
+    col_to_slug = matcher.letterboxd_slugs(all_films)
+    needs_metadata = bool(args.genres or args.exclude_genres or args.min_rating)
+    liked_cols = [c for c, w in sorted(weighted.items(), key=lambda kv: -kv[1]) if w >= 1.0]
+
+    recs: list[Recommendation] = []
+    for col, score in model.recommend_columns(weighted, seen, n=max(args.limit * 20, 300)):
+        slug = col_to_slug.get(col)
+        year = model.years[col]
+        if slug and slug in all_films:
+            film = all_films[slug]
+            if not _passes_cli_filters(film, args):
+                continue
+            title, year = film.get('title', model.titles[col]), film.get('year') or year
+        else:
+            if needs_metadata:
+                continue  # can't check genre/rating filters without Letterboxd metadata
+            if (args.min_year and year and year < args.min_year) or (args.max_year and year and year > args.max_year):
+                continue
+            tmdb = model.tmdb_ids[col]
+            if not tmdb:
+                continue
+            slug, title = f"tmdb:{tmdb}", model.titles[col]
+        contrib = sorted(((float(model.B[c, col]), c) for c in liked_cols), reverse=True)[:2]
+        reasons = [f"Because you liked {model.titles[c]}" for w, c in contrib if w > 0]
+        recs.append(Recommendation(slug=slug, title=title, year=year, score=score, reasons=reasons))
+        if len(recs) >= args.limit:
+            break
+    return recs
+
+
 def _passes_cli_filters(film: dict, args: argparse.Namespace) -> bool:
     """Year / genre / average-rating filters from the recommend command line."""
     year = film.get('year')
@@ -1706,7 +1931,7 @@ def _output_recommendations(
                 "slug": r.slug,
                 "score": round(r.score, 2),
                 "reasons": r.reasons,
-                "url": f"https://letterboxd.com/film/{r.slug}/",
+                "url": film_url(r.slug),
                 "directors": load_json(film.get('directors', [])),
                 "genres": load_json(film.get('genres', [])),
                 "cast": load_json(film.get('cast', []))[:5],
@@ -1740,12 +1965,12 @@ def _output_recommendations(
         logger.info("Title,Year,URL,Score,Reasons")
         for r in recs:
             reasons = "; ".join(r.reasons).replace('"', '""')
-            logger.info(f'"{r.title}",{r.year},https://letterboxd.com/film/{r.slug}/,{r.score:.2f},"{reasons}"')
+            logger.info(f'"{r.title}",{r.year},{film_url(r.slug)},{r.score:.2f},"{reasons}"')
             
     elif output_format == 'markdown':
         logger.info(f"\n# Top {len(recs)} recommendations for {username} ({strategy})\n")
         for i, r in enumerate(recs, 1):
-            logger.info(f"## {i}. [{r.title} ({r.year})](https://letterboxd.com/film/{r.slug}/)")
+            logger.info(f"## {i}. [{r.title} ({r.year})]({film_url(r.slug)})")
             logger.info(f"**Score**: {r.score:.1f}  ")
             logger.info(f"**Why**: {', '.join(r.reasons)}\n")
             
@@ -1875,7 +2100,7 @@ def cmd_jam(args: argparse.Namespace) -> None:
                 "agreement": round(rec.agreement_score, 2),
                 "unanimous": rec.is_unanimous,
                 "reasons": rec.consensus_reasons,
-                "url": f"https://letterboxd.com/film/{rec.slug}/",
+                "url": film_url(rec.slug),
             }
             for rec in recs
         ]
@@ -1957,6 +2182,7 @@ def cmd_recommend(args: argparse.Namespace) -> None:
         'graph': _run_graph_strategy,
         'ease': _run_ease_strategy,
         'content': _run_content_strategy,
+        'movielens': _run_movielens_strategy,
     }
 
     handler = strategy_handlers[strategy]
@@ -1988,6 +2214,10 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
     from .evaluation import EVALUABLE_STRATEGIES, format_results_table, run_evaluation
 
     strategies = args.strategies or list(EVALUABLE_STRATEGIES)
+    if not args.strategies:
+        from .movielens import ML_MODEL_PATH
+        if ML_MODEL_PATH.exists():
+            strategies.append("movielens")
     if "popularity" not in strategies:
         strategies = ["popularity", *strategies]  # always report the baseline
 
@@ -2061,6 +2291,47 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
         "popularity baseline.\nThe graph strategy is not evaluated: it reads the live "
         "database, so hidden films would leak in."
     )
+
+
+def cmd_movielens_build(args: argparse.Namespace) -> None:
+    """Download (optionally) MovieLens, fit EASE, report held-out quality, save the model."""
+    from .movielens import ML_DIR, ML_DOWNLOAD_URL, build_model
+
+    ml_dir = Path(args.dir) if args.dir else ML_DIR
+    if not (ml_dir / "ratings.csv").exists() and not (ml_dir / "ratings.npz").exists():
+        if not args.download:
+            logger.error(f"MovieLens not found in {ml_dir}. Re-run with --download, or download "
+                         f"{ML_DOWNLOAD_URL} and unzip it into {ml_dir.parent}.")
+            return
+        import httpx
+        import zipfile
+        ml_dir.parent.mkdir(parents=True, exist_ok=True)
+        zip_path = ml_dir.parent / "ml-32m.zip"
+        logger.info(f"Downloading {ML_DOWNLOAD_URL} (~240 MB)...")
+        with httpx.stream("GET", ML_DOWNLOAD_URL, follow_redirects=True, timeout=120) as resp:
+            resp.raise_for_status()
+            with open(zip_path, "wb") as fh:
+                for chunk in resp.iter_bytes(1 << 20):
+                    fh.write(chunk)
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(ml_dir.parent)
+
+    model, report = build_model(
+        ml_dir=ml_dir, max_items=args.max_items, lambdas=tuple(args.lambdas),
+        eval_users=args.eval_users, k=args.k, seed=args.seed,
+    )
+    k = report.k
+    logger.info(f"\nMovieLens: {report.n_ratings:,} ratings, {report.n_users:,} users, "
+                f"{report.n_items:,} films kept. Held-out test: {report.n_eval_users:,} users, "
+                f"20% of their liked films hidden.\n")
+    base = report.results[0][f"ndcg@{k}"]
+    logger.info(f"{'model':<22}{f'recall@{k}':>11}{f'ndcg@{k}':>10}{'vs pop':>9}{'fit s':>8}")
+    for r in report.results:
+        name = r["model"] if r["lambda"] is None else f"ease (lambda={r['lambda']:g})"
+        lift = "" if r["lambda"] is None or not base else f"{(r[f'ndcg@{k}'] / base - 1) * 100:+.0f}%"
+        best = "  <- saved" if r["lambda"] == report.best_lambda else ""
+        logger.info(f"{name:<22}{r[f'recall@{k}']:>11.4f}{r[f'ndcg@{k}']:>10.4f}{lift:>9}{r['fit_seconds']:>8.0f}{best}")
+    logger.info("\nNext: python main.py recommend YOUR_USERNAME --strategy movielens")
 
 
 def cmd_stats(args: argparse.Namespace) -> None:
@@ -2180,15 +2451,16 @@ def cmd_import(args: argparse.Namespace) -> None:
                 conn.executemany("""
                     INSERT OR REPLACE INTO films
                     (slug, title, year, directors, genres, cast, themes, runtime, avg_rating, rating_count,
-                     countries, languages, writers, cinematographers, composers)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     countries, languages, writers, cinematographers, composers, tmdb_id, imdb_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, [(
                     film['slug'], film.get('title'), film.get('year'),
                     film.get('directors'), film.get('genres'),
                     film.get('cast'), film.get('themes'),
                     film.get('runtime'), film.get('avg_rating'), film.get('rating_count'),
                     film.get('countries'), film.get('languages'),
-                    film.get('writers'), film.get('cinematographers'), film.get('composers')
+                    film.get('writers'), film.get('cinematographers'), film.get('composers'),
+                    film.get('tmdb_id'), film.get('imdb_id'),
                 ) for film in chunk])
                 # Keep normalized tables in sync with imported films
                 populate_normalized_tables_batch(conn, chunk)
@@ -2445,7 +2717,7 @@ def cmd_refresh_metadata(args: argparse.Namespace) -> None:
         logger.info("No films need refreshing.")
         return
 
-    scraper = LetterboxdScraper(delay=1.0)
+    scraper = make_scraper(delay=1.0)
     try:
         _scrape_film_metadata(scraper, slugs, max_per_batch=args.batch, use_async=True)
     finally:
@@ -2528,6 +2800,9 @@ def setup_jam_parser(subparsers):
 def main():
     parser = argparse.ArgumentParser(description="Letterboxd Recommender")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
+    parser.add_argument("--backend", choices=BACKENDS, default=None,
+                        help="Scraping backend for user/film pages (default: $LETTERBOXD_BACKEND or native). "
+                             "'letterboxdpy' uses browser-impersonating requests and can bypass 403 blocks.")
     subparsers = parser.add_subparsers(dest="command", required=True)
     
     # Scrape command
@@ -2574,6 +2849,10 @@ def main():
                                   help="Max concurrent HTTP requests when using --parallel-users")
     discover_parser.add_argument("--async-delay", type=float, default=DEFAULT_ASYNC_DELAY,
                                   help="Base async delay between requests when using --parallel-users")
+    discover_parser.add_argument("--max-rps", type=float, default=None,
+                                  help="Cap on requests started per second (default: $LETTERBOXD_MAX_RPS or 6)")
+    discover_parser.add_argument("--auto-rps", type=float, default=None, metavar="CEILING",
+                                  help="Probe upward from --max-rps toward CEILING req/s, halving on 429/403")
     discover_parser.add_argument(
         "--discover-delay",
         type=float,
@@ -2628,6 +2907,12 @@ def main():
                                help="Max concurrent HTTP requests across tasks (async)")
     daemon_parser.add_argument("--async-delay", type=float, default=DEFAULT_ASYNC_DELAY,
                                help="Base async delay between requests (seconds)")
+    daemon_parser.add_argument("--max-rps", type=float, default=None,
+                               help="Cap on requests started per second (default: $LETTERBOXD_MAX_RPS or 6)")
+    daemon_parser.add_argument("--auto-rps", type=float, default=None, metavar="CEILING",
+                               help="Probe upward from --max-rps toward CEILING req/s, halving on 429/403")
+    daemon_parser.add_argument("--claim-ttl-minutes", type=float, default=30,
+                               help="On start, re-queue users left claimed longer than this by a crashed run (0 = all)")
     daemon_parser.add_argument("--include-social", action="store_true", help="Also scrape following/followers for each user")
     daemon_parser.add_argument("--social-limit", type=int, default=200, help="Max following/followers to scrape per user")
     daemon_parser.set_defaults(func=cmd_scrape_daemon)
@@ -2635,7 +2920,7 @@ def main():
     # Recommend command
     rec_parser = subparsers.add_parser("recommend", help="Generate recommendations")
     rec_parser.add_argument("username", help="Letterboxd username")
-    rec_parser.add_argument("--strategy", choices=['metadata', 'collaborative', 'hybrid', 'svd', 'graph', 'ease', 'content'],
+    rec_parser.add_argument("--strategy", choices=['metadata', 'collaborative', 'hybrid', 'svd', 'graph', 'ease', 'content', 'movielens'],
                             default='metadata', help="Recommendation strategy")
     rec_parser.add_argument("--limit", type=int, default=20, help="Number of recommendations")
     rec_parser.add_argument("--min-year", type=int, help="Minimum release year")
@@ -2724,7 +3009,7 @@ def main():
     )
     eval_parser.add_argument(
         "--strategies", nargs="+",
-        choices=["popularity", "svd", "collaborative", "metadata", "hybrid", "ease", "content"],
+        choices=["popularity", "svd", "collaborative", "metadata", "hybrid", "ease", "content", "movielens"],
         help="Strategies to compare (default: all; the popularity baseline is always included)",
     )
     eval_parser.add_argument("--k", type=int, default=20, help="Cutoff for recall@k / NDCG@k")
@@ -2739,6 +3024,20 @@ def main():
     eval_parser.add_argument("--json", action="store_true", help="Print results as JSON")
     eval_parser.add_argument("--per-user", action="store_true", help="Include per-user metrics in JSON output")
     eval_parser.set_defaults(func=cmd_evaluate)
+
+    ml_parser = subparsers.add_parser(
+        "movielens-build", help="Train the MovieLens EASE model and report its held-out quality"
+    )
+    ml_parser.add_argument("--download", action="store_true", help="Download ML-32M if missing (~240 MB)")
+    ml_parser.add_argument("--dir", help="Unzipped MovieLens directory (default data/movielens/ml-32m)")
+    ml_parser.add_argument("--max-items", type=int, default=10_000,
+                           help="Most-rated films to model (memory grows with the square; 10k ~ 3 GB peak)")
+    ml_parser.add_argument("--lambdas", type=float, nargs="+", default=[200.0, 500.0, 1000.0, 3000.0],
+                           help="EASE regularization values to compare; the best is saved")
+    ml_parser.add_argument("--eval-users", type=int, default=2000, help="Held-out MovieLens users to score")
+    ml_parser.add_argument("--k", type=int, default=20)
+    ml_parser.add_argument("--seed", type=int, default=42)
+    ml_parser.set_defaults(func=cmd_movielens_build)
 
     # Stats command
     stats_parser = subparsers.add_parser("stats", help="Show database statistics")
@@ -2837,13 +3136,50 @@ def main():
     taste_parser.add_argument("--min-films", type=int, default=50, help="Minimum film count for candidate users")
     taste_parser.set_defaults(func=cmd_discover_from_taste)
 
+    crawl_parser = subparsers.add_parser(
+        "crawl", help="Unattended crawl: seed queue, then alternate scraping and refilling")
+    crawl_parser.add_argument("--users", type=int, default=200, help="Stop after scraping this many new users")
+    crawl_parser.add_argument("--seed-film", action="append", metavar="SLUG",
+                              help="Seed from reviewers of this film (repeatable)")
+    crawl_parser.add_argument("--seed-user", action="append", metavar="USER",
+                              help="Seed from this user's followers (repeatable)")
+    crawl_parser.add_argument("--popular", action="store_true", help="Also seed from popular members")
+    crawl_parser.add_argument("--sources-file", help="JSON sources file (see discover-refill); used when no seeds given")
+    crawl_parser.add_argument("--min-films", type=int, default=50, help="Minimum films for activity filter")
+    crawl_parser.add_argument("--refill-below", type=int, default=50, help="Refill when queue drops below this")
+    crawl_parser.add_argument("--queue-target", type=int, default=200, help="Queue size to refill up to")
+    crawl_parser.add_argument("--source-refresh-days", type=int, default=7)
+    crawl_parser.add_argument("--no-expand-graph", dest="expand_graph", action="store_false",
+                              help="Don't fall back to unscraped users from the social graph")
+    crawl_parser.add_argument("--chunk", type=int, default=50, help="Users to scrape between queue checks")
+    crawl_parser.add_argument("--batch", type=int, default=DEFAULT_MAX_PER_BATCH, help="Film metadata batch size")
+    crawl_parser.add_argument("--max-concurrent-users", type=int, default=DEFAULT_MAX_CONCURRENT_USERS)
+    crawl_parser.add_argument("--max-concurrent-requests", type=int, default=DEFAULT_MAX_CONCURRENT)
+    crawl_parser.add_argument("--async-delay", type=float, default=DEFAULT_ASYNC_DELAY)
+    crawl_parser.add_argument("--max-rps", type=float, default=None,
+                              help="Cap on requests started per second (default: $LETTERBOXD_MAX_RPS or 6)")
+    crawl_parser.add_argument("--auto-rps", type=float, default=None, metavar="CEILING",
+                              help="Probe upward from --max-rps toward CEILING req/s, halving on 429/403")
+    crawl_parser.add_argument("--user-delay", type=float, default=0, help="Extra delay between users (seconds)")
+    crawl_parser.add_argument("--no-social", dest="include_social", action="store_false",
+                              help="Skip following/followers per user (default is to scrape them; feeds graph expansion)")
+    crawl_parser.set_defaults(include_social=True, expand_graph=True)
+    crawl_parser.add_argument("--social-limit", type=int, default=200)
+    crawl_parser.add_argument("--claim-ttl-minutes", type=float, default=30,
+                              help="Re-queue users left claimed longer than this by a crashed run (0 = all)")
+    crawl_parser.add_argument("--max-stalls", type=int, default=3,
+                              help="Abort after this many consecutive chunks that scraped nobody")
+    crawl_parser.set_defaults(func=cmd_crawl)
+
     # Session history
     session_parser = subparsers.add_parser("session-history", help="Show scraping session history")
     session_parser.add_argument("--limit", type=int, default=10, help="Number of sessions to display")
     session_parser.set_defaults(func=cmd_session_history)
 
     args = parser.parse_args()
-    
+    if args.backend:
+        set_backend(args.backend)
+
     # Configure logging based on verbosity
     log_level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(
