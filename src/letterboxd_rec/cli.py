@@ -20,6 +20,7 @@ from .database import (
 from .config import (
     DISCOVERY_PRIORITY_MAP,
     SVD_CACHE_PATH,
+    SVD_ITEM_BIAS_REG,
     RUN_VACUUM_ANALYZE_DEFAULT,
     EXPORT_CHUNK_SIZE,
     IMPORT_CHUNK_SIZE,
@@ -1254,7 +1255,7 @@ def _load_recommendation_data(
     """
     all_user_films: dict[str, list[dict]] | None = None
 
-    if strategy in ('hybrid', 'collaborative', 'svd'):
+    if strategy in ('hybrid', 'collaborative', 'svd', 'ease'):
         all_user_films = _load_all_user_films(conn)
         user_films = all_user_films.get(username, [])
     else:
@@ -1270,7 +1271,7 @@ def _load_recommendation_data(
         min_rating=args.min_rating
     )
 
-    if strategy in ('hybrid', 'collaborative', 'graph', 'svd'):
+    if strategy in ('hybrid', 'collaborative', 'graph', 'svd', 'ease'):
         all_films = {r['slug']: dict(r) for r in conn.execute("SELECT * FROM films")}
     else:
         all_films = all_films_filtered
@@ -1517,6 +1518,7 @@ def _run_svd_strategy(
             "n_factors": n_factors,
             "use_implicit": use_implicit,
             "implicit_weight": implicit_weight,
+            "item_bias_reg": SVD_ITEM_BIAS_REG,
         },
     )
     svd = SVDRecommender.load(cache_path, expected_fingerprint=fingerprint)
@@ -1586,6 +1588,90 @@ def _run_svd_strategy(
         if len(recs) >= args.limit:
             break
 
+    return recs
+
+
+def _passes_cli_filters(film: dict, args: argparse.Namespace) -> bool:
+    """Year / genre / average-rating filters from the recommend command line."""
+    year = film.get('year')
+    if args.min_year and year and year < args.min_year:
+        return False
+    if args.max_year and year and year > args.max_year:
+        return False
+    film_genres = load_json(film.get('genres', []))
+    if args.genres and not any(g.lower() in film_genres for g in args.genres):
+        return False
+    if args.exclude_genres and any(g.lower() in film_genres for g in args.exclude_genres):
+        return False
+    if args.min_rating and film.get('avg_rating') and film['avg_rating'] < args.min_rating:
+        return False
+    return True
+
+
+def _run_ease_strategy(
+    user_films: list[dict],
+    all_films: dict[str, dict],
+    args: argparse.Namespace,
+    username: str,
+    user_lists: list[dict] | None,
+    all_user_films: dict[str, list[dict]] | None,
+) -> list[Recommendation]:
+    """EASE item-item model (closed form, cached per data version)."""
+    from .ease import load_or_fit_ease
+
+    if not all_user_films:
+        logger.error("EASE strategy requires all user data.")
+        return []
+    try:
+        model = load_or_fit_ease(all_user_films)
+    except ValueError as e:
+        logger.error(f"Unable to fit EASE model: {e}")
+        return []
+
+    # Over-fetch so metadata filters still leave enough results
+    ranked = model.recommend(user_films, n=max(args.limit * 10, 200))
+    liked = [f['slug'] for f in user_films if f.get('liked') or (f.get('rating') or 0) >= 4.0]
+    recs: list[Recommendation] = []
+    for slug, score in ranked:
+        film = all_films.get(slug)
+        if not film or not _passes_cli_filters(film, args):
+            continue
+        reasons = []
+        idx = model.item_index.get(slug)
+        if idx is not None and liked:
+            # Films the user liked that push this one up the most
+            contrib = [(model.B[model.item_index[s], idx], s) for s in liked if s in model.item_index]
+            for weight, src in sorted(contrib, reverse=True)[:2]:
+                if weight > 0:
+                    title = all_films.get(src, {}).get('title', src)
+                    reasons.append(f"Because you liked {title}")
+        recs.append(Recommendation(slug=slug, title=film.get('title', slug), year=film.get('year'),
+                                   score=score, reasons=reasons))
+        if len(recs) >= args.limit:
+            break
+    return recs
+
+
+def _run_content_strategy(
+    user_films: list[dict],
+    all_films: dict[str, dict],
+    args: argparse.Namespace,
+    username: str,
+    user_lists: list[dict] | None,
+    all_user_films: dict[str, list[dict]] | None = None,
+) -> list[Recommendation]:
+    """Vectorized IDF-weighted content similarity (fast metadata alternative)."""
+    from .content import ContentRecommender
+
+    candidates = {s: f for s, f in all_films.items() if _passes_cli_filters(f, args)}
+    model = ContentRecommender(candidates)
+    recs = []
+    for slug, score in model.recommend(user_films, n=args.limit):
+        film = candidates[slug]
+        recs.append(Recommendation(
+            slug=slug, title=film.get('title', slug), year=film.get('year'), score=score,
+            reasons=model.top_shared_features(user_films, slug),
+        ))
     return recs
 
 
@@ -1864,6 +1950,8 @@ def cmd_recommend(args: argparse.Namespace) -> None:
         'hybrid': _run_hybrid_strategy,
         'svd': _run_svd_strategy,
         'graph': _run_graph_strategy,
+        'ease': _run_ease_strategy,
+        'content': _run_content_strategy,
     }
 
     handler = strategy_handlers[strategy]
@@ -2524,7 +2612,7 @@ def main():
     # Recommend command
     rec_parser = subparsers.add_parser("recommend", help="Generate recommendations")
     rec_parser.add_argument("username", help="Letterboxd username")
-    rec_parser.add_argument("--strategy", choices=['metadata', 'collaborative', 'hybrid', 'svd', 'graph'],
+    rec_parser.add_argument("--strategy", choices=['metadata', 'collaborative', 'hybrid', 'svd', 'graph', 'ease', 'content'],
                             default='metadata', help="Recommendation strategy")
     rec_parser.add_argument("--limit", type=int, default=20, help="Number of recommendations")
     rec_parser.add_argument("--min-year", type=int, help="Minimum release year")
@@ -2613,7 +2701,7 @@ def main():
     )
     eval_parser.add_argument(
         "--strategies", nargs="+",
-        choices=["popularity", "svd", "collaborative", "metadata", "hybrid"],
+        choices=["popularity", "svd", "collaborative", "metadata", "hybrid", "ease", "content"],
         help="Strategies to compare (default: all; the popularity baseline is always included)",
     )
     eval_parser.add_argument("--k", type=int, default=20, help="Cutoff for recall@k / NDCG@k")

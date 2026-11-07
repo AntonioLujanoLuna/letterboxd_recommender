@@ -142,7 +142,7 @@ python main.py recommend USERNAME [options]
 ```
 
 **Options:**
-- `--strategy {metadata,collaborative,hybrid}`: Algorithm to use (default: metadata)
+- `--strategy {metadata,collaborative,hybrid,svd,graph,ease,content}`: Algorithm to use (default: metadata)
 - `--limit N`: Number of recommendations (default: 20)
 - `--min-year YEAR`: Filter by minimum release year
 - `--max-year YEAR`: Filter by maximum release year
@@ -164,6 +164,9 @@ python main.py recommend your_username --genres Horror --min-rating 3.5 --divers
 
 # Collaborative recommendations (needs other users scraped)
 python main.py recommend your_username --strategy collaborative
+
+# EASE item-item model (strongest in offline evaluation; needs other users scraped)
+python main.py recommend your_username --strategy ease
 
 # Hybrid approach (best of both worlds)
 python main.py recommend your_username --strategy hybrid --limit 30
@@ -322,6 +325,27 @@ Combines both strategies using normalized score merging. Provides balanced recom
 - You have 50+ other users scraped
 - You want diverse recommendations
 - You have both strong preferences and openness to discovery
+
+### EASE
+A closed-form item-item model (Steck, 2019). It learns, from everyone's watch/rating/like
+history, how much each film "predicts" each other film. Fitting is one matrix inverse
+(seconds), and the model is cached until the data changes. Explanations name the films you
+liked that contributed most.
+
+**Requirements:** other users scraped. Only films with 5+ interactions (`EASE_MIN_INTERACTIONS`)
+and at most 8k films (`EASE_MAX_ITEMS`) are modelled. Tune regularization with
+`LETTERBOXD_EASE_LAMBDA` and compare runs with `evaluate`.
+
+### Content
+A fast, vectorized alternative to the metadata strategy: films become IDF-weighted feature
+vectors (directors, genres, themes, cast, crew, countries, decade), your taste is the
+rating-weighted sum of the films you've seen, and every film is scored in one sparse
+matrix product. Works with only your own data.
+
+### SVD
+Truncated SVD on star ratings with damped film biases (`LETTERBOXD_SVD_ITEM_BIAS_REG`).
+Predicting star ratings is a weaker objective for picking a top-N list than EASE's;
+check `evaluate` before relying on it.
 
 ## How Scoring Works
 

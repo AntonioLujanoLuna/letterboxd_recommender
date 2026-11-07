@@ -210,3 +210,17 @@ def test_async_scraper_delay_recovers_after_backoff():
         scraper._decay_delay()
     assert scraper.delay == pytest.approx(0.2, abs=0.01)
     assert scraper.delay >= 0.2
+
+
+def test_svd_item_bias_shrinkage_demotes_single_rating_films():
+    # "classic" is rated 4.5 by ten users; "obscure" got one 5-star rating
+    data = {f"u{i}": [{"slug": "classic", "rating": 4.5}, {"slug": "filler", "rating": 3.0}] for i in range(10)}
+    data["u0"].append({"slug": "obscure", "rating": 5.0})
+    data["target"] = [{"slug": "filler", "rating": 3.0}]
+
+    undamped = SVDRecommender(n_factors=1, item_bias_reg=0).fit(data)
+    damped = SVDRecommender(n_factors=1, item_bias_reg=25).fit(data)
+    idx = damped.item_index
+    assert undamped.item_biases[idx["obscure"]] > undamped.item_biases[idx["classic"]]
+    assert damped.item_biases[idx["classic"]] > damped.item_biases[idx["obscure"]]
+    assert damped.recommend("target", {"filler"}, n=1)[0][0] == "classic"

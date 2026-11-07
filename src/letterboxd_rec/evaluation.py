@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 POSITIVE_RATING_THRESHOLD = 3.5
 
 # The graph strategy builds from the live database, so held-out films would leak into it.
-EVALUABLE_STRATEGIES = ("popularity", "svd", "collaborative", "metadata", "hybrid")
+EVALUABLE_STRATEGIES = ("popularity", "svd", "collaborative", "metadata", "hybrid", "ease", "content")
 
 # A recommender function: (username, training films for that user, k) -> ranked slugs
 RecommendFn = Callable[[str, list[dict], int], list[str]]
@@ -203,12 +203,37 @@ def _build_hybrid(train: dict[str, list[dict]], films: dict[str, dict]) -> Recom
     return recommend
 
 
+def _build_ease(train: dict[str, list[dict]], films: dict[str, dict]) -> RecommendFn:
+    from .ease import EASERecommender
+
+    model = EASERecommender().fit(train)
+
+    def recommend(username: str, user_films: list[dict], k: int) -> list[str]:
+        recs = model.recommend(user_films, n=k * 3)
+        return [slug for slug, _ in recs if not films or slug in films][:k]
+
+    return recommend
+
+
+def _build_content(train: dict[str, list[dict]], films: dict[str, dict]) -> RecommendFn:
+    from .content import ContentRecommender
+
+    model = ContentRecommender(films)
+
+    def recommend(username: str, user_films: list[dict], k: int) -> list[str]:
+        return [slug for slug, _ in model.recommend(user_films, n=k)]
+
+    return recommend
+
+
 STRATEGY_BUILDERS: dict[str, Callable[[dict, dict], RecommendFn]] = {
     "popularity": _build_popularity,
     "svd": _build_svd,
     "collaborative": _build_collaborative,
     "metadata": _build_metadata,
     "hybrid": _build_hybrid,
+    "ease": _build_ease,
+    "content": _build_content,
 }
 
 

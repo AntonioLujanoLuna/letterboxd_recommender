@@ -2,7 +2,7 @@ import json
 import logging
 from datetime import datetime
 from pathlib import Path
-from .config import SVD_CACHE_PATH, SVD_IMPLICIT_RESIDUALS
+from .config import SVD_CACHE_PATH, SVD_IMPLICIT_RESIDUALS, SVD_ITEM_BIAS_REG
 from .data_version import interactions_digest
 
 import numpy as np
@@ -24,8 +24,15 @@ class SVDRecommender:
     - Σ captures factor importance
     """
     
-    def __init__(self, n_factors: int = 50, use_implicit: bool = True, implicit_weight: float = 1.0):
+    def __init__(
+        self,
+        n_factors: int = 50,
+        use_implicit: bool = True,
+        implicit_weight: float = 1.0,
+        item_bias_reg: float = SVD_ITEM_BIAS_REG,
+    ):
         self.n_factors = n_factors
+        self.item_bias_reg = item_bias_reg
         self.use_implicit = use_implicit
         self.implicit_weight = implicit_weight
         self.user_factors = None
@@ -122,11 +129,14 @@ class SVDRecommender:
             user_sums, user_counts, out=np.full(n_users, self.global_mean), where=user_counts > 0
         ) - self.global_mean
 
+        # Film biases: what's left after the user's bias, shrunk toward 0 for films with
+        # few ratings (one 5-star rating must not outrank a consensus classic)
         item_counts = np.bincount(cols_e, minlength=n_items).astype(np.float64)
-        item_sums = np.bincount(cols_e, weights=vals_e, minlength=n_items)
-        self.item_biases = np.divide(
-            item_sums, item_counts, out=np.full(n_items, self.global_mean), where=item_counts > 0
-        ) - self.global_mean
+        item_resid = np.bincount(
+            cols_e, weights=vals_e - self.global_mean - self.user_biases[rows_e], minlength=n_items
+        )
+        denom = item_counts + self.item_bias_reg
+        self.item_biases = np.divide(item_resid, denom, out=np.zeros(n_items), where=denom > 0)
 
         # Residual matrix: explicit ratings minus baseline, implicit signals as positive residuals
         explicit_resid = vals_e - (self.global_mean + self.user_biases[rows_e] + self.item_biases[cols_e])
@@ -164,6 +174,7 @@ class SVDRecommender:
             "n_factors": self.n_factors,
             "use_implicit": self.use_implicit,
             "implicit_weight": self.implicit_weight,
+            "item_bias_reg": self.item_bias_reg,
         }
         
         logger.info(f"Fitted SVD with {k} factors on {n_users} users × {n_items} items")

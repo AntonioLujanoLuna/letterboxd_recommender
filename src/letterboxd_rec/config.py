@@ -287,6 +287,43 @@ SVD_IMPLICIT_RESIDUALS = {
     "watchlisted": 0.25,
 }
 
+# Damping for SVD film biases: bias = sum(residuals) / (n_ratings + SVD_ITEM_BIAS_REG).
+# Without it, a film with a single 5-star rating gets a +1.5 bias and tops every list
+# (offline eval on synthetic data: NDCG@20 0.006 with no damping, 0.046 at 25, 0.085 at 100).
+SVD_ITEM_BIAS_REG = _get_float_env("LETTERBOXD_SVD_ITEM_BIAS_REG", 50.0, min_val=0.0)
+
+# EASE (closed-form item-item model, Steck 2019). Tune with `evaluate`, e.g.
+# LETTERBOXD_EASE_LAMBDA=50 / 200 / 800 python main.py evaluate --strategies ease
+EASE_CACHE_PATH = Path("data/ease_model.npz")
+EASE_LAMBDA = _get_float_env("LETTERBOXD_EASE_LAMBDA", 200.0, min_val=0.0)
+EASE_MIN_INTERACTIONS = _get_int_env("LETTERBOXD_EASE_MIN_INTERACTIONS", 5, min_val=1)
+# Model is a dense items x items matrix: 8k items ~ 0.5 GB of float64 during the inverse
+EASE_MAX_ITEMS = _get_int_env("LETTERBOXD_EASE_MAX_ITEMS", 8_000, min_val=2)
+# Interaction strength in the user x item matrix (a rating overrides the watched flag)
+EASE_WEIGHTS = {
+    "liked": 1.0,
+    "rating_high": 1.0,    # >= 3.5 stars
+    "rating_mid": 0.5,     # 2.5 - 3 stars
+    "rating_low": 0.0,     # < 2.5 stars: watched it, but not a vote for similar films
+    "watched": 0.5,        # watched, unrated
+    "watchlisted": 0.25,
+}
+
+# Vectorized content strategy: per-field weights for the IDF-weighted film x feature matrix
+CONTENT_FIELD_WEIGHTS = {
+    "directors": 1.0,
+    "genres": 0.6,
+    "themes": 0.8,
+    "cast": 0.5,
+    "writers": 0.6,
+    "countries": 0.3,
+    "languages": 0.3,
+    "cinematographers": 0.4,
+    "composers": 0.4,
+    "decade": 0.4,
+}
+CONTENT_MAX_CAST = 8  # billed cast beyond this adds noise
+
 # Migrations
 MIGRATIONS_PATH = Path("src/letterboxd_rec/migrations")
 MIGRATION_VERSION_TABLE = "schema_migrations"
