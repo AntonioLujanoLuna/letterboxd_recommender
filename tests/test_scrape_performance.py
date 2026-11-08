@@ -856,3 +856,76 @@ def test_apply_sparse_popularity_respects_filters():
     args.min_year = 1990
     slugs = [r.slug for r in apply_sparse_popularity(recs, user, films, others, args)]
     assert "pop1" not in slugs
+
+
+# --- actors / directors / decade / filter-before-ranking -------------------------------
+
+def _filter_ns(**kw):
+    import argparse
+
+    base = dict(min_year=None, max_year=None, genres=None, exclude_genres=None, min_rating=None,
+                min_runtime=None, max_runtime=None, exclude_shorts=False, exclude_animation=False,
+                countries=None, languages=None, actors=None, directors=None)
+    base.update(kw)
+    return argparse.Namespace(**base)
+
+
+def test_actor_and_director_filters_match_case_insensitively_and_exclude_unknown_cast():
+    from letterboxd_rec.cli.utils.strategies import _passes_cli_filters, filters_active
+
+    film = {"year": 1995, "genres": "[]", "cast": '["Al Pacino", "Robert De Niro"]', "directors": '["Michael Mann"]'}
+    assert _passes_cli_filters(film, _filter_ns(actors=["al pacino"]))
+    assert _passes_cli_filters(film, _filter_ns(actors=["Nobody", "ROBERT DE NIRO"]))   # any of them
+    assert not _passes_cli_filters(film, _filter_ns(actors=["Tom Hanks"]))
+    assert _passes_cli_filters(film, _filter_ns(directors=["michael mann"]))
+    assert not _passes_cli_filters(film, _filter_ns(directors=["Christopher Nolan"]))
+    # unlike other filters, an actor/director filter drops films whose cast is unknown: it is a "must star"
+    assert not _passes_cli_filters({"year": 1995, "genres": "[]"}, _filter_ns(actors=["Al Pacino"]))
+    assert filters_active(_filter_ns(actors=["x"])) and filters_active(_filter_ns(min_year=1990))
+    assert not filters_active(_filter_ns())
+
+
+def test_decade_sets_the_year_range_and_rejects_bad_values():
+    import argparse
+    from letterboxd_rec.cli.commands.recommend import apply_decade
+
+    for text, lo, hi in (("1990", 1990, 1999), ("1990s", 1990, 1999), ("2020S", 2020, 2029)):
+        a = argparse.Namespace(decade=text, min_year=None, max_year=None)
+        assert apply_decade(a) and (a.min_year, a.max_year) == (lo, hi)
+    a = argparse.Namespace(decade="1990s", min_year=1993, max_year=2005)   # intersects explicit years
+    assert apply_decade(a) and (a.min_year, a.max_year) == (1993, 1999)
+    for bad in ("1995", "90s", "nineties", "19900"):
+        assert not apply_decade(argparse.Namespace(decade=bad, min_year=None, max_year=None))
+    assert apply_decade(argparse.Namespace(decade=None, min_year=None, max_year=None))
+
+
+def test_ease_ranks_only_allowed_films_so_narrow_filters_still_fill_the_list():
+    import numpy as np
+    from letterboxd_rec.ease import EASERecommender
+
+    model = EASERecommender()
+    slugs = [f"f{i}" for i in range(40)]
+    model.item_slugs, model.item_index = slugs, {s: i for i, s in enumerate(slugs)}
+    model.B = np.zeros((40, 40), dtype=np.float32)
+    model.B[0, [1, 2, 3, 7, 8, 9]] = [3.0, 2.0, 1.0, 0.3, 0.2, 0.1]  # f1-f3 lead; the allowed f7-f9 trail
+    model.item_counts = np.ones(40)
+    history = [{"slug": "f0", "liked": 1}]
+
+    narrow = {"f7", "f8", "f9"}       # not in the unrestricted top 3
+    unrestricted = [s for s, _ in model.recommend(history, n=3)]
+    assert not (set(unrestricted) & narrow)
+    restricted = [s for s, _ in model.recommend(history, n=3, allowed=narrow)]
+    assert set(restricted) == narrow  # filled entirely from the allowed set
+    assert "f0" not in [s for s, _ in model.recommend(history, n=5, allowed={"f0", "f1"})]  # seen stays blocked
+
+
+def test_movielens_recommend_columns_honours_allowed_cols():
+    import numpy as np
+    from letterboxd_rec.movielens import MovieLensModel
+
+    B = np.zeros((4, 4), dtype=np.float32)
+    B[0, 1], B[0, 2], B[0, 3] = 1.0, 0.8, 0.1
+    model = MovieLensModel(B=B, movie_ids=np.arange(4), titles=list("abcd"), years=[None] * 4,
+                           tmdb_ids=[None] * 4, imdb_ids=[None] * 4, popularity=np.ones(4))
+    assert [c for c, _ in model.recommend_columns({0: 1.0}, {0}, n=2)] == [1, 2]
+    assert [c for c, _ in model.recommend_columns({0: 1.0}, {0}, n=2, allowed_cols={3})] == [3]

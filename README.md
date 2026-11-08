@@ -221,6 +221,7 @@ python main.py recommend USERNAME [options]
 **Options:**
 - `--strategy {metadata,collaborative,svd,graph,ease,content,movielens,blend}`: Algorithm to use (default: `blend` when the MovieLens model is built and the database holds 20+ users, `ease` without the model, `metadata` with too few users)
 - `--limit N`: Number of recommendations (default: 20)
+- `--decade 1990s`: A decade (shortcut for `--min-year 1990 --max-year 1999`; `1990` works too)
 - `--min-year YEAR`: Filter by minimum release year
 - `--max-year YEAR`: Filter by maximum release year
 - `--genres GENRE [GENRE ...]`: Only include these genres
@@ -229,10 +230,23 @@ python main.py recommend USERNAME [options]
 - `--min-runtime MIN` / `--max-runtime MIN`: Runtime range in minutes
 - `--exclude-shorts` / `--exclude-animation`: Leave out short or animated films
 - `--countries C [C ...]` / `--languages L [L ...]`: Only films from these countries / in these languages
+- `--actors NAME [NAME ...]` / `--directors NAME [NAME ...]`: Only films starring any of these actors (top-billed
+  cast, about ten names per film) or directed by any of these directors; names are case-insensitive
 
 The year, genre, rating, runtime, short/animation, country and language filters all apply to the
 `ease`, `movielens`, `blend` and `svd` strategies (the other strategies ignore the newer ones and say so).
-A film missing a field is never excluded by a filter on that field.
+A film missing a field is never excluded by a filter on that field, except `--actors` and `--directors`,
+which mean "must star / must be directed by" and so drop films whose cast or director is unknown.
+
+For `ease`, `blend` and `movielens` the filters restrict the ranking *before* the top results are
+taken, so a narrow combination (one actor, or 1950s Japan without animation) still returns a full list
+whenever enough matching films exist. If fewer than `--limit` come back, the command says so.
+
+```bash
+python main.py recommend you --decade 1990s --countries Japan
+python main.py recommend you --actors "Tom Hanks" --limit 10
+python main.py recommend you --directors "Christopher Nolan" "Denis Villeneuve"
+```
 
 **Short histories:** with fewer than about 50 films in a user's history, `ease` and `blend` mix
 popular films into the list (by rank; 75% popularity up to 20 films, fading linearly to 0 at 50),

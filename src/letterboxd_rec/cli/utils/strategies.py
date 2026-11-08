@@ -264,9 +264,25 @@ def _run_movielens_strategy(
     needs_metadata = _needs_metadata(args)
     liked_cols = [c for c, w in sorted(weighted.items(), key=lambda kv: -kv[1]) if w >= 1.0]
 
+    allowed_cols = None
+    if filters_active(args):
+        allowed_cols = set()
+        for col in range(model.n_items):
+            slug = col_to_slug.get(col)
+            film = all_films.get(slug) if slug else None
+            if film:
+                if _passes_cli_filters(film, args):
+                    allowed_cols.add(col)
+            elif not needs_metadata and model.tmdb_ids[col]:
+                year = model.years[col]
+                if not ((args.min_year and year and year < args.min_year)
+                        or (args.max_year and year and year > args.max_year)):
+                    allowed_cols.add(col)
+
     recs: list[Recommendation] = []
     novelty = getattr(args, 'novelty', 0.0) or 0.0
-    for col, score in model.recommend_columns(weighted, seen, n=max(args.limit * 20, 300), novelty=novelty):
+    for col, score in model.recommend_columns(weighted, seen, n=max(args.limit * 20, 300), novelty=novelty,
+                                              allowed_cols=allowed_cols):
         slug = col_to_slug.get(col)
         year = model.years[col]
         if slug and slug in all_films:
@@ -394,7 +410,20 @@ def _needs_metadata(args: argparse.Namespace) -> bool:
         or getattr(args, 'min_runtime', None) or getattr(args, 'max_runtime', None)
         or getattr(args, 'exclude_shorts', False) or getattr(args, 'exclude_animation', False)
         or getattr(args, 'countries', None) or getattr(args, 'languages', None)
+        or getattr(args, 'actors', None) or getattr(args, 'directors', None)
     )
+
+
+def filters_active(args: argparse.Namespace) -> bool:
+    """True when any recommend filter is set (so rankings should be restricted before the top-n)."""
+    return bool(getattr(args, 'min_year', None) or getattr(args, 'max_year', None)) or _needs_metadata(args)
+
+
+def _allowed_slugs(all_films: dict[str, dict], args: argparse.Namespace) -> set[str] | None:
+    """Slugs that pass every filter, or None when no filter is set."""
+    if not filters_active(args):
+        return None
+    return {slug for slug, film in all_films.items() if _passes_cli_filters(film, args)}
 
 
 def _any_in(wanted: list[str], available) -> bool:
@@ -429,6 +458,14 @@ def _passes_cli_filters(film: dict, args: argparse.Namespace) -> bool:
         return False
     if g('exclude_animation') and film.get('is_animation'):
         return False
+    if g('actors'):
+        cast = load_json(film.get('cast', []))
+        if not _any_in(g('actors'), cast):  # an actor filter excludes films whose cast we don't know
+            return False
+    if g('directors'):
+        directors = load_json(film.get('directors', []))
+        if not _any_in(g('directors'), directors):
+            return False
     if g('countries'):
         countries = load_json(film.get('countries', []))
         if countries and not _any_in(g('countries'), countries):
@@ -460,8 +497,9 @@ def _run_ease_strategy(
         logger.error(f"Unable to fit EASE model: {e}")
         return []
 
-    # Over-fetch so metadata filters still leave enough results
-    ranked = model.recommend(user_films, n=max(args.limit * 10, 200), novelty=getattr(args, 'novelty', 0.0) or 0.0)
+    # Filters restrict the ranking itself; the over-fetch only covers films that fail the post-check
+    ranked = model.recommend(user_films, n=max(args.limit * 10, 200), novelty=getattr(args, 'novelty', 0.0) or 0.0,
+                             allowed=_allowed_slugs(all_films, args))
     liked = [f['slug'] for f in user_films if f.get('liked') or (f.get('rating') or 0) >= 4.0]
     recs: list[Recommendation] = []
     for slug, score in ranked:

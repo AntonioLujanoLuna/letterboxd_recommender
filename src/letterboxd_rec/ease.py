@@ -161,8 +161,13 @@ class EASERecommender:
         n: int = 20,
         exclude: set[str] | None = None,
         novelty: float = 0.0,
+        allowed: set[str] | None = None,
     ) -> list[tuple[str, float]]:
         """Top-n (slug, score), skipping everything in the user's history and `exclude`.
+
+        `allowed`, when given, restricts the ranking to those slugs *before* the top-n is taken, so a
+        narrow filter (one actor, one country and decade) still fills the list instead of being
+        applied to a fixed shortlist that may contain none of them.
 
         `novelty` (0..1) divides each positive score by popularity**novelty, trading accuracy for
         less mainstream picks. Offline (150 users): 0.3 cost ~1 point of recall@20 for ~10x the
@@ -179,6 +184,13 @@ class EASERecommender:
             idx = self.item_index.get(slug)
             if idx is not None:
                 scores[idx] = -np.inf
+        if allowed is not None:
+            keep = np.zeros(len(scores), dtype=bool)
+            for slug in allowed:
+                idx = self.item_index.get(slug)
+                if idx is not None:
+                    keep[idx] = True
+            scores[~keep] = -np.inf
         k = min(n, len(scores))
         if k <= 0:
             return []

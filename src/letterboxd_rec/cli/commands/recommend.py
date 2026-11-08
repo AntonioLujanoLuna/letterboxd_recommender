@@ -27,6 +27,7 @@ from ..utils.strategies import (
     _run_movielens_strategy,
     _run_blend_strategy,
     apply_sparse_popularity,
+    filters_active,
 )
 from ...recommenders.fusion import sparse_popularity_weight
 from ..utils.output import _output_recommendations
@@ -64,7 +65,26 @@ def _uses_extended_filters(args: argparse.Namespace) -> bool:
         getattr(args, 'min_runtime', None) or getattr(args, 'max_runtime', None)
         or getattr(args, 'exclude_shorts', False) or getattr(args, 'exclude_animation', False)
         or getattr(args, 'countries', None) or getattr(args, 'languages', None)
+        or getattr(args, 'actors', None) or getattr(args, 'directors', None)
     )
+
+
+def apply_decade(args: argparse.Namespace) -> bool:
+    """Turn --decade (1990 or 1990s) into min/max year, intersected with any explicit years.
+
+    Returns False (after logging why) if the value isn't a decade.
+    """
+    decade = getattr(args, 'decade', None)
+    if not decade:
+        return True
+    text = str(decade).strip().lower().rstrip('s')
+    if not (text.isdigit() and len(text) == 4 and int(text) % 10 == 0):
+        logger.error(f"--decade must be a year ending in 0, like 1990 or 1990s (got {decade!r})")
+        return False
+    start = int(text)
+    args.min_year = max(args.min_year or start, start)
+    args.max_year = min(args.max_year or start + 9, start + 9)
+    return True
 
 
 def cmd_recommend(args: argparse.Namespace) -> None:
@@ -73,6 +93,8 @@ def cmd_recommend(args: argparse.Namespace) -> None:
     novelty = getattr(args, 'novelty', 0.0) or 0.0
     if not 0.0 <= novelty <= 1.0:
         logger.error(f"--novelty must be between 0 and 1 (got {novelty})")
+        return
+    if not apply_decade(args):
         return
     strategy = getattr(args, 'strategy', None)
     if strategy is None:
@@ -118,6 +140,10 @@ def cmd_recommend(args: argparse.Namespace) -> None:
     recs = handler(user_films, all_films, run_args, username, user_lists, all_user_films)
     if sparse:
         recs = apply_sparse_popularity(recs, user_films, all_films, all_user_films, args)
+
+    if len(recs) < args.limit and filters_active(args):
+        logger.warning(f"Only {len(recs)} of the {args.limit} requested films match your filters "
+                       f"(among the films in the database the model can score); loosen a filter or crawl more films.")
 
     # Build recommender and profile for explanations if needed
     recommender = None

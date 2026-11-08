@@ -196,7 +196,8 @@ class MovieLensModel:
         return x @ self.B
 
     def recommend_columns(
-        self, weighted_cols: dict[int, float], seen_cols: set[int], n: int, novelty: float = 0.0
+        self, weighted_cols: dict[int, float], seen_cols: set[int], n: int, novelty: float = 0.0,
+        allowed_cols: set[int] | None = None,
     ) -> list[tuple[int, float]]:
         """Top-n unseen columns. `novelty` in [0, 1] divides positive scores by popularity**novelty
         (same damping as EASERecommender.recommend), so niche films can outrank blockbusters."""
@@ -208,6 +209,10 @@ class MovieLensModel:
             scores[positive] = scores[positive] / np.maximum(self.popularity[positive], 1) ** novelty
         if seen_cols:
             scores[list(seen_cols)] = -np.inf
+        if allowed_cols is not None:  # rank only these columns (filters applied before the top-n)
+            keep = np.zeros(self.n_items, dtype=bool)
+            keep[list(allowed_cols)] = True
+            scores[~keep] = -np.inf
         k = min(n, self.n_items)
         top = np.argpartition(-scores, k - 1)[:k]
         top = top[np.argsort(-scores[top], kind="stable")]
