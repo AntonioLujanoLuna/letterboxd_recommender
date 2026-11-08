@@ -100,6 +100,8 @@ def _run_hybrid_strategy(
     if not all_user_films:
         logger.error("Hybrid strategy requires all user data.")
         return []
+    logger.warning("The hybrid strategy scored below popularity offline (recall@20 0.09 vs 0.21 and "
+                   "the slowest strategy); 'blend' or 'ease' are much stronger (see README).")
 
     meta_rec = MetadataRecommender(list(all_films.values()))
     collab_rec = CollaborativeRecommender(all_user_films, all_films)

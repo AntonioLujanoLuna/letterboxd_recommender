@@ -257,7 +257,7 @@ python main.py recommend your_username --strategy blend
 python main.py recommend your_username --strategy ease --novelty 0.3
 
 # Hybrid approach (best of both worlds)
-python main.py recommend your_username --strategy hybrid --limit 30
+python main.py recommend your_username --strategy hybrid --limit 30  # legacy: weaker than ease/blend offline
 
 # Without temporal decay (treat all ratings equally)
 python main.py recommend your_username --no-temporal-decay
@@ -538,7 +538,7 @@ For deeper customization, edit `src/letterboxd_rec/config.py`:
 3. **Use diversity mode** if recommendations cluster too heavily on one director
 4. **Rebuild IDF** periodically as your database grows
 5. **Export regularly** to backup your scraped data
-6. **Try hybrid strategy** once you have 50+ other users for balanced recommendations
+6. **Use the default (`blend`/`ease`)** once you have 50+ other users; the older `hybrid` strategy scored below popularity offline
 7. **Use triage** to prioritize your ever-growing watchlist
 8. **Check gaps** to complete filmographies of directors you love
 

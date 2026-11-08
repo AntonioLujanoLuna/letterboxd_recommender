@@ -214,19 +214,23 @@ def cmd_scrape_social(args: argparse.Namespace) -> None:
     try:
         total_saved = 0
 
-        if args.following or args.both:
-            logger.info(f"Scraping who {username} follows...")
-            following = scraper.scrape_following(username, limit=args.limit)
-            saved = save_user_follows(username, following)
-            logger.info(f"  Saved {saved} following relationships")
-            total_saved += saved
+        try:
+            if args.following or args.both:
+                logger.info(f"Scraping who {username} follows...")
+                following = scraper.scrape_following(username, limit=args.limit)
+                saved = save_user_follows(username, following)
+                logger.info(f"  Saved {saved} following relationships")
+                total_saved += saved
 
-        if args.followers or args.both:
-            logger.info(f"Scraping who follows {username}...")
-            followers = scraper.scrape_followers(username, limit=args.limit)
-            saved = save_user_followers(username, followers)
-            logger.info(f"  Saved {saved} follower relationships")
-            total_saved += saved
+            if args.followers or args.both:
+                logger.info(f"Scraping who follows {username}...")
+                followers = scraper.scrape_followers(username, limit=args.limit)
+                saved = save_user_followers(username, followers)
+                logger.info(f"  Saved {saved} follower relationships")
+                total_saved += saved
+        except ScrapeIncompleteError as e:
+            logger.error(f"{e} Nothing was saved for the failed direction; rerun later.")
+            return
 
         logger.info(f"\nTotal: {total_saved} social edges saved")
 
@@ -248,24 +252,25 @@ def cmd_backfill_social(args: argparse.Namespace) -> None:
     cli.init_db()
 
     with cli.get_db(read_only=True) as conn:
-        users_with_social: set[str] = set()
-        for row in conn.execute("SELECT DISTINCT follower FROM user_follows"):
-            users_with_social.add(row["follower"])
-        for row in conn.execute("SELECT DISTINCT followee FROM user_follows"):
-            users_with_social.add(row["followee"])
-
+        has_following = {row["follower"] for row in conn.execute("SELECT DISTINCT follower FROM user_follows")}
+        has_followers = {row["followee"] for row in conn.execute("SELECT DISTINCT followee FROM user_follows")}
         all_users = {row["username"] for row in conn.execute("SELECT DISTINCT username FROM user_films")}
 
-    users_needing_social = all_users - users_with_social
+    # Each direction is checked on its own: a failed followers page used to leave a user with
+    # only half their edges, and "has any edge" hid that.
+    need_following = all_users - has_following
+    need_followers = all_users - has_followers
+    users_needing_social = sorted(need_following | need_followers)
 
     if not users_needing_social:
         logger.info("All users already have social data")
         return
 
-    logger.info(f"Found {len(users_needing_social)} users without social data")
+    logger.info(f"Found {len(users_needing_social)} users with missing social data "
+                f"({len(need_following)} without following edges, {len(need_followers)} without follower edges)")
 
     if args.dry_run:
-        sample = list(users_needing_social)[:20]
+        sample = users_needing_social[:20]
         for u in sample:
             logger.info(f"  Would scrape: {u}")
         if len(users_needing_social) > len(sample):
@@ -273,17 +278,26 @@ def cmd_backfill_social(args: argparse.Namespace) -> None:
         return
 
     scraper = cli.make_scraper(delay=1.0)
+    failed: list[str] = []
     try:
-        for username in tqdm(list(users_needing_social)[: args.limit], desc="Social"):
-            following = scraper.scrape_following(username, limit=args.social_limit)
-            if following:
-                save_user_follows(username, following)
-
-            followers = scraper.scrape_followers(username, limit=args.social_limit)
-            if followers:
-                save_user_followers(username, followers)
+        for username in tqdm(users_needing_social[: args.limit], desc="Social"):
+            try:
+                if username in need_following:
+                    following = scraper.scrape_following(username, limit=args.social_limit)
+                    if following:
+                        save_user_follows(username, following)
+                if username in need_followers:
+                    followers = scraper.scrape_followers(username, limit=args.social_limit)
+                    if followers:
+                        save_user_followers(username, followers)
+            except ScrapeIncompleteError as e:
+                logger.warning(str(e))
+                failed.append(username)  # nothing partial was saved for that direction; rerun later
     finally:
         scraper.close()
+    if failed:
+        logger.warning(f"{len(failed)} user(s) hit blocked pages and were skipped; rerun backfill-social: "
+                       f"{', '.join(failed[:10])}{' ...' if len(failed) > 10 else ''}")
 
     from ...database import get_social_graph_stats
     stats = get_social_graph_stats()

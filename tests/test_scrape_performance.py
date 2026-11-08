@@ -710,3 +710,57 @@ def test_incomplete_error_names_what_failed(path, word):
 
     msg = str(ScrapeIncompleteError("u", f"https://letterboxd.com/u/{path}/"))
     assert word in msg and "nothing was saved" not in msg
+
+
+# --- backfill-social -----------------------------------------------------------
+
+def test_backfill_social_fills_each_missing_direction_and_survives_blocked_pages(monkeypatch):
+    import argparse
+    import contextlib
+    import sqlite3
+    from letterboxd_rec.cli.commands import scrape as scrape_cmd
+    from letterboxd_rec.scraper import ScrapeIncompleteError
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE user_films (username TEXT, film_slug TEXT)")
+    conn.execute("CREATE TABLE user_follows (follower TEXT, followee TEXT)")
+    conn.executemany("INSERT INTO user_films VALUES (?, 'f')", [("both",), ("half",), ("none",), ("blocked",)])
+    conn.executemany("INSERT INTO user_follows VALUES (?, ?)",
+                     [("both", "x"), ("y", "both"), ("half", "x")])  # `half` lacks followers
+
+    @contextlib.contextmanager
+    def fake_get_db(read_only=False):
+        yield conn
+
+    calls = []
+
+    class FakeScraper:
+        def scrape_following(self, username, limit):
+            calls.append(("following", username))
+            if username == "blocked":
+                raise ScrapeIncompleteError(username, "https://letterboxd.com/blocked/following/page/1/")
+            return ["a"]
+
+        def scrape_followers(self, username, limit):
+            calls.append(("followers", username))
+            return ["b"]
+
+        def close(self):
+            pass
+
+    cli = scrape_cmd._get_cli()
+    monkeypatch.setattr(cli, "init_db", lambda: None)
+    monkeypatch.setattr(cli, "get_db", fake_get_db)
+    monkeypatch.setattr(cli, "make_scraper", lambda delay=1.0: FakeScraper())
+    monkeypatch.setattr(scrape_cmd, "save_user_follows", lambda u, l: None)
+    monkeypatch.setattr(scrape_cmd, "save_user_followers", lambda u, l: None)
+    monkeypatch.setattr("letterboxd_rec.database.get_social_graph_stats",
+                        lambda: {"total_edges": 0, "unique_followers": 0, "unique_followees": 0})
+
+    scrape_cmd.cmd_backfill_social(argparse.Namespace(dry_run=False, limit=100, social_limit=10))
+
+    assert ("followers", "both") not in calls and ("following", "both") not in calls  # complete: untouched
+    assert ("followers", "half") in calls and ("following", "half") not in calls      # only the gap
+    assert ("following", "none") in calls and ("followers", "none") in calls
+    assert ("following", "blocked") in calls and ("followers", "none") in calls        # failure did not stop the run
