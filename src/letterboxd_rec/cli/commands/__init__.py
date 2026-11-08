@@ -12,6 +12,11 @@ from .discover import (
     cmd_discover_from_taste,
     cmd_crawl,
 )
+from .ops import (
+    cmd_backup,
+    cmd_supervise,
+    cmd_doctor,
+)
 from .recommend import (
     cmd_recommend,
     cmd_similar_users,
@@ -57,6 +62,9 @@ __all__ = [
     'cmd_similar_users',
     'cmd_jam',
     # Data commands
+    'cmd_backup',
+    'cmd_supervise',
+    'cmd_doctor',
     'cmd_stats',
     'cmd_export',
     'cmd_import',

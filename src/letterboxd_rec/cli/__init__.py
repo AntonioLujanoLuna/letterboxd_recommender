@@ -38,6 +38,9 @@ from .commands import (
     cmd_scrape_social,
     cmd_backfill_social,
     cmd_scrape_daemon,
+    cmd_backup,
+    cmd_supervise,
+    cmd_doctor,
     cmd_discover,
     cmd_discover_refill,
     cmd_discover_from_taste,
@@ -82,7 +85,6 @@ from .utils import (
     _scrape_users_parallel,
     _run_metadata_strategy,
     _run_collaborative_strategy,
-    _run_hybrid_strategy,
     _run_graph_strategy,
     _run_svd_strategy,
     _output_recommendations,
@@ -272,7 +274,7 @@ def main():
     rec_parser.add_argument("--novelty", type=float, default=0.0, metavar="0-1",
                             help="ease strategy: favor less mainstream films (0 = off; 0.3 is mild, 0.5 strong; "
                                  "costs some accuracy, see README)")
-    rec_parser.add_argument("--strategy", choices=['metadata', 'collaborative', 'hybrid', 'svd', 'graph', 'ease', 'content', 'movielens', 'blend'],
+    rec_parser.add_argument("--strategy", choices=['metadata', 'collaborative', 'svd', 'graph', 'ease', 'content', 'movielens', 'blend'],
                             default=None,
                             help="Recommendation strategy (default: blend when the MovieLens model is built, "
                                  "else ease when the database has enough users, else metadata)")
@@ -281,7 +283,13 @@ def main():
     rec_parser.add_argument("--max-year", type=int, help="Maximum release year")
     rec_parser.add_argument("--genres", nargs="+", help="Filter by genres")
     rec_parser.add_argument("--exclude-genres", nargs="+", help="Exclude genres")
-    rec_parser.add_argument("--min-rating", type=float, help="Minimum community rating (metadata only)")
+    rec_parser.add_argument("--min-rating", type=float, help="Minimum community rating")
+    rec_parser.add_argument("--min-runtime", type=int, metavar="MIN", help="Minimum runtime in minutes")
+    rec_parser.add_argument("--max-runtime", type=int, metavar="MIN", help="Maximum runtime in minutes")
+    rec_parser.add_argument("--exclude-shorts", action="store_true", help="Leave out short films")
+    rec_parser.add_argument("--exclude-animation", action="store_true", help="Leave out animated films")
+    rec_parser.add_argument("--countries", nargs="+", help="Only films from these countries (e.g. Japan 'South Korea')")
+    rec_parser.add_argument("--languages", nargs="+", help="Only films in these languages (e.g. Japanese French)")
     rec_parser.add_argument("--diversity", action="store_true", help="Enable diversity mode (metadata only)")
     rec_parser.add_argument("--max-per-director", type=int, default=2, help="Max films per director (diversity mode)")
     rec_parser.add_argument("--no-temporal-decay", action="store_true",
@@ -292,9 +300,6 @@ def main():
         default="absolute",
         help="Scoring weights: absolute (default), normalized (per-user z-score), or blended",
     )
-    rec_parser.add_argument("--hybrid-meta-weight", type=float, help="Weight for metadata component in hybrid fusion")
-    rec_parser.add_argument("--hybrid-collab-weight", type=float, help="Weight for collaborative component in hybrid fusion")
-    rec_parser.add_argument("--hybrid-diversity", action="store_true", help="Apply diversity constraint to hybrid output")
     rec_parser.add_argument("--graph-alpha", type=float, default=0.15,
                             help="PPR restart probability for graph strategy")
     rec_parser.add_argument("--like-weight", type=float, help="Restart weight for liked films (graph)")
@@ -421,6 +426,29 @@ def main():
     prune_pending_parser.add_argument("--max-priority", type=int, help="Remove pending entries at or below this priority")
     prune_pending_parser.set_defaults(func=cmd_prune_pending)
 
+    # Operations: backups, supervisor, health check
+    backup_parser = subparsers.add_parser("backup", help="Back up the database (safe while a crawl is running)")
+    backup_parser.add_argument("--dir", default="data/backups", help="Backup directory (default: data/backups)")
+    backup_parser.add_argument("--keep", type=int, default=5, help="Backups to keep (default: 5)")
+    backup_parser.set_defaults(func=cmd_backup)
+
+    supervise_parser = subparsers.add_parser(
+        "supervise",
+        help="Run a command and restart it if it crashes, with periodic database backups",
+        description="Example: python main.py supervise -- --backend letterboxdpy crawl --users 10000 --max-rps 2",
+    )
+    supervise_parser.add_argument("--backup-every", type=float, default=60.0, metavar="MIN",
+                                  help="Minutes between backups; 0 disables (default: 60)")
+    supervise_parser.add_argument("--backup-dir", default="data/backups", help="Backup directory")
+    supervise_parser.add_argument("--keep", type=int, default=5, help="Backups to keep (default: 5)")
+    supervise_parser.add_argument("--max-failures", type=int, default=20,
+                                  help="Give up after this many crashes in a row (default: 20)")
+    supervise_parser.add_argument("child", nargs=argparse.REMAINDER, help="-- then the command to run")
+    supervise_parser.set_defaults(func=cmd_supervise)
+
+    doctor_parser = subparsers.add_parser("doctor", help="Check the database for missing, orphaned or stuck data")
+    doctor_parser.set_defaults(func=cmd_doctor)
+
     # Queue management commands
     queue_status_parser = subparsers.add_parser("queue-status", help="Show pending queue status")
     queue_status_parser.add_argument("--verbose", action="store_true", help="Show next pending users")
@@ -495,7 +523,7 @@ def main():
     )
     eval_parser.add_argument(
         "--strategies", nargs="+",
-        choices=["popularity", "svd", "collaborative", "metadata", "hybrid", "ease", "content", "movielens", "blend"],
+        choices=["popularity", "svd", "collaborative", "metadata", "ease", "content", "movielens", "blend"],
         help="Strategies to compare (default: all; the popularity baseline is always included)",
     )
     eval_parser.add_argument("--k", type=int, default=20, help="Cutoff for recall@k / NDCG@k")
@@ -565,6 +593,9 @@ __all__ = [
     'cmd_scrape_social',
     'cmd_backfill_social',
     'cmd_scrape_daemon',
+    'cmd_backup',
+    'cmd_supervise',
+    'cmd_doctor',
     'cmd_discover',
     'cmd_discover_refill',
     'cmd_discover_from_taste',
@@ -603,7 +634,6 @@ __all__ = [
     '_scrape_users_parallel',
     '_run_metadata_strategy',
     '_run_collaborative_strategy',
-    '_run_hybrid_strategy',
     '_run_graph_strategy',
     '_run_svd_strategy',
     '_output_recommendations',

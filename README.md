@@ -7,7 +7,7 @@ A sophisticated command-line film recommendation engine that scrapes your Letter
 ### Core Capabilities
 - **Scrape** your Letterboxd watched films, ratings, likes, watchlists, and curated lists
 - **Discover** similar users from followers, following, popular members, or fans of specific films
-- **Three recommendation strategies**: metadata-based, collaborative filtering, and hybrid
+- **Three recommendation strategies**: metadata-based, collaborative filtering, and EASE (with a MovieLens-trained blend)
 - **Advanced scoring** with IDF weighting, temporal decay, confidence adjustments, and genre pair modeling
 - **Profile analysis** showing your genre, director, actor, decade, and crew preferences
 - **Film similarity search** to find films like ones you already love
@@ -219,13 +219,20 @@ python main.py recommend USERNAME [options]
 ```
 
 **Options:**
-- `--strategy {metadata,collaborative,hybrid,svd,graph,ease,content}`: Algorithm to use (default: `blend` when the MovieLens model is built and the database holds 20+ users, `ease` without the model, `metadata` with too few users)
+- `--strategy {metadata,collaborative,svd,graph,ease,content,movielens,blend}`: Algorithm to use (default: `blend` when the MovieLens model is built and the database holds 20+ users, `ease` without the model, `metadata` with too few users)
 - `--limit N`: Number of recommendations (default: 20)
 - `--min-year YEAR`: Filter by minimum release year
 - `--max-year YEAR`: Filter by maximum release year
 - `--genres GENRE [GENRE ...]`: Only include these genres
 - `--exclude-genres GENRE [GENRE ...]`: Exclude these genres
 - `--min-rating N`: Minimum Letterboxd community rating
+- `--min-runtime MIN` / `--max-runtime MIN`: Runtime range in minutes
+- `--exclude-shorts` / `--exclude-animation`: Leave out short or animated films
+- `--countries C [C ...]` / `--languages L [L ...]`: Only films from these countries / in these languages
+
+The year, genre, rating, runtime, short/animation, country and language filters all apply to the
+`ease`, `movielens`, `blend` and `svd` strategies (the other strategies ignore the newer ones and say so).
+A film missing a field is never excluded by a filter on that field.
 - `--diversity`: Limit films per director (avoids 5 Kurosawa films in a row)
 - `--max-per-director N`: Max films per director in diversity mode (default: 2)
 - `--no-temporal-decay`: Disable temporal decay (treat old and new ratings equally)
@@ -256,9 +263,6 @@ python main.py recommend your_username --strategy blend
 # 0.3 cost ~1 point of recall@20 for ~10x the recall on films outside the 1000 most-watched;
 # 0.5 cost ~8 points for ~25% niche picks. Opt-in because it trades accuracy for novelty.
 python main.py recommend your_username --strategy ease --novelty 0.3
-
-# Hybrid approach (best of both worlds)
-python main.py recommend your_username --strategy hybrid --limit 30  # legacy: weaker than ease/blend offline
 
 # Without temporal decay (treat all ratings equally)
 python main.py recommend your_username --no-temporal-decay
@@ -331,7 +335,7 @@ Run this:
 ### `evaluate` — Measure recommendation quality
 
 ```bash
-python main.py evaluate [--strategies popularity svd collaborative metadata hybrid]
+python main.py evaluate [--strategies popularity svd collaborative metadata ease]
                         [--k 20] [--holdout 0.2] [--min-positives 10] [--max-users 200]
                         [--users NAME ...] [--seed 42] [--json [--per-user]]
 ```
@@ -372,6 +376,38 @@ python main.py stats [--verbose]
 
 **Options:**
 - `--verbose`: Show missing metadata, stalest users, genre distribution
+
+### `backup` — Safe database snapshots
+
+```bash
+python main.py backup [--dir data/backups] [--keep 5]
+```
+
+Uses SQLite's online backup, so it is consistent even while a crawl is writing, checks the copy
+before keeping it, and prunes to the newest `--keep` files. The database is a few hundred MB, so
+`--keep 5` uses a couple of GB.
+
+### `supervise` — Keep a crawl alive and backed up
+
+```bash
+python main.py supervise [--backup-every 60] [--keep 5] [--max-failures 20] --     --backend letterboxdpy crawl --users 10000 --max-rps 2 --auto-rps 5
+```
+
+Runs the command after `--`, restarts it with a growing pause if it crashes (giving up after
+`--max-failures` crashes in a row; a run that lasted 10+ minutes resets the count), and backs the
+database up every `--backup-every` minutes. A lock file stops a second supervisor from starting, so
+two crawlers can't share one IP. A clean exit ends the supervisor. It does not wake a sleeping
+laptop; disable sleep for long crawls.
+
+### `doctor` — Check the database
+
+```bash
+python main.py doctor
+```
+
+Read-only report: integrity check, watched films missing metadata or an id, orphaned rows, parked or
+already-scraped queue entries, and users without social edges, each with the command that fixes it.
+Some "missing metadata" is normal while a crawl is running, since films are filled in after users.
 
 ### `export` / `import` — Backup your data
 
@@ -425,14 +461,6 @@ Finds users with similar taste (based on rating correlation) and recommends film
 - Adjusted cosine similarity (mean-centered ratings)
 - Confidence weighting based on overlap size
 - Fast precomputed similarity components
-
-### Hybrid
-Combines both strategies using normalized score merging. Provides balanced recommendations that leverage both your explicit preferences and community wisdom.
-
-**Best when:**
-- You have 50+ other users scraped
-- You want diverse recommendations
-- You have both strong preferences and openness to discovery
 
 ### EASE
 A closed-form item-item model (Steck, 2019). It learns, from everyone's watch/rating/like
@@ -539,7 +567,7 @@ For deeper customization, edit `src/letterboxd_rec/config.py`:
 3. **Use diversity mode** if recommendations cluster too heavily on one director
 4. **Rebuild IDF** periodically as your database grows
 5. **Export regularly** to backup your scraped data
-6. **Use the default (`blend`/`ease`)** once you have 50+ other users; the older `hybrid` strategy scored below popularity offline
+6. **Use the default (`blend`/`ease`)** once you have 50+ other users
 7. **Use triage** to prioritize your ever-growing watchlist
 8. **Check gaps** to complete filmographies of directors you love
 

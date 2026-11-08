@@ -23,8 +23,6 @@ from .recommenders import (
     # Vectorization
     TfidfEmbedder,
     # Fusion
-    _fuse_normalized,
-    hybrid_weights,
     # Recommenders
     MetadataRecommender,
     CollaborativeRecommender,
@@ -55,8 +53,6 @@ __all__ = [
     # Vectorization
     "TfidfEmbedder",
     # Fusion
-    "_fuse_normalized",
-    "hybrid_weights",
     # Recommenders
     "MetadataRecommender",
     "CollaborativeRecommender",

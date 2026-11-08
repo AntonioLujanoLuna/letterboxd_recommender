@@ -20,7 +20,6 @@ from ..utils.loaders import (
 from ..utils.strategies import (
     _run_metadata_strategy,
     _run_collaborative_strategy,
-    _run_hybrid_strategy,
     _run_graph_strategy,
     _run_svd_strategy,
     _run_ease_strategy,
@@ -54,6 +53,17 @@ def _default_strategy() -> str:
     return 'blend' if ML_MODEL_PATH.exists() else 'ease'
 
 
+FULL_FILTER_STRATEGIES = frozenset({'ease', 'movielens', 'blend', 'svd'})
+
+
+def _uses_extended_filters(args: argparse.Namespace) -> bool:
+    return bool(
+        getattr(args, 'min_runtime', None) or getattr(args, 'max_runtime', None)
+        or getattr(args, 'exclude_shorts', False) or getattr(args, 'exclude_animation', False)
+        or getattr(args, 'countries', None) or getattr(args, 'languages', None)
+    )
+
+
 def cmd_recommend(args: argparse.Namespace) -> None:
     """Generate recommendations."""
     username = _validate_username(args.username)
@@ -66,6 +76,12 @@ def cmd_recommend(args: argparse.Namespace) -> None:
         strategy = _default_strategy()
         args.strategy = strategy
         logger.info(f"Using the '{strategy}' strategy (override with --strategy)")
+
+    if strategy not in FULL_FILTER_STRATEGIES and _uses_extended_filters(args):
+        logger.warning(
+            f"Runtime, short, animation, country and language filters only apply to the "
+            f"{', '.join(sorted(FULL_FILTER_STRATEGIES))} strategies; they are ignored by '{strategy}'."
+        )
 
     with get_db() as conn:
         user_films, all_films, all_user_films, user_lists = _load_recommendation_data(
@@ -81,7 +97,6 @@ def cmd_recommend(args: argparse.Namespace) -> None:
     strategy_handlers = {
         'metadata': _run_metadata_strategy,
         'collaborative': _run_collaborative_strategy,
-        'hybrid': _run_hybrid_strategy,
         'svd': _run_svd_strategy,
         'graph': _run_graph_strategy,
         'ease': _run_ease_strategy,

@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 POSITIVE_RATING_THRESHOLD = 3.5
 
 # The graph strategy builds from the live database, so held-out films would leak into it.
-EVALUABLE_STRATEGIES = ("popularity", "svd", "collaborative", "metadata", "hybrid", "ease", "content")
+EVALUABLE_STRATEGIES = ("popularity", "svd", "collaborative", "metadata", "ease", "content")
 
 # A recommender function: (username, training films for that user, k) -> ranked slugs
 RecommendFn = Callable[[str, list[dict], int], list[str]]
@@ -181,28 +181,6 @@ def _build_metadata(train: dict[str, list[dict]], films: dict[str, dict]) -> Rec
     return recommend
 
 
-def _build_hybrid(train: dict[str, list[dict]], films: dict[str, dict]) -> RecommendFn:
-    from .recommender import (
-        CollaborativeRecommender,
-        MetadataRecommender,
-        _fuse_normalized,
-        hybrid_weights,
-    )
-
-    meta = MetadataRecommender([dict(f) for f in films.values()])
-    collab = CollaborativeRecommender(train, films, use_cache=False)
-
-    def recommend(username: str, user_films: list[dict], k: int) -> list[str]:
-        meta_recs = meta.recommend(user_films, n=k * 2, username=None, user_lists=[])
-        collab_recs = collab.recommend(username, n=k * 2)
-        rated = sum(1 for f in user_films if f.get("rating"))
-        w_meta, w_collab = hybrid_weights(len(train), rated)
-        fused = _fuse_normalized(meta_recs, collab_recs, weight_meta=w_meta, weight_collab=w_collab)
-        return [slug for slug, _, _ in fused if not films or slug in films][:k]
-
-    return recommend
-
-
 def _build_ease(train: dict[str, list[dict]], films: dict[str, dict]) -> RecommendFn:
     from .ease import EASERecommender
 
@@ -271,7 +249,6 @@ STRATEGY_BUILDERS: dict[str, Callable[[dict, dict], RecommendFn]] = {
     "svd": _build_svd,
     "collaborative": _build_collaborative,
     "metadata": _build_metadata,
-    "hybrid": _build_hybrid,
     "ease": _build_ease,
     "content": _build_content,
     "movielens": _build_movielens,

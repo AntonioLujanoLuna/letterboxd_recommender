@@ -2,7 +2,6 @@
 
 import argparse
 import logging
-from collections import defaultdict
 from pathlib import Path
 
 from ...database import load_json, load_user_lists
@@ -10,8 +9,6 @@ from ...recommender import (
     MetadataRecommender,
     CollaborativeRecommender,
     Recommendation,
-    _fuse_normalized,
-    hybrid_weights,
 )
 from ...matrix_factorization import SVDRecommender
 from ...profile import build_profile
@@ -86,86 +83,6 @@ def _run_collaborative_strategy(
         genres=args.genres,
         exclude_genres=args.exclude_genres
     )
-
-
-def _run_hybrid_strategy(
-    user_films: list[dict],
-    all_films: dict[str, dict],
-    args: argparse.Namespace,
-    username: str,
-    user_lists: list[dict] | None,
-    all_user_films: dict[str, list[dict]] | None,
-) -> list[Recommendation]:
-    """Hybrid metadata + collaborative strategy."""
-    if not all_user_films:
-        logger.error("Hybrid strategy requires all user data.")
-        return []
-    logger.warning("The hybrid strategy scored below popularity offline (recall@20 0.09 vs 0.21 and "
-                   "the slowest strategy); 'blend' or 'ease' are much stronger (see README).")
-
-    meta_rec = MetadataRecommender(list(all_films.values()))
-    collab_rec = CollaborativeRecommender(all_user_films, all_films)
-
-    rated_count = sum(1 for f in user_films if f.get('rating'))
-    meta_weight, collab_weight = hybrid_weights(
-        len(all_user_films),
-        rated_count,
-        meta_weight=args.hybrid_meta_weight,
-        collab_weight=args.hybrid_collab_weight,
-    )
-
-    meta_recs = meta_rec.recommend(
-        user_films,
-        n=args.limit * 2,
-        min_year=args.min_year,
-        max_year=args.max_year,
-        genres=args.genres,
-        exclude_genres=args.exclude_genres,
-        min_rating=args.min_rating,
-        username=username,
-        weighting_mode=args.weighting_mode,
-    )
-    collab_recs = collab_rec.recommend(
-        username,
-        n=args.limit * 2,
-        min_year=args.min_year,
-        max_year=args.max_year,
-        genres=args.genres,
-        exclude_genres=args.exclude_genres
-    )
-
-    ranked = _fuse_normalized(meta_recs, collab_recs, weight_meta=meta_weight, weight_collab=collab_weight)
-
-    max_per_director = getattr(args, 'max_per_director', 2)
-    apply_diversity = bool(getattr(args, 'hybrid_diversity', False))
-    director_counts = defaultdict(int)
-
-    recs: list[Recommendation] = []
-    for slug, score, reasons in ranked:
-        film = all_films.get(slug)
-        if not film:
-            continue
-
-        directors = load_json(film.get('directors'))
-        if apply_diversity and max_per_director and directors:
-            if any(director_counts[d] >= max_per_director for d in directors):
-                continue
-
-        recs.append(Recommendation(
-            slug=slug,
-            title=film.get('title', slug),
-            year=film.get('year'),
-            score=score,
-            reasons=list(dict.fromkeys(reasons))[:3]
-        ))
-
-        for d in directors:
-            director_counts[d] += 1
-
-        if len(recs) >= args.limit:
-            break
-
-    return recs
 
 
 def _run_graph_strategy(
@@ -290,25 +207,9 @@ def _run_svd_strategy(
             continue
 
         film = all_films[slug]
-
+        if not _passes_cli_filters(film, args):
+            continue
         year = film.get('year')
-        if args.min_year and year and year < args.min_year:
-            continue
-        if args.max_year and year and year > args.max_year:
-            continue
-
-        film_genres = load_json(film.get('genres', []))
-        if args.genres:
-            genres_lower = [g.lower() for g in args.genres]
-            if not any(g in film_genres for g in genres_lower):
-                continue
-        if args.exclude_genres:
-            exclude_lower = [g.lower() for g in args.exclude_genres]
-            if any(g in film_genres for g in exclude_lower):
-                continue
-
-        if args.min_rating and film.get('avg_rating') and film['avg_rating'] < args.min_rating:
-            continue
 
         recs.append(Recommendation(
             slug=slug,
@@ -360,7 +261,7 @@ def _run_movielens_strategy(
                     f"(MovieLens ends in late 2023; newer and obscure films can't be used).")
 
     col_to_slug = matcher.letterboxd_slugs(all_films)
-    needs_metadata = bool(args.genres or args.exclude_genres or args.min_rating)
+    needs_metadata = _needs_metadata(args)
     liked_cols = [c for c, w in sorted(weighted.items(), key=lambda kv: -kv[1]) if w >= 1.0]
 
     recs: list[Recommendation] = []
@@ -434,20 +335,56 @@ def _run_blend_strategy(
     return recs
 
 
+def _needs_metadata(args: argparse.Namespace) -> bool:
+    """True when a filter can only be checked against Letterboxd metadata (not just the year)."""
+    return bool(
+        getattr(args, 'genres', None) or getattr(args, 'exclude_genres', None) or getattr(args, 'min_rating', None)
+        or getattr(args, 'min_runtime', None) or getattr(args, 'max_runtime', None)
+        or getattr(args, 'exclude_shorts', False) or getattr(args, 'exclude_animation', False)
+        or getattr(args, 'countries', None) or getattr(args, 'languages', None)
+    )
+
+
+def _any_in(wanted: list[str], available) -> bool:
+    available = {str(v).lower() for v in available}
+    return any(w.lower() in available for w in wanted)
+
+
 def _passes_cli_filters(film: dict, args: argparse.Namespace) -> bool:
-    """Year / genre / average-rating filters from the recommend command line."""
+    """Year / genre / rating / runtime / short / animation / country / language filters.
+
+    A film missing a field is never excluded by a filter on that field: unknown is not a mismatch.
+    """
+    g = lambda name: getattr(args, name, None)  # noqa: E731  (older callers build partial namespaces)
     year = film.get('year')
-    if args.min_year and year and year < args.min_year:
+    if g('min_year') and year and year < g('min_year'):
         return False
-    if args.max_year and year and year > args.max_year:
+    if g('max_year') and year and year > g('max_year'):
         return False
     film_genres = load_json(film.get('genres', []))
-    if args.genres and not any(g.lower() in film_genres for g in args.genres):
+    if g('genres') and not any(x.lower() in film_genres for x in g('genres')):
         return False
-    if args.exclude_genres and any(g.lower() in film_genres for g in args.exclude_genres):
+    if g('exclude_genres') and any(x.lower() in film_genres for x in g('exclude_genres')):
         return False
-    if args.min_rating and film.get('avg_rating') and film['avg_rating'] < args.min_rating:
+    if g('min_rating') and film.get('avg_rating') and film['avg_rating'] < g('min_rating'):
         return False
+    runtime = film.get('runtime')
+    if g('min_runtime') and runtime and runtime < g('min_runtime'):
+        return False
+    if g('max_runtime') and runtime and runtime > g('max_runtime'):
+        return False
+    if g('exclude_shorts') and film.get('is_short'):
+        return False
+    if g('exclude_animation') and film.get('is_animation'):
+        return False
+    if g('countries'):
+        countries = load_json(film.get('countries', []))
+        if countries and not _any_in(g('countries'), countries):
+            return False
+    if g('languages'):
+        languages = load_json(film.get('languages', []))
+        if languages and not _any_in(g('languages'), languages):
+            return False
     return True
 
 

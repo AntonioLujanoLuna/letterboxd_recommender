@@ -100,11 +100,11 @@ def test_holdout_split_respects_catalog_min_positives_and_users():
 def test_run_evaluation_ranks_strategies(fresh_recommender_modules):
     data, films = _clustered_data()
     split, results = run_evaluation(
-        data, films, strategies=["popularity", "svd", "collaborative", "metadata", "hybrid"],
+        data, films, strategies=["popularity", "svd", "collaborative", "metadata"],
         k=10, min_positives=10, seed=1,
     )
     by_name = {r.strategy: r for r in results}
-    assert set(by_name) == {"popularity", "svd", "collaborative", "metadata", "hybrid"}
+    assert set(by_name) == {"popularity", "svd", "collaborative", "metadata"}
     for r in results:
         assert r.error is None, (r.strategy, r.error)
         assert r.n_users == len(split.test) == 30
@@ -114,7 +114,6 @@ def test_run_evaluation_ranks_strategies(fresh_recommender_modules):
 
     # With clean taste clusters, neighbour-based models must clearly beat global popularity
     assert by_name["collaborative"].ndcg > 2 * by_name["popularity"].ndcg
-    assert by_name["hybrid"].ndcg > by_name["popularity"].ndcg
 
     table = format_results_table(results)
     assert "popularity" in table and "vs pop" in table

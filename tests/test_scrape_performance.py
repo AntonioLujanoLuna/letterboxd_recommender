@@ -764,3 +764,35 @@ def test_backfill_social_fills_each_missing_direction_and_survives_blocked_pages
     assert ("followers", "half") in calls and ("following", "half") not in calls      # only the gap
     assert ("following", "none") in calls and ("followers", "none") in calls
     assert ("following", "blocked") in calls and ("followers", "none") in calls        # failure did not stop the run
+
+
+# --- recommend filters ---------------------------------------------------------
+
+def test_cli_filters_cover_runtime_shorts_animation_country_language():
+    import argparse
+    from letterboxd_rec.cli.utils.strategies import _passes_cli_filters
+
+    def ns(**kw):
+        base = dict(min_year=None, max_year=None, genres=None, exclude_genres=None, min_rating=None,
+                    min_runtime=None, max_runtime=None, exclude_shorts=False, exclude_animation=False,
+                    countries=None, languages=None)
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    film = {"year": 2001, "genres": '["drama"]', "runtime": 120, "is_short": 0, "is_animation": 1,
+            "countries": '["Japan"]', "languages": '["Japanese"]'}
+    assert _passes_cli_filters(film, ns())
+    assert not _passes_cli_filters(film, ns(max_runtime=100))
+    assert not _passes_cli_filters(film, ns(min_runtime=150))
+    assert _passes_cli_filters(film, ns(min_runtime=90, max_runtime=130))
+    assert not _passes_cli_filters(film, ns(exclude_animation=True))
+    assert not _passes_cli_filters({**film, "is_short": 1}, ns(exclude_shorts=True))
+    assert _passes_cli_filters(film, ns(countries=["japan"], languages=["JAPANESE"]))
+    assert not _passes_cli_filters(film, ns(countries=["France"]))
+    assert not _passes_cli_filters(film, ns(languages=["French"]))
+    # unknown is not a mismatch
+    unknown = {"year": 2001, "genres": "[]"}
+    assert _passes_cli_filters(unknown, ns(max_runtime=90, countries=["France"], languages=["French"]))
+    # partial namespaces from older callers still work
+    assert _passes_cli_filters(film, argparse.Namespace(min_year=None, max_year=None, genres=None,
+                                                        exclude_genres=None, min_rating=None))

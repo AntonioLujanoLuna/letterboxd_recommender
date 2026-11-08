@@ -22,7 +22,6 @@ from .scrapers import (
 from .strategies import (
     _run_metadata_strategy,
     _run_collaborative_strategy,
-    _run_hybrid_strategy,
     _run_graph_strategy,
     _run_svd_strategy,
 )
@@ -44,7 +43,6 @@ __all__ = [
     '_scrape_users_parallel',
     '_run_metadata_strategy',
     '_run_collaborative_strategy',
-    '_run_hybrid_strategy',
     '_run_graph_strategy',
     '_run_svd_strategy',
     '_output_recommendations',
