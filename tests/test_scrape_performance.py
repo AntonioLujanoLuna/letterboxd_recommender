@@ -649,3 +649,51 @@ def test_default_strategy_is_ease_with_enough_users(monkeypatch, tmp_path):
 def test_default_strategy_falls_back_to_metadata_with_few_users(monkeypatch, tmp_path):
     rec_cmd = _fake_db(monkeypatch, tmp_path, 3)
     assert rec_cmd._default_strategy() == "metadata"
+
+
+# --- Social retry and error wording -------------------------------------------
+
+def test_retry_social_waits_out_a_burst_then_succeeds():
+    from letterboxd_rec.cli.commands.scrape import _retry_social
+    from letterboxd_rec.scraper import ScrapeIncompleteError
+
+    calls, sleeps = [], []
+
+    async def once(username):
+        calls.append(username)
+        if len(calls) < 3:
+            raise ScrapeIncompleteError(username, "https://letterboxd.com/u/followers/page/2/")
+        return "ok"
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    assert asyncio.run(_retry_social(once, "u", waits=(0, 30, 90), sleep=fake_sleep)) == "ok"
+    assert calls == ["u", "u", "u"] and sleeps == [30, 90]
+
+
+def test_retry_social_raises_after_the_last_attempt():
+    from letterboxd_rec.cli.commands.scrape import _retry_social
+    from letterboxd_rec.scraper import ScrapeIncompleteError
+
+    attempts = []
+
+    async def always(username):
+        attempts.append(1)
+        raise ScrapeIncompleteError(username, "https://letterboxd.com/u/following/page/1/")
+
+    async def no_sleep(_):
+        return None
+
+    with pytest.raises(ScrapeIncompleteError):
+        asyncio.run(_retry_social(always, "u", waits=(0, 5), sleep=no_sleep))
+    assert len(attempts) == 2
+
+
+@pytest.mark.parametrize("path,word", [("films/page/3", "watched films"), ("watchlist/page/1", "watchlist"),
+                                       ("following/page/2", "following list"), ("followers/page/4", "followers list")])
+def test_incomplete_error_names_what_failed(path, word):
+    from letterboxd_rec.scraper import ScrapeIncompleteError
+
+    msg = str(ScrapeIncompleteError("u", f"https://letterboxd.com/u/{path}/"))
+    assert word in msg and "nothing was saved" not in msg

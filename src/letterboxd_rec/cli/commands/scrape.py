@@ -34,6 +34,28 @@ from ..utils.scrapers import _scrape_film_metadata, _scrape_film_metadata_async
 
 logger = logging.getLogger(__name__)
 
+# Seconds to wait before each attempt at a user's social pages (first attempt is immediate).
+# Throttle bursts last about a minute, so the later attempts wait it out.
+SOCIAL_RETRY_WAITS = (0, 30, 90)
+
+
+async def _retry_social(scrape_once, username: str, waits=SOCIAL_RETRY_WAITS, sleep=asyncio.sleep):
+    """Run `scrape_once(username)`, waiting out throttle bursts; re-raise after the last attempt.
+
+    A failed social page would otherwise fail the whole user and re-scrape all their films on the
+    retry, so only the social part is repeated here.
+    """
+    for attempt, wait in enumerate(waits):
+        if wait:
+            logger.info(f"  Social pages for {username} blocked; retrying in {wait}s "
+                        f"(attempt {attempt + 1}/{len(waits)})")
+            await sleep(wait)
+        try:
+            return await scrape_once(username)
+        except ScrapeIncompleteError:
+            if attempt == len(waits) - 1:
+                raise
+
 
 def _get_cli():
     """Late import cli module to support monkeypatching in tests."""
@@ -342,7 +364,9 @@ async def _cmd_scrape_daemon_async(args: argparse.Namespace) -> None:
     ) as async_scraper:
 
         async def _scrape_social_async(username: str):
-            """Async helper to scrape and persist social graph edges."""
+            await _retry_social(_scrape_social_once, username)
+
+        async def _scrape_social_once(username: str):
             following = await async_scraper.scrape_following_async(username, limit=getattr(args, "social_limit", 200))
             if following:
                 await asyncio.to_thread(save_user_follows, username, following)

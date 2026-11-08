@@ -30,18 +30,22 @@ logger = logging.getLogger(__name__)
 
 
 class ScrapeIncompleteError(RuntimeError):
-    """A user's watched-films listing could not be fetched (blocked, 403, network error).
+    """One of a user's listing pages could not be fetched (blocked, 403, network error).
 
     Raised instead of returning a partial result: saving only a watchlist would look like a
     user who has watched nothing, which silently corrupts recommendations and evaluation.
     """
 
+    _WHAT = (("/watchlist/", "watchlist"), ("/following/", "following list"),
+             ("/followers/", "followers list"), ("/films/", "watched films"))
+
     def __init__(self, username: str, url: str):
         self.username = username
         self.url = url
+        what = next((label for marker, label in self._WHAT if marker in url), "listing")
         super().__init__(
-            f"Could not fetch {username}'s watched films ({url}). Letterboxd may be blocking "
-            "automated requests; nothing was saved for this user."
+            f"Could not fetch {username}'s {what} ({url}). Letterboxd may be blocking automated "
+            "requests; the partial result was discarded and the user will be retried."
         )
 
 
