@@ -273,16 +273,18 @@ python main.py recommend your_username --strategy collaborative
 python main.py recommend your_username --strategy ease
 
 # Local EASE + MovieLens EASE, fused by reciprocal rank (needs `python main.py movielens-build`).
-# Offline (418 users, paired bootstrap) it beat local EASE alone by ~1.4 points of NDCG@20 (95% CI
-# +0.3 to +2.6) and ~0.9 of recall@20 (not distinguishable from zero), and beat MovieLens alone on
-# both. About 3% of its picks are films outside the 1000 most-watched, vs 0.2% for local EASE.
-# Weight on the local model: LETTERBOXD_BLEND_EASE_WEIGHT (default 0.2).
+# Offline (1,630 local users, paired bootstrap) the default weight 0.8 beat local EASE alone by
+# 1.2 points of recall@20 (95% CI +0.7 to +1.7) and 0.8 of NDCG@20 (+0.3 to +1.3). The gain shrinks as
+# the local database grows: at ~420 users a weight of 0.2 was best, at 1,630 that same weight was
+# 2.1 points *worse* than local EASE. Lower weights favor MovieLens: more niche picks, less accuracy.
+# Weight on the local model: LETTERBOXD_BLEND_EASE_WEIGHT (default 0.8; re-tune as data grows).
 python main.py recommend your_username --strategy blend
 
 # Less mainstream picks: divides scores by popularity**N (0 = off); applies to ease, movielens and
-# blend. Default blend, ~500 held-out users, recall@20 / picks outside the 1000 most-watched:
-#   0 -> 0.431 / 4.9%   0.2 -> 0.424 / 11.3%   0.3 -> 0.389 / 17.2%   0.5 -> 0.269 / 34%
-# so 0.2 more than doubles niche picks for under a point of recall. Opt-in: it trades accuracy.
+# blend. Default blend (local weight 0.8), ~500 held-out users, recall@20 / picks outside the 1000
+# most-watched:  0 -> 0.459 / 1.9%   0.2 -> 0.462 / 8.0%   0.3 -> 0.447 / 15.4%   0.5 -> 0.338 / 47%
+# so 0.2 quadruples niche picks with no measurable recall cost, 0.3 costs about a point, 0.5 a lot.
+# Opt-in. (Measured at 1,600 local users; with the old 0.2 blend weight the costs were larger.)
 python main.py recommend your_username --novelty 0.2
 
 # Without temporal decay (treat all ratings equally)
