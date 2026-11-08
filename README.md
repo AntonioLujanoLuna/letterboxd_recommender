@@ -529,6 +529,11 @@ has ~16), the matrix grows with its square, and fitting 12k or 16k films (557 he
 neither recall@20 (within 0.002) nor recall on films outside the 1,000 most-watched (about 140 of 18,349 at
 every size). Tune regularization with `LETTERBOXD_EASE_LAMBDA` and compare runs with `evaluate`.
 
+**More users keep helping.** Local EASE on a fixed set of 150 test users: recall@20 0.296 with 150 training
+users, 0.339 with 250, 0.358 with 350, 0.431 with all 2,118 (the gains slow but have not stopped). At
+2,118 users (552 held-out users, paired bootstrap) every gap is significant: EASE beats popularity by
++0.251 recall@20, the blend beats EASE by +0.015, and MovieLens alone trails EASE by 0.050.
+
 ### Content
 A fast, vectorized alternative to the metadata strategy: films become IDF-weighted feature
 vectors (directors, genres, themes, cast, crew, countries, decade), your taste is the
