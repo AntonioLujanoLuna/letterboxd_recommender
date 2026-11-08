@@ -290,6 +290,10 @@ python main.py recommend your_username --strategy blend
 python main.py recommend your_username --novelty 0.2   # more niche picks
 python main.py recommend your_username --novelty 0     # off
 
+# Diversity caps (max films per director/franchise in the top 20) were tested and rejected: on 553 held-out
+# users every cap lowered recall significantly (2 per franchise -0.002, 1 per franchise -0.011, 1 per
+# director -0.013). Lists repeat a franchise only 0.7 times per 20 picks, and sequels are often real hits.
+
 # Without temporal decay (treat all ratings equally)
 python main.py recommend your_username --no-temporal-decay
 ```
