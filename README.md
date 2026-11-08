@@ -413,8 +413,13 @@ scrape), falling back to title + year.
 
 **Limits:** MovieLens ratings stop in October 2023, so newer films can't be recommended by
 this strategy or used as input (`content` covers them). `--max-items` films are modelled; memory
-grows with its square (10k ≈ 3 GB peak). GroupLens terms: personal/research use only, no
-redistribution.
+grows with its square (10k ≈ 3 GB peak). A larger set does not pay off in the blend: at 12k and 16k
+films (557 users, paired) recall@20 moved by +0.001 (not significant), and the extra films that reach the
+lists were all misses (0 of ~4,000 hidden films outside the 8k models' reach recovered), also at `--novelty`
+0.3/0.4 (16k vs 8k: recall -0.000/-0.002). Reaching films outside the models' sets via content similarity
+(plain, quality-gated or built from EASE-predicted taste) also lowered recall by ~3 points for 2 slots. The
+limit is the signal for thinly-watched films, not the model size. GroupLens terms: personal/research use
+only, no redistribution.
 
 ### `stats` — Database statistics
 
