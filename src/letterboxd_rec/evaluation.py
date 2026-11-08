@@ -226,6 +226,23 @@ def _build_content(train: dict[str, list[dict]], films: dict[str, dict]) -> Reco
     return recommend
 
 
+def _build_blend(train: dict[str, list[dict]], films: dict[str, dict]) -> RecommendFn:
+    """Local EASE fused with the pre-trained MovieLens EASE (reciprocal-rank fusion)."""
+    from .config import BLEND_EASE_WEIGHT
+    from .recommenders.fusion import rrf_fuse
+
+    local = _build_ease(train, films)
+    pretrained = _build_movielens(train, films)
+
+    def recommend(username: str, user_films: list[dict], k: int) -> list[str]:
+        depth = k * 3
+        fused = rrf_fuse([(local(username, user_films, depth), BLEND_EASE_WEIGHT),
+                          (pretrained(username, user_films, depth), 1.0 - BLEND_EASE_WEIGHT)])
+        return [slug for slug, _ in fused][:k]
+
+    return recommend
+
+
 def _build_movielens(train: dict[str, list[dict]], films: dict[str, dict]) -> RecommendFn:
     """Pre-trained MovieLens EASE: nothing is fitted on the split, so nothing can leak."""
     from .movielens import FilmMatcher, MovieLensModel
@@ -258,6 +275,7 @@ STRATEGY_BUILDERS: dict[str, Callable[[dict, dict], RecommendFn]] = {
     "ease": _build_ease,
     "content": _build_content,
     "movielens": _build_movielens,
+    "blend": _build_blend,
 }
 
 

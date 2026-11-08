@@ -219,7 +219,7 @@ python main.py recommend USERNAME [options]
 ```
 
 **Options:**
-- `--strategy {metadata,collaborative,hybrid,svd,graph,ease,content}`: Algorithm to use (default: `ease` when the database holds 20+ users with data, otherwise `metadata`)
+- `--strategy {metadata,collaborative,hybrid,svd,graph,ease,content}`: Algorithm to use (default: `blend` when the MovieLens model is built and the database holds 20+ users, `ease` without the model, `metadata` with too few users)
 - `--limit N`: Number of recommendations (default: 20)
 - `--min-year YEAR`: Filter by minimum release year
 - `--max-year YEAR`: Filter by maximum release year
@@ -244,6 +244,12 @@ python main.py recommend your_username --strategy collaborative
 
 # EASE item-item model (strongest in offline evaluation; needs other users scraped)
 python main.py recommend your_username --strategy ease
+
+# Local EASE + MovieLens EASE, fused by reciprocal rank (needs `python main.py movielens-build`).
+# Offline on 2 splits x 150 users it beat local EASE alone by ~2-3 points of recall@20 and ~4 of
+# NDCG@20, and ~30x more of its picks were films outside the 1000 most-watched. Weight on the local
+# model: LETTERBOXD_BLEND_EASE_WEIGHT (default 0.2).
+python main.py recommend your_username --strategy blend
 
 # Less mainstream picks: divides scores by popularity**N (0 = off). On 150 held-out users,
 # 0.3 cost ~1 point of recall@20 for ~10x the recall on films outside the 1000 most-watched;

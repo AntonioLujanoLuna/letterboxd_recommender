@@ -272,10 +272,10 @@ def main():
     rec_parser.add_argument("--novelty", type=float, default=0.0, metavar="0-1",
                             help="ease strategy: favor less mainstream films (0 = off; 0.3 is mild, 0.5 strong; "
                                  "costs some accuracy, see README)")
-    rec_parser.add_argument("--strategy", choices=['metadata', 'collaborative', 'hybrid', 'svd', 'graph', 'ease', 'content', 'movielens'],
+    rec_parser.add_argument("--strategy", choices=['metadata', 'collaborative', 'hybrid', 'svd', 'graph', 'ease', 'content', 'movielens', 'blend'],
                             default=None,
-                            help="Recommendation strategy (default: ease when the database has enough "
-                                 "users to train it, otherwise metadata)")
+                            help="Recommendation strategy (default: blend when the MovieLens model is built, "
+                                 "else ease when the database has enough users, else metadata)")
     rec_parser.add_argument("--limit", type=int, default=20, help="Number of recommendations")
     rec_parser.add_argument("--min-year", type=int, help="Minimum release year")
     rec_parser.add_argument("--max-year", type=int, help="Maximum release year")
@@ -495,7 +495,7 @@ def main():
     )
     eval_parser.add_argument(
         "--strategies", nargs="+",
-        choices=["popularity", "svd", "collaborative", "metadata", "hybrid", "ease", "content", "movielens"],
+        choices=["popularity", "svd", "collaborative", "metadata", "hybrid", "ease", "content", "movielens", "blend"],
         help="Strategies to compare (default: all; the popularity baseline is always included)",
     )
     eval_parser.add_argument("--k", type=int, default=20, help="Cutoff for recall@k / NDCG@k")

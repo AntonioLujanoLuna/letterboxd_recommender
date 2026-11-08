@@ -642,8 +642,21 @@ def _fake_db(monkeypatch, tmp_path, n_users):
 
 
 def test_default_strategy_is_ease_with_enough_users(monkeypatch, tmp_path):
+    from letterboxd_rec import movielens
+
     rec_cmd = _fake_db(monkeypatch, tmp_path, 20)
+    monkeypatch.setattr(movielens, "ML_MODEL_PATH", tmp_path / "no_such_model.npz")
     assert rec_cmd._default_strategy() == "ease"
+
+
+def test_default_strategy_is_blend_once_the_movielens_model_exists(monkeypatch, tmp_path):
+    from letterboxd_rec import movielens
+
+    rec_cmd = _fake_db(monkeypatch, tmp_path, 20)
+    model = tmp_path / "ml.npz"
+    model.touch()
+    monkeypatch.setattr(movielens, "ML_MODEL_PATH", model)
+    assert rec_cmd._default_strategy() == "blend"
 
 
 def test_default_strategy_falls_back_to_metadata_with_few_users(monkeypatch, tmp_path):

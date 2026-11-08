@@ -26,6 +26,7 @@ from ..utils.strategies import (
     _run_ease_strategy,
     _run_content_strategy,
     _run_movielens_strategy,
+    _run_blend_strategy,
 )
 from ..utils.output import _output_recommendations
 
@@ -38,7 +39,8 @@ MIN_USERS_FOR_EASE = 20
 
 
 def _default_strategy() -> str:
-    """'ease' when the database holds enough users to train it, else the single-user metadata strategy."""
+    """'blend' when the MovieLens model is built, 'ease' when the database holds enough users to
+    train it, else the single-user metadata strategy."""
     if not DB_PATH.exists():
         return 'metadata'
     try:
@@ -46,7 +48,10 @@ def _default_strategy() -> str:
             n_users = conn.execute("SELECT COUNT(DISTINCT username) FROM user_films").fetchone()[0]
     except Exception:  # noqa: BLE001  (no schema yet, locked db...): the safe default still works
         return 'metadata'
-    return 'ease' if n_users >= MIN_USERS_FOR_EASE else 'metadata'
+    if n_users < MIN_USERS_FOR_EASE:
+        return 'metadata'
+    from ...movielens import ML_MODEL_PATH
+    return 'blend' if ML_MODEL_PATH.exists() else 'ease'
 
 
 def cmd_recommend(args: argparse.Namespace) -> None:
@@ -82,6 +87,7 @@ def cmd_recommend(args: argparse.Namespace) -> None:
         'ease': _run_ease_strategy,
         'content': _run_content_strategy,
         'movielens': _run_movielens_strategy,
+        'blend': _run_blend_strategy,
     }
 
     handler = strategy_handlers[strategy]
@@ -260,7 +266,7 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
     if not args.strategies:
         from ...movielens import ML_MODEL_PATH
         if ML_MODEL_PATH.exists():
-            strategies.append("movielens")
+            strategies.extend(["movielens", "blend"])
     if "popularity" not in strategies:
         strategies = ["popularity", *strategies]  # always report the baseline
 

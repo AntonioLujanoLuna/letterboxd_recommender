@@ -129,3 +129,14 @@ def test_ease_novelty_damps_popular_films_and_survives_cache(tmp_path):
     loaded = EASERecommender.load(path, expected_fingerprint=model.fingerprint(users))
     assert loaded is not None and np.array_equal(loaded.item_counts, model.item_counts)
     assert loaded.recommend(target, n=2, novelty=0.7) == model.recommend(target, n=2, novelty=0.7)
+
+
+def test_rrf_fuse_ranks_by_weighted_reciprocal_rank():
+    from letterboxd_rec.recommenders import rrf_fuse
+
+    fused = rrf_fuse([(["a", "b"], 0.9), (["c", "b"], 0.1)])
+    slugs = [s for s, _ in fused]
+    assert slugs[0] == "b"                      # present in both lists beats a lone rank-1 entry
+    assert slugs.index("a") < slugs.index("c")  # the heavier list's top outranks the lighter one's
+    assert set(slugs) == {"a", "b", "c"}
+    assert rrf_fuse([(["x"], 0.0), (["y"], 1.0)]) == [("y", 1.0 / 61)]  # zero weight is ignored

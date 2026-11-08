@@ -387,6 +387,51 @@ def _run_movielens_strategy(
     return recs
 
 
+def _run_blend_strategy(
+    user_films: list[dict],
+    all_films: dict[str, dict],
+    args: argparse.Namespace,
+    username: str,
+    user_lists: list[dict] | None,
+    all_user_films: dict[str, list[dict]] | None = None,
+) -> list[Recommendation]:
+    """Local EASE fused with the MovieLens-trained EASE (weighted reciprocal-rank fusion).
+
+    The local model knows this database's users and films newer than MovieLens; the MovieLens
+    model knows film-to-film structure from 200k users, including films few local users watched.
+    Falls back to whichever model is available.
+    """
+    from ...config import BLEND_EASE_WEIGHT
+    from ...recommenders.fusion import RRF_C, rrf_fuse
+
+    wide = argparse.Namespace(**vars(args))
+    wide.limit = max(args.limit * 5, 100)  # deep lists: filters and fusion both drop some
+    local = _run_ease_strategy(user_films, all_films, wide, username, user_lists, all_user_films)
+    pretrained = _run_movielens_strategy(user_films, all_films, wide, username, user_lists, all_user_films)
+    if not pretrained:
+        if local:
+            logger.warning("MovieLens model unavailable (python main.py movielens-build); "
+                           "using the local EASE model alone.")
+        return local[:args.limit]
+    if not local:
+        return pretrained[:args.limit]
+
+    by_slug: dict[str, Recommendation] = {r.slug: r for r in pretrained}
+    for r in local:
+        other = by_slug.get(r.slug)
+        if other:
+            r.reasons = list(dict.fromkeys([*r.reasons, *other.reasons]))
+        by_slug[r.slug] = r
+    fused = rrf_fuse([([r.slug for r in local], BLEND_EASE_WEIGHT),
+                      ([r.slug for r in pretrained], 1.0 - BLEND_EASE_WEIGHT)])
+    recs = []
+    for slug, score in fused[:args.limit]:
+        rec = by_slug[slug]
+        rec.score = score * (RRF_C + 1)  # 1.0 = ranked first by both models
+        recs.append(rec)
+    return recs
+
+
 def _passes_cli_filters(film: dict, args: argparse.Namespace) -> bool:
     """Year / genre / average-rating filters from the recommend command line."""
     year = film.get('year')
