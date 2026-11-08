@@ -517,8 +517,11 @@ history, how much each film "predicts" each other film. Fitting is one matrix in
 liked that contributed most.
 
 **Requirements:** other users scraped. Only films with 5+ interactions (`EASE_MIN_INTERACTIONS`)
-and at most 8k films (`EASE_MAX_ITEMS`) are modelled. Tune regularization with
-`LETTERBOXD_EASE_LAMBDA` and compare runs with `evaluate`.
+and at most 8k films (`EASE_MAX_ITEMS`, the most-interacted ones) are modelled, so the local model never
+recommends a film outside that set. The cap is deliberate: it covers ~83% of interactions (the 8,000th film
+has ~16), the matrix grows with its square, and fitting 12k or 16k films (557 held-out users, paired) changed
+neither recall@20 (within 0.002) nor recall on films outside the 1,000 most-watched (about 140 of 18,349 at
+every size). Tune regularization with `LETTERBOXD_EASE_LAMBDA` and compare runs with `evaluate`.
 
 ### Content
 A fast, vectorized alternative to the metadata strategy: films become IDF-weighted feature
