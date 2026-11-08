@@ -340,8 +340,9 @@ EASE_WEIGHTS = {
 }
 
 # Blend of the local EASE model with the MovieLens-trained EASE model (reciprocal-rank fusion).
-# Weight on the local model; the rest goes to MovieLens. Offline (2 splits x 150 users) 0.2 beat
-# local EASE alone by ~2-3 points of recall@20 and ~4 of NDCG, with ~30x more niche picks.
+# Weight on the local model; the rest goes to MovieLens. Offline (418 users, paired bootstrap) 0.2 beat
+# local EASE alone by ~1.4 points of NDCG@20 (95% CI +0.3..+2.6); the recall gain (+0.9) is not
+# statistically distinguishable from zero. It also picks far more films outside the top 1000.
 BLEND_EASE_WEIGHT = _get_float_env("LETTERBOXD_BLEND_EASE_WEIGHT", 0.2, min_val=0.0)
 
 # Vectorized content strategy: per-field weights for the IDF-weighted film x feature matrix

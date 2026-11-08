@@ -246,9 +246,10 @@ python main.py recommend your_username --strategy collaborative
 python main.py recommend your_username --strategy ease
 
 # Local EASE + MovieLens EASE, fused by reciprocal rank (needs `python main.py movielens-build`).
-# Offline on 2 splits x 150 users it beat local EASE alone by ~2-3 points of recall@20 and ~4 of
-# NDCG@20, and ~30x more of its picks were films outside the 1000 most-watched. Weight on the local
-# model: LETTERBOXD_BLEND_EASE_WEIGHT (default 0.2).
+# Offline (418 users, paired bootstrap) it beat local EASE alone by ~1.4 points of NDCG@20 (95% CI
+# +0.3 to +2.6) and ~0.9 of recall@20 (not distinguishable from zero), and beat MovieLens alone on
+# both. About 3% of its picks are films outside the 1000 most-watched, vs 0.2% for local EASE.
+# Weight on the local model: LETTERBOXD_BLEND_EASE_WEIGHT (default 0.2).
 python main.py recommend your_username --strategy blend
 
 # Less mainstream picks: divides scores by popularity**N (0 = off). On 150 held-out users,
