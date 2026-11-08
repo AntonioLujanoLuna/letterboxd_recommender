@@ -298,6 +298,20 @@ python main.py recommend your_username --novelty 0     # off
 python main.py recommend your_username --no-temporal-decay
 ```
 
+### `diary` — Backfill watch dates (opt-in)
+
+```bash
+python main.py --backend letterboxdpy diary your_username           # one user
+python main.py --backend letterboxdpy diary --crawled 50            # the 50 biggest crawled users without a diary yet
+```
+
+The crawl's film lists carry no dates; Letterboxd keeps them only in each user's diary. This command
+reads `/user/films/diary/` (about 7 requests per user on a 30-user sample, diaries covered ~55% of the
+films in the database) and stores one row per logged viewing (date, rewatch flag) in the separate
+`user_diary` table, so the main crawl and its throughput are unchanged. Pages blocked by throttling are
+retried with backoff; a user whose diary cannot be read completely is skipped, never stored partially.
+Nothing in the recommender uses the dates yet.
+
 ### `profile` — View your taste profile
 
 ```bash

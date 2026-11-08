@@ -16,6 +16,7 @@ from .ops import (
     cmd_backup,
     cmd_supervise,
     cmd_doctor,
+    cmd_diary,
 )
 from .recommend import (
     cmd_recommend,
@@ -65,6 +66,7 @@ __all__ = [
     'cmd_backup',
     'cmd_supervise',
     'cmd_doctor',
+    'cmd_diary',
     'cmd_stats',
     'cmd_export',
     'cmd_import',

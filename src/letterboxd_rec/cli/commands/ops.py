@@ -67,3 +67,33 @@ def cmd_doctor(args: argparse.Namespace) -> None:
     logger.info("\nDatabase health\n" + "-" * 30 + "\n" + format_report(findings))
     if worst_level(findings) == ERROR:
         sys.exit(1)
+
+
+def cmd_diary(args: argparse.Namespace) -> None:
+    """Backfill watch dates from users' diaries (opt-in; the main crawl does not fetch them)."""
+    from ... import cli
+    from ...diary import save_diary, scrape_diary, users_needing_diary
+    from ...lbpy_backend import CurlClient
+
+    cli.init_db()
+    users = [u.strip().lower() for u in (args.usernames or []) if u.strip()]
+    if args.crawled:
+        with cli.get_db(read_only=True) as conn:
+            users += [u for u in users_needing_diary(conn, args.crawled) if u not in users]
+    if not users:
+        logger.error("Name users to fetch, or use --crawled N for the N biggest crawled users without a diary yet.")
+        sys.exit(2)
+
+    client = CurlClient()
+    done = skipped = total = 0
+    for i, user in enumerate(users, 1):
+        entries = scrape_diary(client, user, delay=args.delay)
+        if entries is None:
+            skipped += 1
+            continue
+        with cli.get_db() as conn:
+            save_diary(conn, user, entries)
+        done += 1
+        total += len(entries)
+        logger.info(f"[{i}/{len(users)}] {user}: {len(entries)} dated viewings")
+    logger.info(f"Diaries stored for {done} users ({total} viewings); {skipped} skipped (private or blocked).")

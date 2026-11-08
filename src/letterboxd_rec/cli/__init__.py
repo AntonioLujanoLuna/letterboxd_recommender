@@ -41,6 +41,7 @@ from .commands import (
     cmd_backup,
     cmd_supervise,
     cmd_doctor,
+    cmd_diary,
     cmd_discover,
     cmd_discover_refill,
     cmd_discover_from_taste,
@@ -452,6 +453,15 @@ def main():
     doctor_parser = subparsers.add_parser("doctor", help="Check the database for missing, orphaned or stuck data")
     doctor_parser.set_defaults(func=cmd_doctor)
 
+    diary_parser = subparsers.add_parser(
+        "diary", help="Backfill watch dates from users' diaries (opt-in, stored separately)",
+        description="Example: python main.py --backend letterboxdpy diary antonio_lujano --crawled 50")
+    diary_parser.add_argument("usernames", nargs="*", help="Users whose diaries to fetch")
+    diary_parser.add_argument("--crawled", type=int, default=0, metavar="N",
+                              help="Also fetch the N biggest crawled users that have no diary stored yet")
+    diary_parser.add_argument("--delay", type=float, default=1.5, help="Seconds between diary pages (default: 1.5)")
+    diary_parser.set_defaults(func=cmd_diary)
+
     # Queue management commands
     queue_status_parser = subparsers.add_parser("queue-status", help="Show pending queue status")
     queue_status_parser.add_argument("--verbose", action="store_true", help="Show next pending users")
@@ -599,6 +609,7 @@ __all__ = [
     'cmd_backup',
     'cmd_supervise',
     'cmd_doctor',
+    'cmd_diary',
     'cmd_discover',
     'cmd_discover_refill',
     'cmd_discover_from_taste',

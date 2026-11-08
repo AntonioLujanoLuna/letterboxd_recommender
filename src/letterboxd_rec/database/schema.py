@@ -162,6 +162,23 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_follows_follower ON user_follows(follower);
             CREATE INDEX IF NOT EXISTS idx_follows_followee ON user_follows(followee);
+
+            -- Optional diary backfill (`diary` command): one row per logged viewing, with its date
+            CREATE TABLE IF NOT EXISTS user_diary (
+                username TEXT NOT NULL,
+                viewing_id INTEGER NOT NULL,
+                film_slug TEXT NOT NULL,
+                watched_date TEXT NOT NULL,
+                rewatch INTEGER DEFAULT 0,
+                scraped_at TEXT,
+                PRIMARY KEY (username, viewing_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_diary_user ON user_diary(username);
+            CREATE TABLE IF NOT EXISTS user_diary_status (
+                username TEXT PRIMARY KEY,
+                entries INTEGER NOT NULL,
+                scraped_at TEXT
+            );
         """)
 
         _record_baseline_migration(conn)
