@@ -265,10 +265,11 @@ python main.py recommend your_username --strategy ease
 # Weight on the local model: LETTERBOXD_BLEND_EASE_WEIGHT (default 0.2).
 python main.py recommend your_username --strategy blend
 
-# Less mainstream picks: divides scores by popularity**N (0 = off). On 150 held-out users,
-# 0.3 cost ~1 point of recall@20 for ~10x the recall on films outside the 1000 most-watched;
-# 0.5 cost ~8 points for ~25% niche picks. Opt-in because it trades accuracy for novelty.
-python main.py recommend your_username --strategy ease --novelty 0.3
+# Less mainstream picks: divides scores by popularity**N (0 = off); applies to ease, movielens and
+# blend. Default blend, ~500 held-out users, recall@20 / picks outside the 1000 most-watched:
+#   0 -> 0.431 / 4.9%   0.2 -> 0.424 / 11.3%   0.3 -> 0.389 / 17.2%   0.5 -> 0.269 / 34%
+# so 0.2 more than doubles niche picks for under a point of recall. Opt-in: it trades accuracy.
+python main.py recommend your_username --novelty 0.2
 
 # Without temporal decay (treat all ratings equally)
 python main.py recommend your_username --no-temporal-decay

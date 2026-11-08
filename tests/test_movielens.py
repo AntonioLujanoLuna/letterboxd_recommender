@@ -113,3 +113,20 @@ def test_cli_movielens_strategy_uses_tmdb_links_for_unknown_films(tmp_path, monk
     assert all(r.slug.startswith("tmdb:") for r in recs)
     assert cli.film_url(recs[0].slug).startswith("https://letterboxd.com/tmdb/")
     assert all(r.reasons == ["Because you liked The Film 1"] for r in recs)
+
+
+def test_recommend_columns_novelty_damps_popular_films():
+    import numpy as np
+    from letterboxd_rec.movielens import MovieLensModel
+
+    B = np.zeros((3, 3), dtype=np.float32)
+    B[0, 1], B[0, 2] = 1.0, 0.9          # film 1 scores a little higher than film 2
+    model = MovieLensModel(
+        B=B, movie_ids=np.array([10, 11, 12]), titles=["a", "b", "c"], years=[None] * 3,
+        tmdb_ids=[None] * 3, imdb_ids=[None] * 3,
+        popularity=np.array([5, 100, 1]),  # ...but film 1 is 100x more popular
+    )
+    plain = [c for c, _ in model.recommend_columns({0: 1.0}, {0}, n=2)]
+    damped = [c for c, _ in model.recommend_columns({0: 1.0}, {0}, n=2, novelty=0.5)]
+    assert plain == [1, 2]
+    assert damped == [2, 1]

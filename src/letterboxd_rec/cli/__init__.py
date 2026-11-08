@@ -272,7 +272,7 @@ def main():
     rec_parser = subparsers.add_parser("recommend", help="Generate recommendations")
     rec_parser.add_argument("username", help="Letterboxd username")
     rec_parser.add_argument("--novelty", type=float, default=0.0, metavar="0-1",
-                            help="ease strategy: favor less mainstream films (0 = off; 0.3 is mild, 0.5 strong; "
+                            help="ease/movielens/blend: favor less mainstream films (0 = off; 0.2 is mild, 0.5 strong; "
                                  "costs some accuracy, see README)")
     rec_parser.add_argument("--strategy", choices=['metadata', 'collaborative', 'svd', 'graph', 'ease', 'content', 'movielens', 'blend'],
                             default=None,

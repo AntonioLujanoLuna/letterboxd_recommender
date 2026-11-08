@@ -265,7 +265,8 @@ def _run_movielens_strategy(
     liked_cols = [c for c, w in sorted(weighted.items(), key=lambda kv: -kv[1]) if w >= 1.0]
 
     recs: list[Recommendation] = []
-    for col, score in model.recommend_columns(weighted, seen, n=max(args.limit * 20, 300)):
+    novelty = getattr(args, 'novelty', 0.0) or 0.0
+    for col, score in model.recommend_columns(weighted, seen, n=max(args.limit * 20, 300), novelty=novelty):
         slug = col_to_slug.get(col)
         year = model.years[col]
         if slug and slug in all_films:
