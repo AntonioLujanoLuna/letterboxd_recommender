@@ -345,6 +345,8 @@ EASE_WEIGHTS = {
 #   ~420 users:  0.2 beat local EASE alone by ~1.4 points of NDCG@20 (recall gain not significant)
 #   ~1630 users: 0.2 was 2.1 points of recall *below* local EASE alone; 0.8 was +1.2 recall (95% CI
 #                +0.7..+1.7) and +0.8 NDCG (+0.3..+1.3) above it, 0.9 +0.7 / +0.5, 1.0 is local EASE.
+#   ~2090 users: 0.2 was 2.4 points below; 0.8 was +1.6 recall (+1.1..+2.1) and +1.1 NDCG (+0.6..+1.6),
+#                0.9 +1.5 / +1.1; the optimum is flat across 0.8-0.9, so the default stays 0.8.
 # Re-tune as the database grows (lower weights pick more niche films but cost accuracy).
 BLEND_EASE_WEIGHT = _get_float_env("LETTERBOXD_BLEND_EASE_WEIGHT", 0.8, min_val=0.0)
 

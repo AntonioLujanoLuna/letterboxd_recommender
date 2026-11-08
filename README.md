@@ -273,10 +273,11 @@ python main.py recommend your_username --strategy collaborative
 python main.py recommend your_username --strategy ease
 
 # Local EASE + MovieLens EASE, fused by reciprocal rank (needs `python main.py movielens-build`).
-# Offline (1,630 local users, paired bootstrap) the default weight 0.8 beat local EASE alone by
-# 1.2 points of recall@20 (95% CI +0.7 to +1.7) and 0.8 of NDCG@20 (+0.3 to +1.3). The gain shrinks as
-# the local database grows: at ~420 users a weight of 0.2 was best, at 1,630 that same weight was
-# 2.1 points *worse* than local EASE. Lower weights favor MovieLens: more niche picks, less accuracy.
+# Offline (2,087 local users, 551 held-out users, paired bootstrap) the default weight 0.8 beat local EASE
+# alone by 1.6 points of recall@20 (95% CI +1.1 to +2.1) and 1.1 of NDCG@20 (+0.6 to +1.6); 0.9 is about
+# the same (+1.5 / +1.1). The best weight moves toward the local model as the database grows: at ~420
+# users 0.2 was best, at 1,630 and 2,087 that same weight was 2.1-2.4 points *worse* than local EASE.
+# Lower weights favor MovieLens: more niche picks, less accuracy.
 # Weight on the local model: LETTERBOXD_BLEND_EASE_WEIGHT (default 0.8; re-tune as data grows).
 python main.py recommend your_username --strategy blend
 
