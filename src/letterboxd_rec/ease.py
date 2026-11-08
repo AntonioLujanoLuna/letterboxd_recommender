@@ -70,6 +70,7 @@ class EASERecommender:
         self.item_slugs: list[str] = []
         self.item_index: dict[str, int] = {}
         self.metadata: dict = {}
+        self.item_counts: np.ndarray | None = None  # users who interacted with each film
 
     @property
     def is_fitted(self) -> bool:
@@ -81,6 +82,7 @@ class EASERecommender:
             "min_interactions": self.min_interactions,
             "max_items": self.max_items,
             "weights": EASE_WEIGHTS,
+            "format": 2,  # v2 caches also hold item_counts (needed for novelty)
         }
 
     def fingerprint(self, all_user_films: dict[str, list[dict]]) -> dict:
@@ -113,6 +115,7 @@ class EASERecommender:
         B = P / (-np.diag(P))
         B[np.diag_indices_from(B)] = 0.0
         self.B = B.astype(np.float32)
+        self.item_counts = np.asarray(np.diff((X > 0).tocsc().indptr), dtype=np.float32)
 
         self.metadata = {
             "fingerprint": self.fingerprint(all_user_films),
@@ -157,11 +160,20 @@ class EASERecommender:
         user_films: list[dict],
         n: int = 20,
         exclude: set[str] | None = None,
+        novelty: float = 0.0,
     ) -> list[tuple[str, float]]:
-        """Top-n (slug, score), skipping everything in the user's history and `exclude`."""
+        """Top-n (slug, score), skipping everything in the user's history and `exclude`.
+
+        `novelty` (0..1) divides each positive score by popularity**novelty, trading accuracy for
+        less mainstream picks. Offline (150 users): 0.3 cost ~1 point of recall@20 for ~10x the
+        recall on films outside the 1000 most-watched; 0.5 cost ~8 points for 25% niche picks.
+        """
         if self.B is None:
             return []
         scores = self.score(user_films)
+        if novelty > 0 and self.item_counts is not None:
+            damp = np.maximum(self.item_counts, 1.0) ** novelty
+            scores = np.where(scores > 0, scores / damp, scores).astype(np.float32)
         blocked = {f["slug"] for f in user_films} | (exclude or set())
         for slug in blocked:
             idx = self.item_index.get(slug)
@@ -181,7 +193,8 @@ class EASERecommender:
             return
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez(path, B=self.B, item_slugs=np.array(self.item_slugs), metadata=json.dumps(self.metadata))
+        np.savez(path, B=self.B, item_slugs=np.array(self.item_slugs), metadata=json.dumps(self.metadata),
+                 item_counts=self.item_counts)
         logger.info(f"Saved EASE model to {path}")
 
     @classmethod
@@ -202,6 +215,7 @@ class EASERecommender:
                 max_items=hp.get("max_items", EASE_MAX_ITEMS),
             )
             inst.B = blob["B"]
+            inst.item_counts = blob["item_counts"]
             inst.item_slugs = [str(s) for s in blob["item_slugs"]]
             inst.item_index = {s: i for i, s in enumerate(inst.item_slugs)}
             inst.metadata = metadata

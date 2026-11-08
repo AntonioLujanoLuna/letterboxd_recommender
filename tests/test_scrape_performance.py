@@ -617,3 +617,35 @@ def test_async_social_scrape_treats_404_as_empty(monkeypatch, kind):
 
     monkeypatch.setattr(s, "_get_with_soft_block_recovery", missing)
     assert asyncio.run(getattr(s, f"scrape_{kind}_async")("someone")) == []
+
+
+# --- Default recommend strategy ---------------------------------------------
+
+def _fake_db(monkeypatch, tmp_path, n_users):
+    import contextlib
+    import sqlite3
+    from letterboxd_rec.cli.commands import recommend as rec_cmd
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE user_films (username TEXT, film_slug TEXT)")
+    conn.executemany("INSERT INTO user_films VALUES (?, 'f')", [(f"u{i}",) for i in range(n_users)])
+
+    @contextlib.contextmanager
+    def fake_get_db(read_only=False):
+        yield conn
+
+    monkeypatch.setattr(rec_cmd, "get_db", fake_get_db)
+    db_file = tmp_path / "x.db"
+    db_file.touch()
+    monkeypatch.setattr(rec_cmd, "DB_PATH", db_file)
+    return rec_cmd
+
+
+def test_default_strategy_is_ease_with_enough_users(monkeypatch, tmp_path):
+    rec_cmd = _fake_db(monkeypatch, tmp_path, 20)
+    assert rec_cmd._default_strategy() == "ease"
+
+
+def test_default_strategy_falls_back_to_metadata_with_few_users(monkeypatch, tmp_path):
+    rec_cmd = _fake_db(monkeypatch, tmp_path, 3)
+    assert rec_cmd._default_strategy() == "metadata"

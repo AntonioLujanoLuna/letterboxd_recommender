@@ -219,7 +219,7 @@ python main.py recommend USERNAME [options]
 ```
 
 **Options:**
-- `--strategy {metadata,collaborative,hybrid,svd,graph,ease,content}`: Algorithm to use (default: metadata)
+- `--strategy {metadata,collaborative,hybrid,svd,graph,ease,content}`: Algorithm to use (default: `ease` when the database holds 20+ users with data, otherwise `metadata`)
 - `--limit N`: Number of recommendations (default: 20)
 - `--min-year YEAR`: Filter by minimum release year
 - `--max-year YEAR`: Filter by maximum release year
@@ -244,6 +244,11 @@ python main.py recommend your_username --strategy collaborative
 
 # EASE item-item model (strongest in offline evaluation; needs other users scraped)
 python main.py recommend your_username --strategy ease
+
+# Less mainstream picks: divides scores by popularity**N (0 = off). On 150 held-out users,
+# 0.3 cost ~1 point of recall@20 for ~10x the recall on films outside the 1000 most-watched;
+# 0.5 cost ~8 points for ~25% niche picks. Opt-in because it trades accuracy for novelty.
+python main.py recommend your_username --strategy ease --novelty 0.3
 
 # Hybrid approach (best of both worlds)
 python main.py recommend your_username --strategy hybrid --limit 30

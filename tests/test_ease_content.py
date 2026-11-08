@@ -103,3 +103,29 @@ def test_content_rows_are_normalized_and_singletons_dropped():
 
 def test_content_empty_history_returns_nothing():
     assert ContentRecommender(_content_films()).recommend([], n=5) == []
+
+
+def test_ease_novelty_damps_popular_films_and_survives_cache(tmp_path):
+    import numpy as np
+
+    users = {}
+    for i in range(30):  # "hit" is watched by everyone, "gem" only by a few of the same people
+        films = [{"slug": "hit", "rating": 4.5}, {"slug": "seed", "rating": 4.5}]
+        if i < 6:
+            films.append({"slug": "gem", "rating": 4.5})
+        users[f"u{i}"] = films
+    model = EASERecommender(lam=1.0, min_interactions=1).fit(users)
+    assert model.item_counts[model.item_index["hit"]] == 30
+    assert model.item_counts[model.item_index["gem"]] == 6
+
+    target = [{"slug": "seed", "rating": 5.0}]
+    plain = dict(model.recommend(target, n=2))
+    damped = dict(model.recommend(target, n=2, novelty=0.7))
+    # popularity damping shrinks "hit" more than "gem"
+    assert damped["hit"] / plain["hit"] < damped["gem"] / plain["gem"]
+
+    path = tmp_path / "ease.npz"
+    model.save(path)
+    loaded = EASERecommender.load(path, expected_fingerprint=model.fingerprint(users))
+    assert loaded is not None and np.array_equal(loaded.item_counts, model.item_counts)
+    assert loaded.recommend(target, n=2, novelty=0.7) == model.recommend(target, n=2, novelty=0.7)

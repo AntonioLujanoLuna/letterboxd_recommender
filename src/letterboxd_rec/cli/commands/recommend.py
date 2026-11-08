@@ -32,10 +32,35 @@ from ..utils.output import _output_recommendations
 logger = logging.getLogger(__name__)
 
 
+# EASE beat every other strategy in offline evaluation (see README), but it learns from other users:
+# with fewer than this many users with data it has nothing to generalize from.
+MIN_USERS_FOR_EASE = 20
+
+
+def _default_strategy() -> str:
+    """'ease' when the database holds enough users to train it, else the single-user metadata strategy."""
+    if not DB_PATH.exists():
+        return 'metadata'
+    try:
+        with get_db(read_only=True) as conn:
+            n_users = conn.execute("SELECT COUNT(DISTINCT username) FROM user_films").fetchone()[0]
+    except Exception:  # noqa: BLE001  (no schema yet, locked db...): the safe default still works
+        return 'metadata'
+    return 'ease' if n_users >= MIN_USERS_FOR_EASE else 'metadata'
+
+
 def cmd_recommend(args: argparse.Namespace) -> None:
     """Generate recommendations."""
     username = _validate_username(args.username)
-    strategy = getattr(args, 'strategy', 'metadata')
+    novelty = getattr(args, 'novelty', 0.0) or 0.0
+    if not 0.0 <= novelty <= 1.0:
+        logger.error(f"--novelty must be between 0 and 1 (got {novelty})")
+        return
+    strategy = getattr(args, 'strategy', None)
+    if strategy is None:
+        strategy = _default_strategy()
+        args.strategy = strategy
+        logger.info(f"Using the '{strategy}' strategy (override with --strategy)")
 
     with get_db() as conn:
         user_films, all_films, all_user_films, user_lists = _load_recommendation_data(

@@ -269,8 +269,13 @@ def main():
     # Recommend command
     rec_parser = subparsers.add_parser("recommend", help="Generate recommendations")
     rec_parser.add_argument("username", help="Letterboxd username")
+    rec_parser.add_argument("--novelty", type=float, default=0.0, metavar="0-1",
+                            help="ease strategy: favor less mainstream films (0 = off; 0.3 is mild, 0.5 strong; "
+                                 "costs some accuracy, see README)")
     rec_parser.add_argument("--strategy", choices=['metadata', 'collaborative', 'hybrid', 'svd', 'graph', 'ease', 'content', 'movielens'],
-                            default='metadata', help="Recommendation strategy")
+                            default=None,
+                            help="Recommendation strategy (default: ease when the database has enough "
+                                 "users to train it, otherwise metadata)")
     rec_parser.add_argument("--limit", type=int, default=20, help="Number of recommendations")
     rec_parser.add_argument("--min-year", type=int, help="Minimum release year")
     rec_parser.add_argument("--max-year", type=int, help="Maximum release year")

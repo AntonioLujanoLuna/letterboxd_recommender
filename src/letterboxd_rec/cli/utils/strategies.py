@@ -425,7 +425,7 @@ def _run_ease_strategy(
         return []
 
     # Over-fetch so metadata filters still leave enough results
-    ranked = model.recommend(user_films, n=max(args.limit * 10, 200))
+    ranked = model.recommend(user_films, n=max(args.limit * 10, 200), novelty=getattr(args, 'novelty', 0.0) or 0.0)
     liked = [f['slug'] for f in user_films if f.get('liked') or (f.get('rating') or 0) >= 4.0]
     recs: list[Recommendation] = []
     for slug, score in ranked:
