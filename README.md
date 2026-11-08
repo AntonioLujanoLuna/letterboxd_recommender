@@ -284,8 +284,11 @@ python main.py recommend your_username --strategy blend
 # blend. Default blend (local weight 0.8), ~500 held-out users, recall@20 / picks outside the 1000
 # most-watched:  0 -> 0.459 / 1.9%   0.2 -> 0.462 / 8.0%   0.3 -> 0.447 / 15.4%   0.5 -> 0.338 / 47%
 # so 0.2 quadruples niche picks with no measurable recall cost, 0.3 costs about a point, 0.5 a lot.
-# Opt-in. (Measured at 1,600 local users; with the old 0.2 blend weight the costs were larger.)
-python main.py recommend your_username --novelty 0.2
+# Paired test, 554 users: 0.1 is a small significant gain (recall +0.0035, NDCG +0.0048, niche picks
+# 1.7% -> 3.7%) and is the default; 0.2 is neutral; 0.3+ is significantly worse. Niche-taste users lose
+# the most from novelty, so a per-user adaptive setting does not help.
+python main.py recommend your_username --novelty 0.2   # more niche picks
+python main.py recommend your_username --novelty 0     # off
 
 # Without temporal decay (treat all ratings equally)
 python main.py recommend your_username --no-temporal-decay
