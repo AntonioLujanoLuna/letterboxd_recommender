@@ -335,6 +335,57 @@ def _run_blend_strategy(
     return recs
 
 
+def apply_sparse_popularity(
+    recs: list[Recommendation],
+    user_films: list[dict],
+    all_films: dict[str, dict],
+    all_user_films: dict[str, list[dict]] | None,
+    args: argparse.Namespace,
+) -> list[Recommendation]:
+    """Mix popular films into a short-history user's list (rank fusion), then cut to `args.limit`.
+
+    The weight fades from 0.75 at 20 films or fewer to 0 at 50 (see `sparse_popularity_weight`).
+    Popular films respect the same year/genre/runtime/... filters and exclude what the user has seen.
+    """
+    from collections import Counter
+
+    from ...evaluation import is_positive
+    from ...recommenders.fusion import RRF_C, rrf_fuse, sparse_popularity_weight
+
+    weight = sparse_popularity_weight(len(user_films))
+    if weight <= 0 or not all_user_films:
+        return recs[:args.limit]
+
+    seen = {f['slug'] for f in user_films}
+    counts = Counter(f['slug'] for fs in all_user_films.values() for f in fs if is_positive(f))
+    depth = max(args.limit * 3, 60)
+    popular: list[str] = []
+    for slug, _ in counts.most_common():
+        film = all_films.get(slug)
+        if slug in seen or not film or not _passes_cli_filters(film, args):
+            continue
+        popular.append(slug)
+        if len(popular) >= depth:
+            break
+
+    by_slug = {r.slug: r for r in recs}
+    for slug in popular:
+        if slug not in by_slug:
+            film = all_films[slug]
+            by_slug[slug] = Recommendation(
+                slug=slug, title=film.get('title', slug), year=film.get('year'), score=0.0,
+                reasons=["Popular with the other users (your history is short)"])
+    fused = rrf_fuse([([r.slug for r in recs], 1.0 - weight), (popular, weight)])
+    out = []
+    for slug, score in fused[:args.limit]:
+        rec = by_slug[slug]
+        rec.score = score * (RRF_C + 1)
+        out.append(rec)
+    logger.info(f"Short history ({len(user_films)} films): {weight:.0%} of the ranking comes from popular films. "
+                f"Add more watched/rated films for more personal picks.")
+    return out
+
+
 def _needs_metadata(args: argparse.Namespace) -> bool:
     """True when a filter can only be checked against Letterboxd metadata (not just the year)."""
     return bool(

@@ -19,7 +19,7 @@ from .scoring import (
 )
 from .engine import ScoringEngine
 from .vectorization import TfidfEmbedder
-from .fusion import RRF_C, rrf_fuse
+from .fusion import RRF_C, rrf_fuse, sparse_popularity_weight
 from .metadata import MetadataRecommender
 from .collaborative import CollaborativeRecommender
 
@@ -43,6 +43,7 @@ __all__ = [
     "TfidfEmbedder",
     # Fusion
     "rrf_fuse",
+    "sparse_popularity_weight",
     "RRF_C",
     # Recommenders
     "MetadataRecommender",

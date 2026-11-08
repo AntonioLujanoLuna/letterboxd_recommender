@@ -796,3 +796,63 @@ def test_cli_filters_cover_runtime_shorts_animation_country_language():
     # partial namespaces from older callers still work
     assert _passes_cli_filters(film, argparse.Namespace(min_year=None, max_year=None, genres=None,
                                                         exclude_genres=None, min_rating=None))
+
+
+# --- short-history popularity fallback ---------------------------------------------
+
+def test_sparse_popularity_weight_schedule():
+    from letterboxd_rec.recommenders.fusion import sparse_popularity_weight as w
+
+    assert w(0) == w(5) == w(20) == 0.75
+    assert abs(w(30) - 0.5) < 1e-9 and abs(w(40) - 0.25) < 1e-9
+    assert w(50) == 0.0 and w(500) == 0.0
+    assert all(w(n) >= w(n + 1) for n in range(0, 60))  # never increases with more history
+
+
+def _sparse_fixture(n_user_films):
+    import argparse
+    from letterboxd_rec.recommenders import Recommendation
+
+    films = {s: {"title": s.upper(), "year": 2000, "genres": "[]"}
+             for s in ["pop1", "pop2", "pop3", "ease1", "ease2", "seen"]}
+    user = [{"slug": "seen", "liked": 1}] + [{"slug": f"x{i}", "liked": 1} for i in range(n_user_films - 1)]
+    others = {f"u{i}": [{"slug": s, "liked": 1} for s in (["pop1"] * 1 + ["pop2", "seen"] if i < 3 else ["pop3"])]
+              for i in range(6)}
+    others["u0"] += [{"slug": "pop1", "liked": 1}]
+    recs = [Recommendation(slug=s, title=s.upper(), year=2000, score=1.0, reasons=["because"])
+            for s in ["ease1", "ease2"]]
+    args = argparse.Namespace(limit=3, min_year=None, max_year=None, genres=None, exclude_genres=None,
+                              min_rating=None)
+    return recs, user, films, others, args
+
+
+def test_apply_sparse_popularity_mixes_in_popular_films_for_short_histories():
+    from letterboxd_rec.cli.utils.strategies import apply_sparse_popularity
+
+    recs, user, films, others, args = _sparse_fixture(5)
+    args.limit = 5
+    out = apply_sparse_popularity(recs, user, films, others, args)
+    slugs = [r.slug for r in out]
+    assert len(slugs) == 5                          # 3 popular + 2 personal; the seen film is excluded
+    assert "seen" not in slugs                      # never recommends what the user has watched
+    assert slugs[0] in {"pop1", "pop2", "pop3"}     # popularity dominates at 5 films (weight 0.75)
+    assert any(s.startswith("ease") for s in slugs)  # but the personal picks still get through
+    assert all(0.0 < r.score <= 1.0 for r in out)
+
+
+def test_apply_sparse_popularity_leaves_long_histories_alone_and_just_truncates():
+    from letterboxd_rec.cli.utils.strategies import apply_sparse_popularity
+
+    recs, user, films, others, args = _sparse_fixture(60)
+    args.limit = 1
+    assert [r.slug for r in apply_sparse_popularity(recs, user, films, others, args)] == ["ease1"]
+
+
+def test_apply_sparse_popularity_respects_filters():
+    from letterboxd_rec.cli.utils.strategies import apply_sparse_popularity
+
+    recs, user, films, others, args = _sparse_fixture(5)
+    films["pop1"]["year"] = 1950
+    args.min_year = 1990
+    slugs = [r.slug for r in apply_sparse_popularity(recs, user, films, others, args)]
+    assert "pop1" not in slugs

@@ -26,7 +26,9 @@ from ..utils.strategies import (
     _run_content_strategy,
     _run_movielens_strategy,
     _run_blend_strategy,
+    apply_sparse_popularity,
 )
+from ...recommenders.fusion import sparse_popularity_weight
 from ..utils.output import _output_recommendations
 
 logger = logging.getLogger(__name__)
@@ -54,6 +56,7 @@ def _default_strategy() -> str:
 
 
 FULL_FILTER_STRATEGIES = frozenset({'ease', 'movielens', 'blend', 'svd'})
+SPARSE_FALLBACK_STRATEGIES = frozenset({'ease', 'blend'})  # popularity mixed in for short histories
 
 
 def _uses_extended_filters(args: argparse.Namespace) -> bool:
@@ -106,7 +109,15 @@ def cmd_recommend(args: argparse.Namespace) -> None:
     }
 
     handler = strategy_handlers[strategy]
-    recs = handler(user_films, all_films, args, username, user_lists, all_user_films)
+    sparse = strategy in SPARSE_FALLBACK_STRATEGIES and sparse_popularity_weight(len(user_films)) > 0
+    if sparse:
+        run_args = argparse.Namespace(**vars(args))
+        run_args.limit = max(args.limit * 3, 60)   # deep list to fuse with popularity
+    else:
+        run_args = args
+    recs = handler(user_films, all_films, run_args, username, user_lists, all_user_films)
+    if sparse:
+        recs = apply_sparse_popularity(recs, user_films, all_films, all_user_films, args)
 
     # Build recommender and profile for explanations if needed
     recommender = None

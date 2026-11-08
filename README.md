@@ -233,6 +233,12 @@ python main.py recommend USERNAME [options]
 The year, genre, rating, runtime, short/animation, country and language filters all apply to the
 `ease`, `movielens`, `blend` and `svd` strategies (the other strategies ignore the newer ones and say so).
 A film missing a field is never excluded by a filter on that field.
+
+**Short histories:** with fewer than about 50 films in a user's history, `ease` and `blend` mix
+popular films into the list (by rank; 75% popularity up to 20 films, fading linearly to 0 at 50),
+because below ~20 films plain popularity beat every personalized model offline (recall@20 about
+0.10 vs 0.06-0.10), and the mix beat both at every size from 3 to 40 films. The command says so when
+it applies; scrape more of the user's activity and it fades out on its own.
 - `--diversity`: Limit films per director (avoids 5 Kurosawa films in a row)
 - `--max-per-director N`: Max films per director in diversity mode (default: 2)
 - `--no-temporal-decay`: Disable temporal decay (treat old and new ratings equally)
