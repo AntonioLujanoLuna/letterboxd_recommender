@@ -310,7 +310,11 @@ reads `/user/films/diary/` (about 7 requests per user on a 30-user sample, diari
 films in the database) and stores one row per logged viewing (date, rewatch flag) in the separate
 `user_diary` table, so the main crawl and its throughput are unchanged. Pages blocked by throttling are
 retried with backoff; a user whose diary cannot be read completely is skipped, never stored partially.
-Nothing in the recommender uses the dates yet.
+Nothing in the recommender uses the dates: a pilot on 30 heavy loggers (hide each user's latest 20% of
+dated likes, down-weight older watches at query time, half-lives 0.5 to 4 years) found no detectable
+recency gain (recall change -0.035 to +0.005, every 95% interval spanning zero; shorter half-lives
+trended slightly worse), so it was not pursued. Undated films must get the user's average weight, not full
+weight, or the comparison is confounded.
 
 ### `profile` — View your taste profile
 
